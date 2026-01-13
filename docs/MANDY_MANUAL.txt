@@ -1,0 +1,83 @@
+Mandy AI — Complete Manual
+
+Status: Integrated & Production Ready
+Generated: 2026-01-13
+
+Overview:
+Mandy AI provides natural-language command processing and safe tool execution. This manual merges the quick reference, integration notes, and system summary and includes configuration, extension developer guidance, and troubleshooting.
+
+Quick Start:
+- Start the bot: python main.py
+- Try: dm @john hello
+- Verify integration (optional): python verify_integration.py
+
+Architecture & Key Files:
+- intelligent_command_processor.py — core engine
+- cogs/mandy_ai.py — integration / _ManydAICommandExecutor
+- capability_registry.py — tool registry
+- tool_plugin_manager.py — plugin loader
+- extensions/ — extension tools & validators
+- main.py — config & startup
+- verify_integration.py — integration checks
+
+What the Intelligent Processor Does:
+- Detects intent across 8 types (send_dm, add_watcher, remove_watcher, list_watchers, create_mirror, show_stats, show_health, show_queue)
+- Uses fuzzy matching, pronoun resolution, context memory, clarification
+- Executes via _ManydAICommandExecutor
+- Falls back to classic parsing on errors
+
+Configuration:
+- cooldown_seconds: default 5
+- limits: per-model rpm, tpm, rpd (defaults in main.py -> DEFAULT_AI_LIMITS)
+- installed_extensions: list of module names
+
+Limits & Rate Handling:
+- Enforced with rpm/tpm/rpd. LocalRateLimitError or job queue used when thresholds hit.
+- Backoff steps: [10, 30, 60, 120, 240, 480, 600]
+
+Commands & Quick Reference:
+- mandy (primary)
+- mandy_model <name>
+- mandy_queue
+- mandy_cancel <job_id>
+- mandy_limits
+- Users: dm @alice "Hey" ; watch bob after 10 messages say "hi" ; mirror #a to #b ; show stats
+
+Extension Development — Build & Safety Rules:
+- TOOL_EXPORTS dict required
+- Files must be under extensions/ and end with .py, <=200KB
+- Allowed imports: discord, discord.ext.commands, typing, datetime, json, re, asyncio, math, random
+- Denied imports: os, sys, subprocess, socket, requests, aiohttp, httpx, pathlib, shutil, aiomysql, sqlite3, pickle
+- No eval/exec/open
+- Use validate_extension_path and validate_extension_source for checks
+- Developer mode available via validator_unrestricted.py for local prototyping
+
+Build Tool (BUILD_TOOL intent):
+- build payload: slug + files
+- slug must match [a-z0-9_]{3,32}
+- Validated, written, imported, then added to installed_extensions
+
+Developer & Admin UX recommendations:
+- Add beginner_mode opt-in and scaffold generator
+- Improve validator messages with line numbers & suggested fixes
+- Add interactive mandy build --dry-run
+- Add mandy help & getting_started commands
+
+Troubleshooting & Diagnostics:
+- Intelligent processor errors: check console, it falls back
+- Extension load issues: check validator errors
+- Rate-limit: run mandy_limits to inspect rpm/tpm/rpd
+- Run python verify_integration.py to check integration
+
+Security Considerations:
+- Validator is strict to avoid dangerous code
+- dev/unrestricted mode is for local, developer use only
+- Any relaxation should be opt-in and audited
+
+Example extension (snippet) provided in the markdown manual.
+
+Changelog & Notes:
+- 2026-01-13: Manual merged & generated. Defaults: cooldown_seconds=5; limits seeded from DEFAULT_AI_LIMITS.
+
+Next Steps:
+- Implement beginner-mode and scaffold generator on request.
