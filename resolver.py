@@ -32,6 +32,9 @@ class GuildIndex:
     members: List[IndexedEntry]
     channels: List[IndexedEntry]
     roles: List[IndexedEntry]
+    member_lookup: Dict[str, List[Tuple[int, str]]]
+    channel_lookup: Dict[str, List[Tuple[int, str]]]
+    role_lookup: Dict[str, List[Tuple[int, str]]]
 
 
 def normalize_token(text: str) -> str:
@@ -92,9 +95,24 @@ def _rank_indexed(
     entries: Iterable[IndexedEntry],
     recent_ids: Optional[Iterable[int]] = None,
     limit: int = 5,
+    exact_lookup: Optional[Dict[str, List[Tuple[int, str]]]] = None,
 ) -> List[ResolutionCandidate]:
     query_norm = normalize_token(query)
     recent = set(int(x) for x in (recent_ids or []))
+    if exact_lookup and query_norm:
+        exact = exact_lookup.get(query_norm)
+        if exact:
+            candidates = [
+                ResolutionCandidate(
+                    entity_id=entity_id,
+                    label=label,
+                    score=1.0,
+                    match_type="exact",
+                )
+                for entity_id, label in exact
+            ]
+            candidates.sort(key=lambda c: (-c.score, c.label.lower()))
+            return candidates[:limit]
     scored: List[ResolutionCandidate] = []
     for entry in entries:
         best_score = 0.0
@@ -128,8 +146,9 @@ def pick_best(candidates: List[ResolutionCandidate], min_score: float = 0.82, ga
     return int(top.entity_id)
 
 
-def _build_member_entries(guild: discord.Guild) -> List[IndexedEntry]:
+def _build_member_entries(guild: discord.Guild) -> Tuple[List[IndexedEntry], Dict[str, List[Tuple[int, str]]]]:
     entries: List[IndexedEntry] = []
+    lookup: Dict[str, List[Tuple[int, str]]] = {}
     for member in guild.members:
         labels = [
             member.display_name,
@@ -137,29 +156,38 @@ def _build_member_entries(guild: discord.Guild) -> List[IndexedEntry]:
             getattr(member, "global_name", None),
         ]
         norms = [normalize_token(label) for label in labels if label]
+        for label, norm in zip(labels, norms):
+            if label and norm:
+                lookup.setdefault(norm, []).append((member.id, label))
         entries.append(IndexedEntry(entity_id=member.id, labels=labels, normalized=norms))
-    return entries
+    return entries, lookup
 
 
-def _build_channel_entries(guild: discord.Guild) -> List[IndexedEntry]:
+def _build_channel_entries(guild: discord.Guild) -> Tuple[List[IndexedEntry], Dict[str, List[Tuple[int, str]]]]:
     entries: List[IndexedEntry] = []
+    lookup: Dict[str, List[Tuple[int, str]]] = {}
     for ch in guild.channels:
         if isinstance(ch, (discord.TextChannel, discord.Thread)):
             labels = [ch.name]
             norms = [normalize_token(ch.name)]
+            if norms and norms[0]:
+                lookup.setdefault(norms[0], []).append((ch.id, ch.name))
             entries.append(IndexedEntry(entity_id=ch.id, labels=labels, normalized=norms))
-    return entries
+    return entries, lookup
 
 
-def _build_role_entries(guild: discord.Guild) -> List[IndexedEntry]:
+def _build_role_entries(guild: discord.Guild) -> Tuple[List[IndexedEntry], Dict[str, List[Tuple[int, str]]]]:
     entries: List[IndexedEntry] = []
+    lookup: Dict[str, List[Tuple[int, str]]] = {}
     for role in guild.roles:
         if role.is_default():
             continue
         labels = [role.name]
         norms = [normalize_token(role.name)]
+        if norms and norms[0]:
+            lookup.setdefault(norms[0], []).append((role.id, role.name))
         entries.append(IndexedEntry(entity_id=role.id, labels=labels, normalized=norms))
-    return entries
+    return entries, lookup
 
 
 class GuildIndexCache:
@@ -186,10 +214,16 @@ class GuildIndexCache:
             if same_counts and fresh:
                 return entry.get("index")
 
+        members, member_lookup = _build_member_entries(guild)
+        channels, channel_lookup = _build_channel_entries(guild)
+        roles, role_lookup = _build_role_entries(guild)
         index = GuildIndex(
-            members=_build_member_entries(guild),
-            channels=_build_channel_entries(guild),
-            roles=_build_role_entries(guild),
+            members=members,
+            channels=channels,
+            roles=roles,
+            member_lookup=member_lookup,
+            channel_lookup=channel_lookup,
+            role_lookup=role_lookup,
         )
         self._cache[gid] = {
             "at": now,
@@ -211,9 +245,15 @@ def rank_members(
     if not guild or not query:
         return []
     if index:
-        return _rank_indexed(query, index.members, recent_ids=recent_ids, limit=limit)
-    entries = _build_member_entries(guild)
-    return _rank_indexed(query, entries, recent_ids=recent_ids, limit=limit)
+        return _rank_indexed(
+            query,
+            index.members,
+            recent_ids=recent_ids,
+            limit=limit,
+            exact_lookup=index.member_lookup,
+        )
+    entries, lookup = _build_member_entries(guild)
+    return _rank_indexed(query, entries, recent_ids=recent_ids, limit=limit, exact_lookup=lookup)
 
 
 def rank_channels(
@@ -226,9 +266,15 @@ def rank_channels(
     if not guild or not query:
         return []
     if index:
-        return _rank_indexed(query.lstrip("#"), index.channels, recent_ids=recent_ids, limit=limit)
-    entries = _build_channel_entries(guild)
-    return _rank_indexed(query.lstrip("#"), entries, recent_ids=recent_ids, limit=limit)
+        return _rank_indexed(
+            query.lstrip("#"),
+            index.channels,
+            recent_ids=recent_ids,
+            limit=limit,
+            exact_lookup=index.channel_lookup,
+        )
+    entries, lookup = _build_channel_entries(guild)
+    return _rank_indexed(query.lstrip("#"), entries, recent_ids=recent_ids, limit=limit, exact_lookup=lookup)
 
 
 def rank_roles(
@@ -241,6 +287,12 @@ def rank_roles(
     if not guild or not query:
         return []
     if index:
-        return _rank_indexed(query.lstrip("@"), index.roles, recent_ids=recent_ids, limit=limit)
-    entries = _build_role_entries(guild)
-    return _rank_indexed(query.lstrip("@"), entries, recent_ids=recent_ids, limit=limit)
+        return _rank_indexed(
+            query.lstrip("@"),
+            index.roles,
+            recent_ids=recent_ids,
+            limit=limit,
+            exact_lookup=index.role_lookup,
+        )
+    entries, lookup = _build_role_entries(guild)
+    return _rank_indexed(query.lstrip("@"), entries, recent_ids=recent_ids, limit=limit, exact_lookup=lookup)

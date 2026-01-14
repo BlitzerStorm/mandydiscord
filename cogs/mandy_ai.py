@@ -34,6 +34,8 @@ MANDY_MIN_LEVEL = 90
 AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac")
 BACKOFF_STEPS = [10, 30, 60, 120, 240, 480, 600]
 FAST_STATUS_STATES = {"online", "idle", "dnd", "invisible"}
+MENTION_USER_RE = re.compile(r"<@!?(\d+)>")
+NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 WINDOW_ALIASES = {
     "today": "daily",
     "day": "daily",
@@ -771,7 +773,7 @@ class MandyAI(commands.Cog):
         if message and getattr(message, "mentions", None):
             if message.mentions:
                 return int(message.mentions[0].id)
-        match = re.search(r"<@!?(\d+)>", text or "")
+        match = MENTION_USER_RE.search(text or "")
         if match:
             try:
                 return int(match.group(1))
@@ -780,7 +782,7 @@ class MandyAI(commands.Cog):
         return None
 
     def _normalize_name(self, text: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", (text or "").strip().lower())
+        return NON_ALNUM_RE.sub("", (text or "").strip().lower())
 
     async def _resolve_user(
         self,
