@@ -1,7 +1,8 @@
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import discord
@@ -32,8 +33,12 @@ class GuildIndex:
     members: List[IndexedEntry]
     channels: List[IndexedEntry]
     roles: List[IndexedEntry]
+    member_exact: Dict[str, List[Tuple[int, str]]] = field(default_factory=dict)
+    channel_exact: Dict[str, List[Tuple[int, str]]] = field(default_factory=dict)
+    role_exact: Dict[str, List[Tuple[int, str]]] = field(default_factory=dict)
 
 
+@lru_cache(maxsize=8192)
 def normalize_token(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (text or "").strip().lower())
 
@@ -74,6 +79,7 @@ def parse_role_id(text: str) -> Optional[int]:
     return None
 
 
+@lru_cache(maxsize=16384)
 def _score_norm(query_norm: str, name_norm: str) -> Tuple[float, str]:
     if not query_norm or not name_norm:
         return 0.0, "none"
@@ -85,6 +91,17 @@ def _score_norm(query_norm: str, name_norm: str) -> Tuple[float, str]:
         return 0.86, "contains"
     ratio = SequenceMatcher(None, query_norm, name_norm).ratio()
     return 0.6 * ratio, "fuzzy"
+
+
+def _build_exact_map(entries: List[IndexedEntry]) -> Dict[str, List[Tuple[int, str]]]:
+    exact: Dict[str, List[Tuple[int, str]]] = {}
+    for entry in entries:
+        for label, norm in zip(entry.labels, entry.normalized):
+            if not label or not norm:
+                continue
+            bucket = exact.setdefault(norm, [])
+            bucket.append((int(entry.entity_id), label))
+    return exact
 
 
 def _rank_indexed(
@@ -190,7 +207,13 @@ class GuildIndexCache:
             members=_build_member_entries(guild),
             channels=_build_channel_entries(guild),
             roles=_build_role_entries(guild),
+            member_exact={},
+            channel_exact={},
+            role_exact={},
         )
+        index.member_exact = _build_exact_map(index.members)
+        index.channel_exact = _build_exact_map(index.channels)
+        index.role_exact = _build_exact_map(index.roles)
         self._cache[gid] = {
             "at": now,
             "member_count": member_count,
@@ -211,6 +234,14 @@ def rank_members(
     if not guild or not query:
         return []
     if index:
+        query_norm = normalize_token(query)
+        if query_norm:
+            exact = index.member_exact.get(query_norm)
+            if exact:
+                return [
+                    ResolutionCandidate(entity_id=entity_id, label=label, score=1.0, match_type="exact")
+                    for entity_id, label in exact
+                ]
         return _rank_indexed(query, index.members, recent_ids=recent_ids, limit=limit)
     entries = _build_member_entries(guild)
     return _rank_indexed(query, entries, recent_ids=recent_ids, limit=limit)
@@ -226,6 +257,14 @@ def rank_channels(
     if not guild or not query:
         return []
     if index:
+        query_norm = normalize_token(query.lstrip("#"))
+        if query_norm:
+            exact = index.channel_exact.get(query_norm)
+            if exact:
+                return [
+                    ResolutionCandidate(entity_id=entity_id, label=label, score=1.0, match_type="exact")
+                    for entity_id, label in exact
+                ]
         return _rank_indexed(query.lstrip("#"), index.channels, recent_ids=recent_ids, limit=limit)
     entries = _build_channel_entries(guild)
     return _rank_indexed(query.lstrip("#"), entries, recent_ids=recent_ids, limit=limit)
@@ -241,6 +280,14 @@ def rank_roles(
     if not guild or not query:
         return []
     if index:
+        query_norm = normalize_token(query.lstrip("@"))
+        if query_norm:
+            exact = index.role_exact.get(query_norm)
+            if exact:
+                return [
+                    ResolutionCandidate(entity_id=entity_id, label=label, score=1.0, match_type="exact")
+                    for entity_id, label in exact
+                ]
         return _rank_indexed(query.lstrip("@"), index.roles, recent_ids=recent_ids, limit=limit)
     entries = _build_role_entries(guild)
     return _rank_indexed(query.lstrip("@"), entries, recent_ids=recent_ids, limit=limit)
