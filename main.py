@@ -366,6 +366,7 @@ BRIDGE_TYPING_INDICATORS: Dict[int, float] = {}
 LIVE_STATS_TASKS: Dict[int, asyncio.Task] = {}
 MANDY_EXTENSION = "cogs.mandy_ai"
 MANDY_LOADED = False
+SHUTDOWN_USER_ID = 741470965359443970
 
 # -----------------------------
 # Optional MySQL
@@ -4907,6 +4908,33 @@ async def nuke(ctx: commands.Context, limit: int = 300):
     await audit(ctx.author.id, "NUKE", {"channel_id": ctx.channel.id, "deleted": deleted})
     await ctx.send(f"Deleted {deleted}.", delete_after=8)
 
+@bot.command(name="shutdown")
+async def shutdown(ctx: commands.Context):
+    if ctx.author.id != SHUTDOWN_USER_ID:
+        await safe_delete(ctx.message)
+        return
+    await safe_delete(ctx.message)
+    await audit(ctx.author.id, "Shutdown requested", {})
+    try:
+        await ctx.send("Shutting down...", delete_after=6)
+    except Exception:
+        pass
+    try:
+        await ambient_engine.stop_ambient_engine()
+    except Exception:
+        pass
+    try:
+        await STORE.flush()
+    except Exception:
+        pass
+    if POOL:
+        try:
+            POOL.close()
+            await POOL.wait_closed()
+        except Exception:
+            pass
+    await bot.close()
+
 # -----------------------------
 # Events
 # -----------------------------
@@ -5279,8 +5307,6 @@ async def on_typing(channel: discord.abc.Messageable, user: discord.User, when: 
 # -----------------------------
 attach_mandy_context()
 bot.run(DISCORD_TOKEN)
-
-
 
 
 
