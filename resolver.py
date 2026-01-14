@@ -111,7 +111,9 @@ def _rank_indexed(
     limit: int = 5,
 ) -> List[ResolutionCandidate]:
     query_norm = normalize_token(query)
-    recent = set(int(x) for x in (recent_ids or []))
+    if not query_norm:
+        return []
+    recent = set(int(x) for x in recent_ids) if recent_ids else set()
     scored: List[ResolutionCandidate] = []
     for entry in entries:
         best_score = 0.0
@@ -148,12 +150,12 @@ def pick_best(candidates: List[ResolutionCandidate], min_score: float = 0.82, ga
 def _build_member_entries(guild: discord.Guild) -> List[IndexedEntry]:
     entries: List[IndexedEntry] = []
     for member in guild.members:
-        labels = [
+        labels = [label for label in (
             member.display_name,
             member.name,
             getattr(member, "global_name", None),
-        ]
-        norms = [normalize_token(label) for label in labels if label]
+        ) if label]
+        norms = [normalize_token(label) for label in labels]
         entries.append(IndexedEntry(entity_id=member.id, labels=labels, normalized=norms))
     return entries
 
@@ -162,8 +164,8 @@ def _build_channel_entries(guild: discord.Guild) -> List[IndexedEntry]:
     entries: List[IndexedEntry] = []
     for ch in guild.channels:
         if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            labels = [ch.name]
-            norms = [normalize_token(ch.name)]
+            labels = [ch.name] if ch.name else []
+            norms = [normalize_token(label) for label in labels]
             entries.append(IndexedEntry(entity_id=ch.id, labels=labels, normalized=norms))
     return entries
 
@@ -173,8 +175,8 @@ def _build_role_entries(guild: discord.Guild) -> List[IndexedEntry]:
     for role in guild.roles:
         if role.is_default():
             continue
-        labels = [role.name]
-        norms = [normalize_token(role.name)]
+        labels = [role.name] if role.name else []
+        norms = [normalize_token(label) for label in labels]
         entries.append(IndexedEntry(entity_id=role.id, labels=labels, normalized=norms))
     return entries
 
