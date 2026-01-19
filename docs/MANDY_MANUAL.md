@@ -154,6 +154,7 @@ Quick reference lives in `COMMANDS.md`. The highlights:
 ### Setup / Ops (admin hub only)
 - `!setup bootstrap`
 - `!setup fullsync` / `!setup destructive` (SUPERUSER only)
+- Destructive mode now prompts for Default vs AI-assisted rebuild (Gemini) and falls back to default if rate-limited.
 - `!leavevc`: emergency voice disconnect (SUPERUSER only)
 - `!health`: health snapshot (level >= 70)
 

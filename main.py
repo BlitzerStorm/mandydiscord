@@ -4403,6 +4403,97 @@ async def setup_fullsync(guild: discord.Guild):
     await ensure_log_channels(guild)
     await setup_log("Phase 3/4: setup complete for this server")
 
+class SetupAiRateLimitError(Exception):
+    def __init__(self, retry_after: Optional[float] = None):
+        super().__init__("AI setup rate limited")
+        self.retry_after = retry_after
+
+def _mandy_ai_client():
+    mandy = bot.get_cog("MandyAI")
+    if not mandy:
+        return None
+    return getattr(mandy, "client", None)
+
+def _is_ai_rate_limit(client, exc: Exception) -> Tuple[bool, Optional[float]]:
+    if client and hasattr(client, "_is_rate_limit_error"):
+        try:
+            return client._is_rate_limit_error(exc)
+        except Exception:
+            pass
+    msg = str(exc).lower()
+    is_rate = "rate limit" in msg or "429" in msg or "quota" in msg or "resource exhausted" in msg
+    return is_rate, None
+
+async def _generate_setup_ai_brief(guild: discord.Guild) -> str:
+    client = _mandy_ai_client()
+    if not client or not getattr(client, "available", False):
+        return ""
+    ai = ai_cfg()
+    model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
+    roles = len(guild.roles) if guild else 0
+    channels = len(guild.channels) if guild else 0
+    categories = len([c for c in guild.channels if isinstance(c, discord.CategoryChannel)]) if guild else 0
+    system_prompt = (
+        "You are Mandy's sentient core. Produce a concise AI-assisted rebuild brief for an operator. "
+        "Use a calm, analytical tone with light biological metaphors. No emojis."
+    )
+    user_prompt = (
+        "Create a short rebuild brief for a destructive setup run.\n"
+        "Constraints:\n"
+        "- 5 to 8 lines total.\n"
+        "- Include 2 bullet metrics.\n"
+        "- Include 1 observation and 1 operator recommendation.\n\n"
+        f"Context: roles={roles}, channels={channels}, categories={categories}, mysql={'on' if POOL else 'off'}."
+    )
+    try:
+        text = await client.generate(system_prompt, user_prompt, model=model, response_format=None, timeout=60.0)
+        return (text or "").strip()
+    except Exception as exc:
+        is_rate, retry_after = _is_ai_rate_limit(client, exc)
+        if is_rate:
+            raise SetupAiRateLimitError(retry_after=retry_after)
+        return ""
+
+async def _send_ai_setup_brief(user_id: int, guild: discord.Guild) -> bool:
+    brief = await _generate_setup_ai_brief(guild)
+    if not brief:
+        return False
+    user = bot.get_user(user_id)
+    if not user:
+        try:
+            user = await bot.fetch_user(user_id)
+        except Exception:
+            return False
+    try:
+        await user.send(brief[:1900])
+        return True
+    except Exception:
+        return False
+
+async def _await_ai_rate_limit_response(user_id: int) -> Optional[str]:
+    user = bot.get_user(user_id)
+    if not user:
+        try:
+            user = await bot.fetch_user(user_id)
+        except Exception:
+            return None
+    try:
+        await user.send(
+            "AI rebuild is rate-limited. Reply `wait` within 60s to retry; "
+            "reply `default` (or anything else) to continue with the standard rebuild."
+        )
+    except Exception:
+        return None
+    try:
+        msg = await bot.wait_for(
+            "message",
+            timeout=60,
+            check=lambda m: m.author.id == user_id and isinstance(m.channel, discord.DMChannel),
+        )
+    except asyncio.TimeoutError:
+        return None
+    return (msg.content or "").strip().lower()
+
 async def auto_setup_guild(guild: discord.Guild, do_backfill: bool = False, force_backfill: bool = False):
     if guild.id == ADMIN_GUILD_ID:
         try:
@@ -4459,7 +4550,22 @@ async def run_full_setup(guild: discord.Guild, mode: str, actor_id: int = 0):
     await setup_log(f"Full setup requested: {mode} by {actor_id}")
     try:
         async with AUTO_SETUP_LOCK:
-            if mode in ("destructive", "fullsync"):
+            if mode in ("destructive", "destructive_ai", "fullsync"):
+                if mode == "destructive_ai":
+                    ai_ok = True
+                    try:
+                        ai_ok = await _send_ai_setup_brief(actor_id, guild)
+                    except SetupAiRateLimitError:
+                        ai_ok = False
+                        reply = await _await_ai_rate_limit_response(actor_id)
+                        if reply in ("wait", "ai", "yes", "y"):
+                            await asyncio.sleep(60)
+                            try:
+                                ai_ok = await _send_ai_setup_brief(actor_id, guild)
+                            except SetupAiRateLimitError:
+                                ai_ok = False
+                    if not ai_ok:
+                        await setup_log("AI rebuild unavailable; defaulting to standard destructive setup.")
                 await setup_destructive(guild)
             else:
                 await setup_fullsync(guild)
@@ -4759,6 +4865,36 @@ class BaseView(discord.ui.View):
                 await self.message.delete()
             except Exception:
                 pass
+
+class SetupDestructiveChoiceView(BaseView):
+    def __init__(self, author_id: int):
+        super().__init__(author_id, timeout=60)
+        self.choice: Optional[str] = None
+
+    async def on_timeout(self):
+        return
+
+    async def _finalize(self, interaction: discord.Interaction, choice: str):
+        self.choice = choice
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.response.edit_message(content=f"Destructive setup: {choice}", view=self)
+        except Exception:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Default Rebuild", style=discord.ButtonStyle.danger)
+    async def default_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finalize(interaction, "destructive")
+
+    @discord.ui.button(label="AI-Assisted Rebuild", style=discord.ButtonStyle.primary)
+    async def ai_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finalize(interaction, "destructive_ai")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finalize(interaction, "cancel")
 
 async def user_status_text(user: discord.abc.User) -> str:
     parts = []
@@ -6018,6 +6154,19 @@ async def cmd_health(ctx: commands.Context):
     ]
     await ctx.send("\n".join(lines[:12]))
 
+async def prompt_setup_destructive_choice(ctx: commands.Context) -> str:
+    view = SetupDestructiveChoiceView(ctx.author.id)
+    msg = await ctx.send("Destructive setup: choose rebuild mode.", view=view)
+    view.message = msg
+    await view.wait()
+    choice = view.choice or "destructive"
+    if choice == "cancel":
+        try:
+            await msg.edit(content="Destructive setup cancelled.", view=None)
+        except Exception:
+            pass
+    return choice
+
 @bot.command()
 async def setup(ctx: commands.Context, mode: str = ""):
     if not ctx.guild or ctx.guild.id != ADMIN_GUILD_ID:
@@ -6034,6 +6183,11 @@ async def setup(ctx: commands.Context, mode: str = ""):
         )
     if mode in ("destructive", "fullsync") and not is_super(ctx.author.id):
         return await ctx.send("SUPERUSER only.", delete_after=6)
+    if mode == "destructive":
+        choice = await prompt_setup_destructive_choice(ctx)
+        if choice == "cancel":
+            return
+        mode = choice
     asyncio.create_task(run_full_setup(ctx.guild, mode, actor_id=ctx.author.id))
     await audit(ctx.author.id, "Setup run", {"mode": mode})
     await safe_ctx_send(ctx, "Setup started. You'll get a DM when it's done.", delete_after=10)

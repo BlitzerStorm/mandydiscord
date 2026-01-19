@@ -26,7 +26,7 @@ The bot supports both **classic commands** and **natural language** (via Mandy A
 
 ## Setup / Server Ops (admin server only)
 - `!setup bootstrap`: Create/update roles, categories, channels, topics, pins, and menus.
-- `!setup destructive` / `!setup fullsync`: Full layout sync (SUPERUSER only).
+- `!setup destructive` / `!setup fullsync`: Full layout sync (SUPERUSER only); destructive now prompts for Default vs AI-assisted rebuild.
 
 ## Watchers / Mirrors / DM bridges
 These are primarily managed through the menus, but key commands exist:
