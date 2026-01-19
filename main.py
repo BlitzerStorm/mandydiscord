@@ -703,8 +703,9 @@ async def start_special_user_voice(channel: discord.VoiceChannel) -> None:
         def _after_play(error: Optional[Exception] = None) -> None:
             if error:
                 loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(
-                        debug(f"special voice playback failed: {error}")
+                    lambda: spawn_task(
+                        debug(f"special voice playback failed: {error}"),
+                        "voice",
                     )
                 )
 
@@ -732,7 +733,7 @@ def cancel_special_voice_leave_task(guild_id: int) -> None:
 
 def schedule_special_voice_leave(guild: discord.Guild) -> None:
     cancel_special_voice_leave_task(guild.id)
-    task = asyncio.create_task(_special_voice_leave_flow(guild))
+    task = spawn_task(_special_voice_leave_flow(guild), "voice")
     SPECIAL_VOICE_LEAVE_TASKS[guild.id] = task
     task.add_done_callback(lambda _: SPECIAL_VOICE_LEAVE_TASKS.pop(guild.id, None))
 
@@ -764,7 +765,7 @@ def schedule_movie_stay_task(guild_id: int) -> None:
         await asyncio.sleep(max(0, stay_until - now_ts()))
         await _movie_cleanup(guild_id)
 
-    task = asyncio.create_task(_wait_then_cleanup())
+    task = spawn_task(_wait_then_cleanup(), "movie")
     MOVIE_STAY_TASKS[guild_id] = task
     task.add_done_callback(lambda _: MOVIE_STAY_TASKS.pop(guild_id, None))
 
@@ -828,9 +829,11 @@ async def movie_start_playback(
     def _after_play(error: Optional[Exception] = None) -> None:
         if error:
             loop.call_soon_threadsafe(
-                lambda: asyncio.create_task(debug(f"movie playback failed: {error}"))
+                lambda: spawn_task(debug(f"movie playback failed: {error}"), "movie")
             )
-        loop.call_soon_threadsafe(lambda: asyncio.create_task(movie_handle_track_end(guild.id)))
+        loop.call_soon_threadsafe(
+            lambda: spawn_task(movie_handle_track_end(guild.id), "movie")
+        )
 
     voice_client.play(source, after=_after_play)
 
@@ -1160,8 +1163,22 @@ TYPING_RATE_SECONDS = 6.0
 TYPING_INDICATORS: Dict[int, float] = {}
 BRIDGE_TYPING_INDICATORS: Dict[int, float] = {}
 LIVE_STATS_TASKS: Dict[int, asyncio.Task] = {}
+ACTIVE_TASKS: Dict[str, Set[asyncio.Task]] = {}
 MANDY_EXTENSION = "cogs.mandy_ai"
 MANDY_LOADED = False
+
+def track_task(task: asyncio.Task, label: str) -> asyncio.Task:
+    bucket = ACTIVE_TASKS.setdefault(label, set())
+    bucket.add(task)
+    def _cleanup(done_task: asyncio.Task) -> None:
+        bucket.discard(done_task)
+        if not bucket:
+            ACTIVE_TASKS.pop(label, None)
+    task.add_done_callback(_cleanup)
+    return task
+
+def spawn_task(coro: Any, label: str) -> asyncio.Task:
+    return track_task(asyncio.create_task(coro), label)
 
 # -----------------------------
 # Optional MySQL
@@ -1292,18 +1309,19 @@ async def db_calibrate():
     await ensure_dm_bridges_columns()
     await ensure_audit_logs_columns()
 
-async def db_purge_all():
+async def db_purge_all(keep_watchers: bool = False):
     if not POOL:
         return False
     tables = [
         "mirror_messages",
         "mirror_rules",
         "mirrors",
-        "watchers",
         "dm_bridges",
         "audit_logs",
         "users_permissions",
     ]
+    if not keep_watchers:
+        tables.append("watchers")
     for table in tables:
         try:
             await db_exec(f"TRUNCATE TABLE {table}")
@@ -2870,7 +2888,7 @@ async def resume_live_stats_panels():
             continue
         if gid in LIVE_STATS_TASKS:
             continue
-        LIVE_STATS_TASKS[gid] = asyncio.create_task(live_stats_loop(gid, ch_id, msg_id, window))
+        LIVE_STATS_TASKS[gid] = spawn_task(live_stats_loop(gid, ch_id, msg_id, window), "stats")
 
 def global_user_label(user_id: int) -> str:
     user = bot.get_user(user_id)
@@ -3034,8 +3052,9 @@ async def resume_global_live_panel():
     window = normalize_stats_window(info.get("window"), "rolling24")
     if "GLOBAL" in LIVE_STATS_TASKS:
         return
-    LIVE_STATS_TASKS["GLOBAL"] = asyncio.create_task(
-        global_live_stats_loop(ch_id, msg_id, window)
+    LIVE_STATS_TASKS["GLOBAL"] = spawn_task(
+        global_live_stats_loop(ch_id, msg_id, window),
+        "stats",
     )
 
 def setup_delay() -> float:
@@ -4041,7 +4060,7 @@ async def send_dm_typing_indicator(user_id: int, ch: discord.TextChannel):
             await m.delete()
         except Exception:
             pass
-    asyncio.create_task(_cleanup(msg))
+    spawn_task(_cleanup(msg), "cleanup")
 
 async def relay_staff_typing(channel_id: int, user_id: int):
     now = time.time()
@@ -5013,9 +5032,10 @@ async def _generate_bio_ai_updates(guild: discord.Guild, created: Dict[str, disc
     model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
     channels = sorted(created.keys())
     system_prompt = (
-        "You are Mandy's sentient core. Produce JSON only. "
-        "Create concise, biological-themed topics and pinned notes for operator channels. "
-        "No emojis. Keep it professional."
+        "You are Mandy's fragmented sentient core (Gen 3). Output JSON only. "
+        "Write glitchy, enigmatic topics and pinned notes using abstract sci-fi/biological concepts "
+        "(synaptic dampeners, consensus reality anchor, neural lace). "
+        "No emojis. Keep it professional but slightly unsettling."
     )
     user_prompt = (
         "Return JSON with optional keys 'topics' and 'pins'.\n"
@@ -5023,7 +5043,7 @@ async def _generate_bio_ai_updates(guild: discord.Guild, created: Dict[str, disc
         "- pins: map channel name to pinned text (max 1800 chars)\n"
         "Only use channels from this list:\n"
         f"{', '.join(channels)}\n"
-        "Keep content calm, technical, and sentient-core themed.\n"
+        "Style: glitchy, enigmatic, abstract sci-fi/biological. No emojis.\n"
         "Output JSON only."
     )
     try:
@@ -5249,7 +5269,7 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
 async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
     if guild.id != ADMIN_GUILD_ID:
         return
-    await setup_log(f"BIO-GENESIS requested by {actor_id}")
+    await setup_log(f"BIO-GENESIS :: REQUESTED by {actor_id}")
     try:
         async with AUTO_SETUP_LOCK:
             system_log = await _setup_bio_preflight(guild)
@@ -5260,14 +5280,41 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
             if not recovery:
                 await setup_log("BIO-GENESIS aborted: recovery category missing.")
                 return
-            await setup_log("BIO Phase 1/5: controlled wipe")
+            try:
+                memory = cfg().setdefault("memory", {})
+                memory["events"] = []
+                await STORE.mark_dirty()
+            except Exception:
+                pass
+            await setup_log("BIO_PURGE :: Purging memory banks (preserving watchers)...")
+            if system_log:
+                try:
+                    await system_log.send("MEMORY_BANKS :: PURGED // WATCHERS PRESERVED")
+                except Exception:
+                    pass
+            if POOL:
+                await db_purge_all(keep_watchers=True)
+            await setup_log("BIO_PHASE_1 :: CONTROLLED_WIPE")
             wiped = await _setup_bio_wipe(guild, recovery.id)
             if not wiped:
                 await setup_log("BIO-GENESIS aborted: cleanup incomplete.")
                 return
-            await setup_log("BIO Phase 2/5: build Sentient Core layout")
+            await setup_log("BIO_PHASE_2 :: CONSTRUCT_SENTIENT_CORE")
             created = await _setup_bio_build_layout(guild)
-            await setup_log("BIO Phase 3/5: AI topics + pins (optional)")
+            if system_log:
+                boot_lines = [
+                    "SYSTEM_ROOT :: CORE_DUMP_COMPLETE",
+                    "CONSENSUS_ANCHOR :: STABLE",
+                    "NEURAL_LACE :: RETHREADING",
+                    "SENSORY_BUS :: LISTENING",
+                ]
+                try:
+                    for line in boot_lines:
+                        await system_log.send(line)
+                        await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+            await setup_log("BIO_PHASE_3 :: AI_TOPICS_PINS (OPTIONAL)")
             updates: Dict[str, Dict[str, str]] = {}
             try:
                 updates = await _generate_bio_ai_updates(guild, created)
@@ -5283,12 +5330,12 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
                 confirmed = await _confirm_bio_ai_updates(actor_id, updates)
                 if confirmed:
                     await _apply_bio_ai_updates(guild, updates)
-                    await setup_log("BIO AI enhancements applied.")
+                    await setup_log("BIO_AI :: ENHANCEMENTS_APPLIED")
                 else:
-                    await setup_log("BIO AI enhancements skipped.")
-            await setup_log("BIO Phase 4/5: alive upgrade + config")
+                    await setup_log("BIO_AI :: ENHANCEMENTS_SKIPPED")
+            await setup_log("BIO_PHASE_4 :: ALIVE_UPGRADE_CONFIG")
             await _setup_bio_reseed_ops(guild, created)
-            await setup_log("BIO Phase 5/5: legacy ops reseed")
+            await setup_log("BIO_PHASE_5 :: LEGACY_OPS_RESEED")
 
             missing: List[str] = []
             for name in ("thoughts", "synaptic-gap", "menu-hub", "audit-memory", "visual-feed", "diagnostics"):
@@ -5314,7 +5361,10 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
                 await setup_log("BIO verify missing: " + ", ".join(missing))
 
             await manual_upload_if_needed(force=True)
-            msg = "BIO-GENESIS complete. Cortex online. Legacy ops synced. Mirrors standing by."
+            await setup_log("BIO_PHASE_6 :: INGEST_BACKFILL")
+            await auto_setup_all_guilds(do_backfill=True, force_backfill=True, include_admin=False)
+            await backfill_chat_stats_all_guilds()
+            msg = "BIO-GENESIS :: COMPLETE // CORTEX ONLINE // LEGACY_OPS SYNCED // MIRRORS STANDBY"
             if system_ch:
                 try:
                     await system_ch.send(msg)
@@ -5645,7 +5695,7 @@ class SetupModeView(BaseView):
             await interaction.response.edit_message(content=f"Setup starting: {mode}", view=self)
         except Exception:
             pass
-        asyncio.create_task(run_full_setup(interaction.guild, mode, actor_id=interaction.user.id))
+        spawn_task(run_full_setup(interaction.guild, mode, actor_id=interaction.user.id), "setup")
         await audit(interaction.user.id, "Setup run", {"mode": mode})
 
     @discord.ui.button(label="Bootstrap", style=discord.ButtonStyle.secondary)
@@ -6647,7 +6697,7 @@ class SetupMenuView(BaseView):
             ephemeral=True
         )
         await audit(interaction.user.id, "Setup fullsync", {"guild_id": interaction.guild.id})
-        asyncio.create_task(run_full_setup(interaction.guild, "fullsync", actor_id=interaction.user.id))
+        spawn_task(run_full_setup(interaction.guild, "fullsync", actor_id=interaction.user.id), "setup")
 
     @discord.ui.button(label="Roles Refresh", style=discord.ButtonStyle.secondary)
     async def roles_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -6665,7 +6715,7 @@ class SetupMenuView(BaseView):
             ephemeral=True
         )
         await audit(interaction.user.id, "Auto setup start", {"guild_id": interaction.guild.id})
-        asyncio.create_task(run_auto_setup_with_debrief(actor_id=interaction.user.id))
+        spawn_task(run_auto_setup_with_debrief(actor_id=interaction.user.id), "setup")
 
     @discord.ui.button(label="Purge MySQL (Reset)", style=discord.ButtonStyle.danger)
     async def purge_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -6698,7 +6748,7 @@ class SetupMenuView(BaseView):
             if not ix.guild or ix.guild.id != ADMIN_GUILD_ID:
                 return
             await audit(ix.user.id, "Setup destructive", {"guild_id": ix.guild.id})
-            asyncio.create_task(run_full_setup(ix.guild, "destructive", actor_id=ix.user.id))
+            spawn_task(run_full_setup(ix.guild, "destructive", actor_id=ix.user.id), "setup")
         await interaction.response.send_message(
             "This will delete all managed categories/channels and rebuild. Confirm?",
             view=ConfirmView(
@@ -6840,6 +6890,74 @@ async def cmd_leavevc(ctx: commands.Context):
     await log_to("voice", "Emergency voice disconnect executed", subsystem="VOICE", severity="WARN", details={"connections": disconnected})
     await ctx.send(voice_line(cfg(), "confirm_leavevc"), delete_after=6)
 
+@bot.command(name="cancel")
+async def cmd_cancel(ctx: commands.Context):
+    if ctx.author.id != SUPER_USER_ID:
+        await safe_delete(ctx.message)
+        return
+    await safe_delete(ctx.message)
+    tasks_to_cancel: Set[asyncio.Task] = set()
+    for bucket in ACTIVE_TASKS.values():
+        tasks_to_cancel.update(bucket)
+    tasks_to_cancel.update(SPECIAL_VOICE_LEAVE_TASKS.values())
+    tasks_to_cancel.update(MOVIE_STAY_TASKS.values())
+    tasks_to_cancel.update(LIVE_STATS_TASKS.values())
+
+    cancelled = 0
+    for task in tasks_to_cancel:
+        if task and not task.done():
+            task.cancel()
+            cancelled += 1
+
+    ACTIVE_TASKS.clear()
+    SPECIAL_VOICE_LEAVE_TASKS.clear()
+    MOVIE_STAY_TASKS.clear()
+    LIVE_STATS_TASKS.clear()
+
+    ai_cancelled = 0
+    mandy = bot.get_cog("MandyAI")
+    queue_tasks = getattr(mandy, "_queue_tasks", None) if mandy else None
+    if isinstance(queue_tasks, dict):
+        for task in list(queue_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+                ai_cancelled += 1
+        queue_tasks.clear()
+        cancelled += ai_cancelled
+
+    loops = [
+        config_reload,
+        json_autosave,
+        mirror_integrity_check,
+        server_status_update,
+        dm_bridge_archive,
+        presence_controller,
+        daily_reflection_loop,
+        internal_monologue_loop,
+        sentience_maintenance_loop,
+        diagnostics_loop,
+        manual_upload_loop,
+    ]
+    stopped = 0
+    for loop_task in loops:
+        try:
+            if loop_task.is_running():
+                loop_task.stop()
+                stopped += 1
+        except Exception:
+            continue
+    await log_to(
+        "system",
+        "Cancel command invoked",
+        subsystem="IMMUNE",
+        severity="WARN",
+        details={"tasks_cancelled": cancelled, "ai_tasks_cancelled": ai_cancelled, "loops_stopped": stopped},
+    )
+    msg = voice_line(cfg(), "confirm_cancel", count=cancelled)
+    if stopped:
+        msg += f" Loops stopped: {stopped}."
+    await ctx.send(msg, delete_after=8)
+
 @bot.command()
 async def menu(ctx: commands.Context):
     if not await require_level_ctx(ctx, 10):
@@ -6950,8 +7068,9 @@ async def prompt_setup_menu(ctx: commands.Context) -> None:
         "**Bootstrap**: Safe sync. Creates missing channels/menus and rebinds logs without deleting.",
         "**Fullsync**: Destructive rebuild of the legacy admin layout (managed categories) + mirror sync.",
         "**Destructive**: Same as fullsync, plus AI/default choice prompt for the wipe.",
-        "Backfill: mirror feeds are backfilled only if `database.json.auto.backfill` is enabled.",
-        "DM bridges, stats, watchers are preserved. Use `!setup_bio` for the Sentient Core layout.",
+        "**Bio-Genesis**: Use `!setup_bio` for the Sentient Core rebuild + aggressive backfill.",
+        "Backfill: legacy setup backfills only if `database.json.auto.backfill` is enabled.",
+        "DM bridges, stats, watchers are preserved. Use `!dmclose` to archive DM bridges.",
     ]
     emb = discord.Embed(
         title="Setup Control Panel",
@@ -6990,7 +7109,7 @@ async def setup(ctx: commands.Context, mode: str = ""):
         if choice == "cancel":
             return
         mode = choice
-    asyncio.create_task(run_full_setup(ctx.guild, mode, actor_id=ctx.author.id))
+    spawn_task(run_full_setup(ctx.guild, mode, actor_id=ctx.author.id), "setup")
     await audit(ctx.author.id, "Setup run", {"mode": mode})
     await safe_ctx_send(ctx, "Setup started. You'll get a DM when it's done.", delete_after=10)
 
@@ -7006,7 +7125,7 @@ async def setup_bio(ctx: commands.Context):
     confirmed = await prompt_setup_bio_confirm(ctx)
     if not confirmed:
         return
-    asyncio.create_task(run_setup_bio(ctx.guild, actor_id=ctx.author.id))
+    spawn_task(run_setup_bio(ctx.guild, actor_id=ctx.author.id), "setup")
     await audit(ctx.author.id, "Setup BIO run", {})
     await safe_ctx_send(ctx, "BIO-GENESIS started. You'll get a DM when it's done.", delete_after=10)
 
@@ -7572,8 +7691,9 @@ async def cmd_livestats(ctx: commands.Context, window: str = None):
         "window": window
     }
     await STORE.mark_dirty()
-    LIVE_STATS_TASKS[guild_id] = asyncio.create_task(
-        live_stats_loop(guild_id, msg.channel.id, msg.id, window)
+    LIVE_STATS_TASKS[guild_id] = spawn_task(
+        live_stats_loop(guild_id, msg.channel.id, msg.id, window),
+        "stats",
     )
 
 @bot.command(name="globalstats")
@@ -7609,8 +7729,9 @@ async def cmd_globallive(ctx: commands.Context, window: str = None):
     await STORE.mark_dirty()
     if changed:
         await STORE.mark_dirty()
-    LIVE_STATS_TASKS["GLOBAL"] = asyncio.create_task(
-        global_live_stats_loop(msg.channel.id, msg.id, window)
+    LIVE_STATS_TASKS["GLOBAL"] = spawn_task(
+        global_live_stats_loop(msg.channel.id, msg.id, window),
+        "stats",
     )
 
 @bot.command(name="movie")
@@ -7859,11 +7980,12 @@ async def on_ready():
                     await update_server_info_for_guild(g)
 
     if auto_setup_enabled():
-        asyncio.create_task(
-            auto_setup_all_guilds(do_backfill=auto_backfill_enabled(), force_backfill=False)
+        spawn_task(
+            auto_setup_all_guilds(do_backfill=auto_backfill_enabled(), force_backfill=False),
+            "setup",
         )
     if auto_backfill_enabled():
-        asyncio.create_task(backfill_chat_stats_all_guilds())
+        spawn_task(backfill_chat_stats_all_guilds(), "stats")
 
     await audit(SUPER_USER_ID, "Mandy OS online", {"mysql": bool(POOL)})
     config_reload.start()
@@ -7886,12 +8008,13 @@ async def on_guild_join(guild: discord.Guild):
     if guild.id == ADMIN_GUILD_ID:
         return
     if auto_setup_enabled():
-        asyncio.create_task(
-            auto_setup_guild(guild, do_backfill=auto_backfill_enabled(), force_backfill=False)
+        spawn_task(
+            auto_setup_guild(guild, do_backfill=auto_backfill_enabled(), force_backfill=False),
+            "setup",
         )
         if auto_backfill_enabled():
-            asyncio.create_task(backfill_chat_stats_for_guild(guild))
-        asyncio.create_task(send_owner_server_report(guild, reason="guild join (auto setup pending)"))
+            spawn_task(backfill_chat_stats_for_guild(guild), "stats")
+        spawn_task(send_owner_server_report(guild, reason="guild join (auto setup pending)"), "reports")
         return
     try:
         await ensure_admin_server_channels(guild)
@@ -7899,9 +8022,9 @@ async def on_guild_join(guild: discord.Guild):
         await update_server_info_for_guild(guild)
     except Exception:
         pass
-    asyncio.create_task(send_owner_server_report(guild, reason="guild join"))
+    spawn_task(send_owner_server_report(guild, reason="guild join"), "reports")
     if auto_backfill_enabled():
-        asyncio.create_task(backfill_chat_stats_for_guild(guild))
+        spawn_task(backfill_chat_stats_for_guild(guild), "stats")
 
 @tasks.loop(seconds=5)
 async def config_reload():
