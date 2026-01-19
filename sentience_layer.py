@@ -7,6 +7,7 @@ def sentience_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     root.setdefault("dialect", "sentient_core")
     root.setdefault("channels", {})
     root.setdefault("thoughts_rate_limit_seconds", 30)
+    root.setdefault("menu_style", "default")
     daily = root.setdefault("daily_reflection", {})
     daily.setdefault("enabled", False)
     daily.setdefault("last_run_utc", 0)

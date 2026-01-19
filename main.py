@@ -207,6 +207,7 @@ DEFAULT_JSON: Dict[str, Any] = {
         "dialect": "sentient_core",
         "channels": {},
         "thoughts_rate_limit_seconds": 30,
+        "menu_style": "default",
         "daily_reflection": {
             "enabled": False,
             "last_run_utc": 0,
@@ -4204,10 +4205,33 @@ async def ensure_menu_panel(
     state = cfg().setdefault("menu_messages", {})
     entry = state.setdefault(str(guild.id), {})
     msg_id = entry.get(entry_key)
+    menu_style = str(sentience_cfg(cfg()).get("menu_style") or "default")
+    payload: Dict[str, Any] = {"view": view}
+    if menu_style == "glitchy":
+        title = "Mandy Menu" if entry_key == "user_menu" else "GOD MENU"
+        glitch = [
+            f"// {title.upper()} :: CORTEX LINK ACTIVE //",
+            "Signal integrity: stable",
+            "Operator interface: ready",
+            "Latency: minimal",
+            "Command surface: armed",
+        ]
+        if entry_key == "god_menu":
+            glitch.insert(2, "Immune clearance: elevated")
+        emb = discord.Embed(
+            title=title,
+            description="\n".join(glitch),
+            color=discord.Color.teal() if entry_key == "user_menu" else discord.Color.dark_gold(),
+        )
+        emb.set_footer(text="Sentient Core Interface")
+        payload["embed"] = emb
+        payload["content"] = None
+    else:
+        payload["content"] = content
     if msg_id:
         try:
             msg = await ch.fetch_message(int(msg_id))
-            await msg.edit(content=content, view=view)
+            await msg.edit(**payload)
             view.message = msg
             try:
                 if not msg.pinned:
@@ -4217,7 +4241,7 @@ async def ensure_menu_panel(
             return
         except Exception:
             entry.pop(entry_key, None)
-    msg = await ch.send(content, view=view)
+    msg = await ch.send(**payload)
     view.message = msg
     entry[entry_key] = msg.id
     await STORE.mark_dirty()
@@ -4750,27 +4774,6 @@ BIO_LAYOUT = {
     "BIO-FILTER": ["audit-memory", "containment-ward"],
     "VISUAL CORTEX": ["visual-feed"],
 }
-BIO_ALLOWED_CATEGORIES = {
-    "Welcome & Information",
-    "Bot Control & Monitoring",
-    "Research & Development",
-    "Guest Access",
-    "Engineering Core",
-    "Admin Backrooms",
-    "DM Bridges",
-    "CEREBRAL CORTEX",
-    "BIO-FILTER",
-    "VISUAL CORTEX",
-}
-
-def _bio_managed_categories(guild: discord.Guild) -> Set[str]:
-    layout = cfg().get("layout", {}).get("categories", {})
-    names = set(layout.keys()) if layout else set(BIO_ALLOWED_CATEGORIES)
-    for cat in guild.categories:
-        if cat.name.startswith("04-servers /"):
-            names.add(cat.name)
-    return names
-
 async def _ensure_recovery_anchor(guild: discord.Guild) -> Optional[Tuple[discord.CategoryChannel, discord.TextChannel, discord.TextChannel]]:
     try:
         recovery = await ensure_category(guild, "RECOVERY")
@@ -4803,28 +4806,46 @@ async def _setup_bio_preflight(guild: discord.Guild) -> Optional[discord.TextCha
     return system_log
 
 async def _setup_bio_wipe(guild: discord.Guild, recovery_id: int) -> bool:
-    managed = _bio_managed_categories(guild)
-    for cat in list(guild.categories):
-        if cat.id == recovery_id:
-            continue
-        if cat.name not in managed:
-            continue
-        try:
-            for ch in list(cat.channels):
-                try:
-                    await ch.delete()
-                    await setup_pause()
-                except Exception:
-                    continue
-            await cat.delete()
-            await setup_pause()
-        except Exception:
-            continue
-    remaining = [c.name for c in guild.categories if c.id != recovery_id and c.name in managed]
-    if remaining:
-        await setup_log("BIO cleanup remaining categories: " + ", ".join(remaining[:10]))
-        return False
-    return True
+    recovery = guild.get_channel(recovery_id)
+    preserved = {recovery_id}
+    if isinstance(recovery, discord.CategoryChannel):
+        preserved.update({c.id for c in recovery.channels})
+    passes = 3
+    for attempt in range(passes):
+        deleted = 0
+        for ch in list(guild.channels):
+            if ch.id in preserved:
+                continue
+            if isinstance(ch, discord.CategoryChannel):
+                continue
+            try:
+                await ch.delete()
+                deleted += 1
+                await setup_pause()
+            except Exception:
+                continue
+        for cat in list(guild.categories):
+            if cat.id in preserved:
+                continue
+            try:
+                await cat.delete()
+                deleted += 1
+                await setup_pause()
+            except Exception:
+                continue
+        remaining = [
+            c for c in guild.channels
+            if c.id not in preserved and not isinstance(c, discord.CategoryChannel)
+        ]
+        remaining_cats = [c for c in guild.categories if c.id not in preserved]
+        await setup_log(
+            f"BIO cleanup pass {attempt + 1}/{passes}: removed={deleted} remaining={len(remaining)} cats={len(remaining_cats)}"
+        )
+        if not remaining and not remaining_cats:
+            return True
+        await asyncio.sleep(1)
+    await setup_log("BIO cleanup incomplete after max passes.")
+    return False
 
 async def _setup_bio_build_layout(guild: discord.Guild) -> Dict[str, discord.TextChannel]:
     created: Dict[str, discord.TextChannel] = {}
@@ -4869,7 +4890,10 @@ async def _generate_bio_ai_updates(guild: discord.Guild, created: Dict[str, disc
     try:
         text = await client.generate(system_prompt, user_prompt, model=model, response_format="json", timeout=60.0)
         payload = json.loads(text or "{}")
-    except Exception:
+    except Exception as exc:
+        is_rate, retry_after = _is_ai_rate_limit(client, exc)
+        if is_rate:
+            raise SetupAiRateLimitError(retry_after=retry_after)
         return {}
     if not isinstance(payload, dict):
         return {}
@@ -4886,6 +4910,30 @@ async def _generate_bio_ai_updates(guild: discord.Guild, created: Dict[str, disc
     if not out_topics and not out_pins:
         return {}
     return {"topics": out_topics, "pins": out_pins}
+
+async def _await_ai_enhancement_response(user_id: int) -> Optional[str]:
+    user = bot.get_user(user_id)
+    if not user:
+        try:
+            user = await bot.fetch_user(user_id)
+        except Exception:
+            return None
+    try:
+        await user.send(
+            "AI enhancements are rate-limited. Reply `wait` within 60s to retry; "
+            "reply `skip` (or anything else) to continue without AI content."
+        )
+    except Exception:
+        return None
+    try:
+        msg = await bot.wait_for(
+            "message",
+            timeout=60,
+            check=lambda m: m.author.id == user_id and isinstance(m.channel, discord.DMChannel),
+        )
+    except asyncio.TimeoutError:
+        return None
+    return (msg.content or "").strip().lower()
 
 async def _confirm_bio_ai_updates(user_id: int, updates: Dict[str, Dict[str, str]]) -> bool:
     user = bot.get_user(user_id)
@@ -4950,6 +4998,7 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
     channels["visual_feed"] = created.get("visual-feed").id if created.get("visual-feed") else 0
     sent["enabled"] = True
     sent["dialect"] = "sentient_core"
+    sent["menu_style"] = "glitchy"
     sent.setdefault("daily_reflection", {})["enabled"] = True
     sent["daily_reflection"]["fallback_enabled"] = True
     sent.setdefault("internal_monologue", {})["enabled"] = True
@@ -4972,6 +5021,14 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
     channels_cfg["god"] = "synaptic-gap"
 
     await STORE.mark_dirty()
+
+    if guild.id == ADMIN_GUILD_ID:
+        try:
+            await ensure_roles(guild)
+            await apply_guest_permissions(guild)
+            await apply_quarantine_permissions(guild)
+        except Exception:
+            pass
 
     await ensure_menu_panels(guild)
 
@@ -5007,6 +5064,18 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
         if mirror_feed:
             await mirror_rule_update(rule, target_channel=mirror_feed.id)
 
+    if auto_backfill_enabled():
+        for g in bot.guilds:
+            if g.id == ADMIN_GUILD_ID:
+                continue
+            rule = find_server_scope_rule(g.id)
+            if not rule or not rule.get("enabled", True):
+                continue
+            try:
+                await backfill_mirror_for_guild(g, rule, force=False)
+            except Exception:
+                continue
+
     for bridge in await dm_bridge_list_active():
         uid = int(bridge.get("user_id", 0))
         if not uid:
@@ -5039,7 +5108,17 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
             await setup_log("BIO Phase 2/5: build Sentient Core layout")
             created = await _setup_bio_build_layout(guild)
             await setup_log("BIO Phase 3/5: AI topics + pins (optional)")
-            updates = await _generate_bio_ai_updates(guild, created)
+            updates: Dict[str, Dict[str, str]] = {}
+            try:
+                updates = await _generate_bio_ai_updates(guild, created)
+            except SetupAiRateLimitError:
+                reply = await _await_ai_enhancement_response(actor_id)
+                if reply in ("wait", "ai", "yes", "y"):
+                    await asyncio.sleep(60)
+                    try:
+                        updates = await _generate_bio_ai_updates(guild, created)
+                    except SetupAiRateLimitError:
+                        updates = {}
             if updates:
                 confirmed = await _confirm_bio_ai_updates(actor_id, updates)
                 if confirmed:

@@ -157,6 +157,7 @@ Quick reference lives in `COMMANDS.md`. The highlights:
 - Destructive mode now prompts for Default vs AI-assisted rebuild (Gemini). AI mode sends a sentient brief + post-rebuild debrief and falls back to default if rate-limited or unavailable.
 - `!setup_bio`: bio-themed admin hub rebuild (SUPERUSER only). Includes recovery anchor, sentience channels, and automatic legacy ops reseed.
 - During `!setup_bio`, Mandy can optionally generate AI-assisted topics/pins and will ask for confirmation before applying.
+- `!setup_bio` also re-ensures roles, quarantine permissions, and guest permissions in the admin hub after rebuild.
 - `!leavevc`: emergency voice disconnect (SUPERUSER only)
 - `!health`: health snapshot (level >= 70)
 
