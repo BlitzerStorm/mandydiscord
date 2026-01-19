@@ -24,6 +24,7 @@ import random
 import re
 import time
 import datetime
+import hashlib
 from typing import Optional, Dict, Any, List, Tuple, Set
 import secrets
 import urllib.parse
@@ -225,6 +226,18 @@ DEFAULT_JSON: Dict[str, Any] = {
             "enabled": True,
             "ai_queue_max_age_hours": 6
         }
+    },
+    "diagnostics": {
+        "channel_id": 0,
+        "message_id": 0,
+        "last_update": 0
+    },
+    "manual": {
+        "channel_id": 0,
+        "last_hash": "",
+        "last_message_id": 0,
+        "last_upload": 0,
+        "auto_upload_enabled": False
     },
     "memory": {
         "events": []  # long-term sentiment / notes
@@ -2159,6 +2172,12 @@ def _daily_reflection_due(now_dt: datetime.datetime) -> bool:
 def sentience_channels_cfg() -> Dict[str, Any]:
     return sentience_cfg(cfg()).setdefault("channels", {})
 
+def diagnostics_cfg() -> Dict[str, Any]:
+    return cfg().setdefault("diagnostics", {})
+
+def manual_cfg() -> Dict[str, Any]:
+    return cfg().setdefault("manual", {})
+
 async def _resolve_thoughts_channel() -> Optional[discord.TextChannel]:
     channels = sentience_channels_cfg()
     ch_id = int(channels.get("thoughts", 0) or 0)
@@ -2180,6 +2199,86 @@ async def _resolve_thoughts_channel() -> Optional[discord.TextChannel]:
         await STORE.mark_dirty()
         return ch
     return None
+
+async def _resolve_diagnostics_channel() -> Optional[discord.TextChannel]:
+    diag = diagnostics_cfg()
+    ch_id = int(diag.get("channel_id", 0) or 0)
+    if ch_id:
+        ch = bot.get_channel(ch_id)
+        if not ch:
+            try:
+                ch = await bot.fetch_channel(ch_id)
+            except Exception:
+                ch = None
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if not admin:
+        return None
+    ch = find_text_by_name(admin, "diagnostics")
+    if isinstance(ch, discord.TextChannel):
+        diag["channel_id"] = ch.id
+        await STORE.mark_dirty()
+        return ch
+    return None
+
+def _manual_path() -> str:
+    return os.path.join("docs", "MANDY_MANUAL.md")
+
+def _manual_hash() -> str:
+    path = _manual_path()
+    if not os.path.exists(path):
+        return ""
+    try:
+        data = open(path, "rb").read()
+    except Exception:
+        return ""
+    return hashlib.sha256(data).hexdigest()
+
+async def _resolve_manual_channel() -> Optional[discord.TextChannel]:
+    manual = manual_cfg()
+    ch_id = int(manual.get("channel_id", 0) or 0)
+    if ch_id:
+        ch = bot.get_channel(ch_id)
+        if not ch:
+            try:
+                ch = await bot.fetch_channel(ch_id)
+            except Exception:
+                ch = None
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if not admin:
+        return None
+    ch = find_text_by_name(admin, "manual-for-living")
+    if isinstance(ch, discord.TextChannel):
+        manual["channel_id"] = ch.id
+        await STORE.mark_dirty()
+        return ch
+    return None
+
+async def manual_upload_if_needed(force: bool = False) -> None:
+    manual = manual_cfg()
+    if not manual.get("auto_upload_enabled", False):
+        return
+    ch = await _resolve_manual_channel()
+    if not ch:
+        return
+    current_hash = _manual_hash()
+    if not current_hash:
+        return
+    if not force and manual.get("last_hash") == current_hash:
+        return
+    path = _manual_path()
+    try:
+        file = discord.File(path, filename="MANDY_MANUAL.md")
+        msg = await ch.send("Mandy manual updated.", file=file)
+        manual["last_hash"] = current_hash
+        manual["last_message_id"] = msg.id
+        manual["last_upload"] = now_ts()
+        await STORE.mark_dirty()
+    except Exception:
+        return
 
 def internal_monologue_cfg() -> Dict[str, Any]:
     return sentience_cfg(cfg()).get("internal_monologue", {})
@@ -2291,6 +2390,46 @@ def _build_fallback_reflection(context: Dict[str, Any]) -> str:
         "Recommendation: Review audit-memory for anomalies and keep synaptic-gap clear.",
     ]
     return "\n".join(lines)
+
+def _task_state(task: Optional[tasks.Loop]) -> str:
+    if not task:
+        return "offline"
+    try:
+        if task.failed():
+            return "error"
+    except Exception:
+        pass
+    return "online" if task.is_running() else "offline"
+
+def _diagnostic_status_lines(dm_bridge_count: int) -> List[str]:
+    lines: List[str] = []
+    mandy = bot.get_cog("MandyAI")
+    ai_client = getattr(mandy, "client", None) if mandy else None
+    ai_ok = bool(ai_client and getattr(ai_client, "available", False))
+    runtime = getattr(bot, "mandy_runtime", {}) or {}
+    last_rate = runtime.get("last_rate_limit", {})
+    last_rate_text = "n/a"
+    if last_rate:
+        last_rate_text = f"{last_rate.get('source')} wait={last_rate.get('wait_seconds')}s"
+
+    rules = list(mirror_rules_dict().values())
+    mirror_enabled = len([r for r in rules if r.get("enabled", True)])
+    mirror_disabled = len(rules) - mirror_enabled
+
+    lines.append(f"Core: guilds={len(bot.guilds)} voice_clients={len(bot.voice_clients)} mysql={'on' if POOL else 'off'}")
+    lines.append(f"Sentience: {'on' if sentience_enabled() else 'off'} dialect={sentience_dialect()}")
+    lines.append(f"Presence: {'auto' if autopresence_enabled() else 'manual'} state={getattr(bot, 'status', 'unknown')}")
+    ambient = ambient_engine.ambient_status()
+    lines.append(f"Ambient: {'on' if ambient.get('enabled') else 'off'}")
+    lines.append(f"Mirrors: total={len(rules)} enabled={mirror_enabled} disabled={mirror_disabled}")
+    lines.append(f"Watchers: {len(cfg().get('targets', {}) or {})}")
+    lines.append(f"DM bridges active: {dm_bridge_count}")
+    lines.append(f"AI: {'online' if ai_ok else 'offline'} queue={len(cfg().get('ai', {}).get('queue', {}) or {})} last_rate={last_rate_text}")
+    lines.append(f"Tasks: config_reload={_task_state(config_reload)} json_autosave={_task_state(json_autosave)} mirror_integrity={_task_state(mirror_integrity_check)}")
+    lines.append(f"Tasks: server_status={_task_state(server_status_update)} dm_bridge_archive={_task_state(dm_bridge_archive)} presence={_task_state(presence_controller)}")
+    lines.append(f"Tasks: daily_reflection={_task_state(daily_reflection_loop)} monologue={_task_state(internal_monologue_loop)} maintenance={_task_state(sentience_maintenance_loop)}")
+    lines.append(f"Tasks: diagnostics={_task_state(diagnostics_loop)}")
+    return lines
 
 async def _generate_internal_monologue(context: Dict[str, Any]) -> str:
     mandy = bot.get_cog("MandyAI")
@@ -4208,7 +4347,7 @@ async def ensure_menu_panel(
     menu_style = str(sentience_cfg(cfg()).get("menu_style") or "default")
     payload: Dict[str, Any] = {"view": view}
     if menu_style == "glitchy":
-        title = "Mandy Menu" if entry_key == "user_menu" else "GOD MENU"
+        title = "Mandy Menu" if str(entry_key).startswith("user_menu") else "GOD MENU"
         glitch = [
             f"// {title.upper()} :: CORTEX LINK ACTIVE //",
             "Signal integrity: stable",
@@ -4216,7 +4355,7 @@ async def ensure_menu_panel(
             "Latency: minimal",
             "Command surface: armed",
         ]
-        if entry_key == "god_menu":
+        if str(entry_key).startswith("god_menu"):
             glitch.insert(2, "Immune clearance: elevated")
         emb = discord.Embed(
             title=title,
@@ -4770,8 +4909,8 @@ async def setup_destructive(guild: discord.Guild) -> bool:
     return True
 
 BIO_LAYOUT = {
-    "CEREBRAL CORTEX": ["synaptic-gap", "manual-for-living", "thoughts"],
-    "BIO-FILTER": ["audit-memory", "containment-ward"],
+    "CEREBRAL CORTEX": ["synaptic-gap", "menu-hub", "manual-for-living", "thoughts"],
+    "BIO-FILTER": ["audit-memory", "containment-ward", "diagnostics"],
     "VISUAL CORTEX": ["visual-feed"],
 }
 async def _ensure_recovery_anchor(guild: discord.Guild) -> Optional[Tuple[discord.CategoryChannel, discord.TextChannel, discord.TextChannel]]:
@@ -5015,6 +5154,11 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
         logs["debug"] = created["containment-ward"].id
         logs["ai"] = created["containment-ward"].id
         logs["voice"] = created["containment-ward"].id
+    if created.get("diagnostics"):
+        cfg().setdefault("diagnostics", {})["channel_id"] = created["diagnostics"].id
+    if created.get("manual-for-living"):
+        cfg().setdefault("manual", {})["channel_id"] = created["manual-for-living"].id
+        cfg().setdefault("manual", {})["auto_upload_enabled"] = True
 
     channels_cfg = cfg().setdefault("command_channels", {})
     channels_cfg["user"] = "synaptic-gap"
@@ -5031,6 +5175,22 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
             pass
 
     await ensure_menu_panels(guild)
+    menu_hub = created.get("menu-hub")
+    if menu_hub:
+        await ensure_menu_panel(
+            guild,
+            "menu-hub",
+            "user_menu_hub",
+            "**Mandy Menu**\nUse the buttons below.",
+            UserMenuView(0, timeout=None),
+        )
+        await ensure_menu_panel(
+            guild,
+            "menu-hub",
+            "god_menu_hub",
+            "**GOD MENU**\nGOD-only controls.",
+            GodMenuView(0, timeout=None),
+        )
 
     for g in bot.guilds:
         if g.id == ADMIN_GUILD_ID:
@@ -5131,7 +5291,7 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
             await setup_log("BIO Phase 5/5: legacy ops reseed")
 
             missing: List[str] = []
-            for name in ("thoughts", "synaptic-gap", "audit-memory", "visual-feed"):
+            for name in ("thoughts", "synaptic-gap", "menu-hub", "audit-memory", "visual-feed", "diagnostics"):
                 if name not in created:
                     missing.append(name)
             recovery_ch = find_text_by_name(guild, "command-line")
@@ -5153,6 +5313,7 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
             if missing:
                 await setup_log("BIO verify missing: " + ", ".join(missing))
 
+            await manual_upload_if_needed(force=True)
             msg = "BIO-GENESIS complete. Cortex online. Legacy ops synced. Mirrors standing by."
             if system_ch:
                 try:
@@ -5465,6 +5626,39 @@ class SetupBioConfirmView(BaseView):
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._finalize(interaction, False, "BIO-GENESIS cancelled.")
+
+class SetupModeView(BaseView):
+    def __init__(self, author_id: int):
+        super().__init__(author_id, timeout=90)
+
+    async def _start(self, interaction: discord.Interaction, mode: str):
+        if mode in ("fullsync", "destructive") and not is_super(interaction.user.id):
+            return await interaction.response.send_message("SUPERUSER only.", ephemeral=True)
+        if mode == "destructive":
+            choice = await prompt_setup_destructive_choice_with_channel(interaction.channel, interaction.user.id)
+            if choice == "cancel":
+                return await interaction.response.send_message("Destructive setup cancelled.", ephemeral=True)
+            mode = choice
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.response.edit_message(content=f"Setup starting: {mode}", view=self)
+        except Exception:
+            pass
+        asyncio.create_task(run_full_setup(interaction.guild, mode, actor_id=interaction.user.id))
+        await audit(interaction.user.id, "Setup run", {"mode": mode})
+
+    @discord.ui.button(label="Bootstrap", style=discord.ButtonStyle.secondary)
+    async def bootstrap_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._start(interaction, "bootstrap")
+
+    @discord.ui.button(label="Fullsync", style=discord.ButtonStyle.primary)
+    async def fullsync_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._start(interaction, "fullsync")
+
+    @discord.ui.button(label="Destructive", style=discord.ButtonStyle.danger)
+    async def destructive_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._start(interaction, "destructive")
 
 async def user_status_text(user: discord.abc.User) -> str:
     parts = []
@@ -6737,6 +6931,35 @@ async def prompt_setup_destructive_choice(ctx: commands.Context) -> str:
             pass
     return choice
 
+async def prompt_setup_destructive_choice_with_channel(channel: discord.abc.Messageable, user_id: int) -> str:
+    view = SetupDestructiveChoiceView(user_id)
+    msg = await channel.send("Destructive setup: choose rebuild mode.", view=view)
+    view.message = msg
+    await view.wait()
+    choice = view.choice or "destructive"
+    if choice == "cancel":
+        try:
+            await msg.edit(content="Destructive setup cancelled.", view=None)
+        except Exception:
+            pass
+    return choice
+
+async def prompt_setup_menu(ctx: commands.Context) -> None:
+    menu = SetupModeView(ctx.author.id)
+    desc = [
+        "**Bootstrap**: Safe sync. Creates missing channels/menus and rebinds logs without deleting.",
+        "**Fullsync**: Destructive rebuild of the legacy admin layout (managed categories) + mirror sync.",
+        "**Destructive**: Same as fullsync, plus AI/default choice prompt for the wipe.",
+        "Backfill: mirror feeds are backfilled only if `database.json.auto.backfill` is enabled.",
+        "DM bridges, stats, watchers are preserved. Use `!setup_bio` for the Sentient Core layout.",
+    ]
+    emb = discord.Embed(
+        title="Setup Control Panel",
+        description="\n".join(desc),
+        color=discord.Color.dark_teal(),
+    )
+    await ctx.send(embed=emb, view=menu)
+
 async def prompt_setup_bio_confirm(ctx: commands.Context) -> bool:
     view = SetupBioConfirmView(ctx.author.id)
     msg = await ctx.send("BIO-GENESIS will rebuild the admin hub. Confirm?", view=view)
@@ -6753,6 +6976,8 @@ async def setup(ctx: commands.Context, mode: str = ""):
         return
     await safe_delete(ctx.message)
     mode = (mode or "").lower().strip()
+    if not mode:
+        return await prompt_setup_menu(ctx)
     if mode not in ("fullsync", "bootstrap", "destructive"):
         return await ctx.send(
             "Use: `!setup fullsync` (destructive), `!setup destructive`, or `!setup bootstrap`",
@@ -7650,6 +7875,8 @@ async def on_ready():
     daily_reflection_loop.start()
     internal_monologue_loop.start()
     sentience_maintenance_loop.start()
+    diagnostics_loop.start()
+    manual_upload_loop.start()
     await resume_live_stats_panels()
     await resume_global_live_panel()
     print(f"Logged in as {bot.user} ({bot.user.id}) | mysql={bool(POOL)}")
@@ -7849,6 +8076,34 @@ async def sentience_maintenance_loop():
                 await log_to("ai", f"AI queue cleanup removed {pruned} stale job(s)", subsystem="AI", severity="INFO")
         except Exception:
             pass
+
+@tasks.loop(minutes=10)
+async def diagnostics_loop():
+    ch = await _resolve_diagnostics_channel()
+    if not ch:
+        return
+    dm_bridges = await dm_bridge_list_active()
+    lines = [f"Diagnostics Snapshot (UTC {datetime.datetime.utcnow().replace(microsecond=0).isoformat()}Z)"]
+    lines.extend(_diagnostic_status_lines(len(dm_bridges)))
+    payload = "\n".join(lines[:25])
+    diag = diagnostics_cfg()
+    msg_id = int(diag.get("message_id", 0) or 0)
+    try:
+        if msg_id:
+            msg = await ch.fetch_message(msg_id)
+            await msg.edit(content=payload)
+        else:
+            msg = await ch.send(payload)
+            diag["message_id"] = msg.id
+            await STORE.mark_dirty()
+        diag["last_update"] = now_ts()
+        await STORE.mark_dirty()
+    except Exception:
+        return
+
+@tasks.loop(minutes=30)
+async def manual_upload_loop():
+    await manual_upload_if_needed()
 
 @tasks.loop(minutes=12)
 async def dm_bridge_archive():

@@ -152,14 +152,17 @@ Quick reference lives in `COMMANDS.md`. The highlights:
 - `!godmenu`: admin panel (level >= 90)
 
 ### Setup / Ops (admin hub only)
+- `!setup`: opens a menu explaining Bootstrap vs Fullsync vs Destructive and starts the selected flow.
 - `!setup bootstrap`
 - `!setup fullsync` / `!setup destructive` (SUPERUSER only)
 - Destructive mode now prompts for Default vs AI-assisted rebuild (Gemini). AI mode sends a sentient brief + post-rebuild debrief and falls back to default if rate-limited or unavailable.
-- `!setup_bio`: bio-themed admin hub rebuild (SUPERUSER only). Includes recovery anchor, sentience channels, and automatic legacy ops reseed.
+- `!setup_bio`: bio-themed admin hub rebuild (SUPERUSER only). Includes recovery anchor, sentience channels, a menu hub, and automatic legacy ops reseed.
 - During `!setup_bio`, Mandy can optionally generate AI-assisted topics/pins and will ask for confirmation before applying.
 - `!setup_bio` also re-ensures roles, quarantine permissions, and guest permissions in the admin hub after rebuild.
+- Manual auto-upload: when enabled, Mandy posts the latest `docs/MANDY_MANUAL.md` to `#manual-for-living` (tracked by file hash).
 - `!leavevc`: emergency voice disconnect (SUPERUSER only)
 - `!health`: health snapshot (level >= 70)
+- `#diagnostics`: auto-updated status board every 10 minutes
 
 ### Watchers / Mirrors / DM bridges
 - `!watchers` / `!watcher`: show watch list (level >= 50)
