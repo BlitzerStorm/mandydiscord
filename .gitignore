@@ -1,0 +1,41 @@
+*.zip
+*.tar
+archive-*.tar/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.code-workspace
+
+# Secrets / env
+.env
+passwords.txt
+passwords.local.txt
+
+# Runtime data
+database.json
+*.db
+*.sqlite
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

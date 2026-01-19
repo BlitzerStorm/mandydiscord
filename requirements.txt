@@ -1,0 +1,16 @@
+# ============================================================
+# MandyDiscord Bot - Requirements
+# ============================================================
+#
+# Install:
+#   pip install -r requirements.txt
+#
+
+discord.py>=2.3.0
+aiofiles>=23.1.0
+aiomysql>=0.2.0
+
+# Gemini (optional but recommended for AI features)
+google-genai>=0.3.0
+PyNaCl>=1.5.0
+yt-dlp>=2024.9.1
