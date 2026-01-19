@@ -1167,6 +1167,12 @@ ACTIVE_TASKS: Dict[str, Set[asyncio.Task]] = {}
 MANDY_EXTENSION = "cogs.mandy_ai"
 MANDY_LOADED = False
 
+SETUP_ADAPTIVE_ACTIVE = False
+SETUP_DELAY_OVERRIDE: Optional[float] = None
+SETUP_DELAY_MIN = 0.4
+SETUP_DELAY_MAX = 4.0
+SETUP_DELAY_STEP = 0.05
+
 def track_task(task: asyncio.Task, label: str) -> asyncio.Task:
     bucket = ACTIVE_TASKS.setdefault(label, set())
     bucket.add(task)
@@ -3057,16 +3063,54 @@ async def resume_global_live_panel():
         "stats",
     )
 
-def setup_delay() -> float:
+def setup_delay_base() -> float:
     try:
         return max(0.0, float(cfg().get("tuning", {}).get("setup_delay", 1.0)))
     except Exception:
         return 1.0
 
-async def setup_pause():
+def setup_delay() -> float:
+    override = SETUP_DELAY_OVERRIDE
+    if override is not None:
+        try:
+            return max(0.0, float(override))
+        except Exception:
+            return setup_delay_base()
+    return setup_delay_base()
+
+def _rate_limit_info(exc: Exception) -> Tuple[bool, Optional[float]]:
+    status = getattr(exc, "status", None)
+    retry_after = getattr(exc, "retry_after", None)
+    if status == 429 or retry_after is not None:
+        try:
+            retry_val = float(retry_after) if retry_after is not None else None
+        except Exception:
+            retry_val = None
+        return True, retry_val
+    return False, None
+
+def _setup_adjust_delay(success: bool, retry_after: Optional[float] = None) -> None:
+    global SETUP_DELAY_OVERRIDE
+    if not SETUP_ADAPTIVE_ACTIVE:
+        return
+    current = SETUP_DELAY_OVERRIDE if SETUP_DELAY_OVERRIDE is not None else setup_delay_base()
+    if success:
+        new_delay = max(SETUP_DELAY_MIN, current - SETUP_DELAY_STEP)
+    else:
+        bump = (retry_after + 0.25) if retry_after else (current * 1.4 + 0.25)
+        new_delay = min(SETUP_DELAY_MAX, max(current, bump))
+    SETUP_DELAY_OVERRIDE = new_delay
+
+async def setup_pause(success: bool = True, retry_after: Optional[float] = None):
+    _setup_adjust_delay(success, retry_after)
     delay = setup_delay()
     if delay > 0:
         await asyncio.sleep(delay)
+
+async def _setup_pause_on_rate_limit(exc: Exception) -> None:
+    is_rate, retry_after = _rate_limit_info(exc)
+    if is_rate:
+        await setup_pause(success=False, retry_after=retry_after)
 
 # -----------------------------
 # Watchers (your JSON targets) + optional MySQL sync
@@ -4306,9 +4350,13 @@ async def ensure_category(guild: discord.Guild, name: str) -> discord.CategoryCh
     cat = discord.utils.get(guild.categories, name=name)
     if cat:
         return cat
-    cat = await guild.create_category(name)
-    await setup_pause()
-    return cat
+    try:
+        cat = await guild.create_category(name)
+        await setup_pause()
+        return cat
+    except Exception as exc:
+        await _setup_pause_on_rate_limit(exc)
+        raise
 
 async def ensure_text_channel(
     guild: discord.Guild,
@@ -4327,12 +4375,16 @@ async def ensure_text_channel(
             if edits:
                 await ch.edit(**edits)
                 await setup_pause()
-        except Exception:
-            pass
+        except Exception as exc:
+            await _setup_pause_on_rate_limit(exc)
         return ch
-    ch = await guild.create_text_channel(name, category=category, topic=topic or None)
-    await setup_pause()
-    return ch
+    try:
+        ch = await guild.create_text_channel(name, category=category, topic=topic or None)
+        await setup_pause()
+        return ch
+    except Exception as exc:
+        await _setup_pause_on_rate_limit(exc)
+        raise
 
 async def ensure_pinned(channel: discord.TextChannel, content: str):
     key = content.splitlines()[0][:60]
@@ -4980,7 +5032,8 @@ async def _setup_bio_wipe(guild: discord.Guild, recovery_id: int) -> bool:
                 await ch.delete()
                 deleted += 1
                 await setup_pause()
-            except Exception:
+            except Exception as exc:
+                await _setup_pause_on_rate_limit(exc)
                 continue
         for cat in list(guild.categories):
             if cat.id in preserved:
@@ -4989,7 +5042,8 @@ async def _setup_bio_wipe(guild: discord.Guild, recovery_id: int) -> bool:
                 await cat.delete()
                 deleted += 1
                 await setup_pause()
-            except Exception:
+            except Exception as exc:
+                await _setup_pause_on_rate_limit(exc)
                 continue
         remaining = [
             c for c in guild.channels
@@ -5266,12 +5320,134 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
 
     await log_to("mirror", "Mirror sync complete", subsystem="SENSORY", severity="INFO")
 
+async def _pause_background_tasks_for_setup() -> Dict[str, Any]:
+    state: Dict[str, Any] = {"loops": {}, "ambient_enabled": False}
+    current = asyncio.current_task()
+    tasks_to_cancel: Set[asyncio.Task] = set()
+    for bucket in ACTIVE_TASKS.values():
+        tasks_to_cancel.update(bucket)
+    tasks_to_cancel.update(SPECIAL_VOICE_LEAVE_TASKS.values())
+    tasks_to_cancel.update(MOVIE_STAY_TASKS.values())
+    tasks_to_cancel.update(LIVE_STATS_TASKS.values())
+    if current in tasks_to_cancel:
+        tasks_to_cancel.discard(current)
+
+    cancelled = 0
+    for task in tasks_to_cancel:
+        if task and not task.done():
+            task.cancel()
+            cancelled += 1
+
+    SPECIAL_VOICE_LEAVE_TASKS.clear()
+    MOVIE_STAY_TASKS.clear()
+    LIVE_STATS_TASKS.clear()
+
+    ai_cancelled = 0
+    mandy = bot.get_cog("MandyAI")
+    queue_tasks = getattr(mandy, "_queue_tasks", None) if mandy else None
+    if isinstance(queue_tasks, dict):
+        for task in list(queue_tasks.values()):
+            if task and not task.done():
+                task.cancel()
+                ai_cancelled += 1
+        queue_tasks.clear()
+        cancelled += ai_cancelled
+
+    state["tasks_cancelled"] = cancelled
+    state["ai_tasks_cancelled"] = ai_cancelled
+
+    loops = {
+        "config_reload": config_reload,
+        "json_autosave": json_autosave,
+        "mirror_integrity": mirror_integrity_check,
+        "server_status": server_status_update,
+        "dm_bridge_archive": dm_bridge_archive,
+        "presence": presence_controller,
+        "daily_reflection": daily_reflection_loop,
+        "monologue": internal_monologue_loop,
+        "maintenance": sentience_maintenance_loop,
+        "diagnostics": diagnostics_loop,
+        "manual_upload": manual_upload_loop,
+    }
+    for name, loop_task in loops.items():
+        running = loop_task.is_running()
+        state["loops"][name] = running
+        if running:
+            try:
+                loop_task.stop()
+            except Exception:
+                pass
+
+    ambient_enabled = bool(cfg().get("ambient_engine", {}).get("enabled", True))
+    state["ambient_enabled"] = ambient_enabled
+    if ambient_enabled:
+        try:
+            await ambient_engine.stop_ambient_engine()
+        except Exception:
+            pass
+    return state
+
+async def _resume_background_tasks_after_setup(state: Dict[str, Any]) -> None:
+    try:
+        await STORE.flush()
+    except Exception:
+        pass
+    loops = state.get("loops", {})
+    loop_map = {
+        "config_reload": config_reload,
+        "json_autosave": json_autosave,
+        "mirror_integrity": mirror_integrity_check,
+        "server_status": server_status_update,
+        "dm_bridge_archive": dm_bridge_archive,
+        "presence": presence_controller,
+        "daily_reflection": daily_reflection_loop,
+        "monologue": internal_monologue_loop,
+        "maintenance": sentience_maintenance_loop,
+        "diagnostics": diagnostics_loop,
+        "manual_upload": manual_upload_loop,
+    }
+    for name, loop_task in loop_map.items():
+        if loops.get(name) and not loop_task.is_running():
+            try:
+                loop_task.start()
+            except Exception:
+                pass
+
+    if state.get("ambient_enabled"):
+        cfg().setdefault("ambient_engine", {})["enabled"] = True
+        try:
+            await STORE.mark_dirty()
+        except Exception:
+            pass
+        try:
+            await ambient_engine.start_ambient_engine(bot)
+        except Exception:
+            pass
+
+    try:
+        await resume_live_stats_panels()
+        await resume_global_live_panel()
+    except Exception:
+        pass
+
 async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
     if guild.id != ADMIN_GUILD_ID:
         return
     await setup_log(f"BIO-GENESIS :: REQUESTED by {actor_id}")
+    global SETUP_ADAPTIVE_ACTIVE, SETUP_DELAY_OVERRIDE
+    prev_adaptive = SETUP_ADAPTIVE_ACTIVE
+    prev_override = SETUP_DELAY_OVERRIDE
+    paused_state: Optional[Dict[str, Any]] = None
+    bio_setup_cfg = sentience_cfg(cfg()).setdefault("bio_setup", {})
+    pause_background = bool(bio_setup_cfg.get("pause_background", True))
+    resume_background = bool(bio_setup_cfg.get("resume_background", False))
     try:
         async with AUTO_SETUP_LOCK:
+            SETUP_ADAPTIVE_ACTIVE = True
+            if SETUP_DELAY_OVERRIDE is None:
+                SETUP_DELAY_OVERRIDE = setup_delay_base()
+            if pause_background:
+                paused_state = await _pause_background_tasks_for_setup()
             system_log = await _setup_bio_preflight(guild)
             if not system_log:
                 await setup_log("BIO-GENESIS aborted: recovery anchor failed.")
@@ -5376,6 +5552,11 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
                 pass
     except Exception as exc:
         await setup_log(f"BIO-GENESIS failed: {exc}")
+    finally:
+        if paused_state is not None and resume_background:
+            await _resume_background_tasks_after_setup(paused_state)
+        SETUP_ADAPTIVE_ACTIVE = prev_adaptive
+        SETUP_DELAY_OVERRIDE = prev_override
 
 async def bot_permissions_text(guild: discord.Guild) -> str:
     m = guild.me

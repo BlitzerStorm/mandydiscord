@@ -22,6 +22,9 @@ def sentience_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     maintenance = root.setdefault("maintenance", {})
     maintenance.setdefault("enabled", True)
     maintenance.setdefault("ai_queue_max_age_hours", 6)
+    bio_setup = root.setdefault("bio_setup", {})
+    bio_setup.setdefault("pause_background", True)
+    bio_setup.setdefault("resume_background", False)
     return root
 
 
