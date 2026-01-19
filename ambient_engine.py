@@ -326,6 +326,10 @@ async def _perform_presence_change() -> None:
     bot = _AMBIENT_BOT
     if not bot:
         return
+    cfg = _get_cfg()
+    presence = cfg.get("presence", {}) if isinstance(cfg.get("presence", {}), dict) else {}
+    if presence.get("autopresence_enabled"):
+        return
     prev_state = _current_presence_state()
     next_state = _next_presence_state(prev_state)
     if next_state == prev_state:

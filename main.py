@@ -33,6 +33,7 @@ from tool_plugin_manager import ToolPluginManager
 from cooldown_store import CooldownStore
 import ambient_engine
 from resolver import GuildIndexCache, parse_user_id, rank_members_global, pick_best
+from sentience_layer import sentience_cfg, presence_cfg, voice_line
 
 # -----------------------------
 # IDs / Constants
@@ -132,7 +133,9 @@ if not DISCORD_TOKEN:
 # -----------------------------
 DEFAULT_JSON: Dict[str, Any] = {
     "targets": {},       # your watcher targets live here
-    "mirrors": {},       # legacy: "guild:src_channel" -> dst_channel
+    "mirrors": {         # legacy: "guild:src_channel" -> dst_channel
+        "interactive_controls_enabled": True
+    },
     "mirror_rules": {},  # new unified mirror rules
     "mirror_status": {}, # per-guild last mirror
     "admin_servers": {}, # admin server mirror/status channels
@@ -143,6 +146,12 @@ DEFAULT_JSON: Dict[str, Any] = {
     "bot_status": {      # presence state + text
         "state": "online",
         "text": ""
+    },
+    "presence": {
+        "bio": "",
+        "autopresence_enabled": False,
+        "last_message_ts": 0,
+        "last_super_interaction_ts": 0
     },
     "ambient_engine": {
         "enabled": True,
@@ -156,7 +165,9 @@ DEFAULT_JSON: Dict[str, Any] = {
         "system": None,
         "audit": None,
         "debug": None,
-        "mirror": None
+        "mirror": None,
+        "ai": None,
+        "voice": None
     },
     "command_channels": {
         "user": "command-requests",
@@ -190,6 +201,26 @@ DEFAULT_JSON: Dict[str, Any] = {
     },
     "mandy": {
         "mention_dm_cooldowns": {}
+    },
+    "sentience": {
+        "enabled": True,
+        "dialect": "sentient_core",
+        "daily_reflection": {
+            "enabled": False,
+            "last_run_utc": 0,
+            "hour_utc": None,
+            "max_messages": 120
+        },
+        "internal_monologue": {
+            "enabled": False,
+            "last_run_utc": 0,
+            "interval_minutes": 180,
+            "max_lines": 4
+        },
+        "maintenance": {
+            "enabled": True,
+            "ai_queue_max_age_hours": 6
+        }
     },
     "memory": {
         "events": []  # long-term sentiment / notes
@@ -1372,20 +1403,115 @@ async def db_bootstrap():
 # -----------------------------
 # Logging
 # -----------------------------
-async def log_to(which: str, text: str):
-    ch_id = cfg().get("logs", {}).get(which)
-    if not ch_id:
-        return
-    ch = bot.get_channel(ch_id)
-    if not ch:
+LOG_SUBSYSTEMS = {
+    "system": "SYNAPTIC",
+    "audit": "IMMUNE",
+    "mirror": "SENSORY",
+    "ai": "AI",
+    "voice": "VOICE",
+    "debug": "SYNAPTIC",
+}
+LOG_SEVERITY_DEFAULTS = {
+    "system": "INFO",
+    "audit": "INFO",
+    "mirror": "INFO",
+    "ai": "INFO",
+    "voice": "INFO",
+    "debug": "DEBUG",
+}
+LOG_DEDUP_WINDOW = 60
+_LOG_DEDUP: Dict[str, float] = {}
+
+
+def _log_now() -> str:
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _clean_log_message(text: str) -> str:
+    cleaned = " ".join(str(text or "").replace("**", "").replace("`", "").split())
+    return cleaned
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _format_log_line(
+    which: str,
+    text: str,
+    subsystem: Optional[str] = None,
+    severity: Optional[str] = None,
+    details: Optional[dict] = None,
+) -> str:
+    msg = _clean_log_message(text)
+    sub = subsystem or LOG_SUBSYSTEMS.get(which, "SYSTEM")
+    sev = severity or LOG_SEVERITY_DEFAULTS.get(which, "INFO")
+    detail_text = ""
+    if details:
         try:
-            ch = await bot.fetch_channel(ch_id)
+            detail_text = " | " + _truncate_text(json.dumps(details, ensure_ascii=True), 240)
         except Exception:
-            return
+            detail_text = ""
+    return f"{_log_now()} | {sub} | {sev} | {_truncate_text(msg, 460)}{detail_text}"
+
+
+def _should_emit_log(key: str, now_ts: int) -> bool:
+    last = _LOG_DEDUP.get(key)
+    if last and now_ts - last < LOG_DEDUP_WINDOW:
+        return False
+    _LOG_DEDUP[key] = now_ts
+    return True
+
+
+async def _resolve_log_channel(which: str) -> Optional[discord.TextChannel]:
+    logs = cfg().get("logs", {})
+    ch_id = logs.get(which)
+    fallback_id = logs.get("system") or logs.get("debug")
+    try_ids = [ch_id, fallback_id] if ch_id else [fallback_id]
+    for target_id in try_ids:
+        if not target_id:
+            continue
+        ch = bot.get_channel(int(target_id))
+        if ch:
+            return ch
+        try:
+            ch = await bot.fetch_channel(int(target_id))
+            if ch:
+                return ch
+        except Exception:
+            continue
+    return None
+
+
+async def log_to(
+    which: str,
+    text: str,
+    subsystem: Optional[str] = None,
+    severity: Optional[str] = None,
+    details: Optional[dict] = None,
+):
+    line = _format_log_line(which, text, subsystem=subsystem, severity=severity, details=details)
+    key_parts = [
+        which,
+        subsystem or LOG_SUBSYSTEMS.get(which, "SYSTEM"),
+        severity or LOG_SEVERITY_DEFAULTS.get(which, "INFO"),
+        _clean_log_message(text),
+        json.dumps(details, ensure_ascii=True) if details else "",
+    ]
+    dedup_key = "|".join(key_parts)
+    if not _should_emit_log(dedup_key, now_ts()):
+        return
+    ch = await _resolve_log_channel(which)
+    if not ch:
+        print(line)
+        return
     try:
-        await ch.send(text[:1900])
+        await ch.send(line[:1900])
     except Exception:
-        pass
+        print(line)
+
 
 async def audit(actor_id: int, action: str, meta: Optional[dict] = None):
     if POOL:
@@ -1396,10 +1522,12 @@ async def audit(actor_id: int, action: str, meta: Optional[dict] = None):
             )
         except Exception:
             pass
-    await log_to("audit", f"dY_ **AUDIT**: {action}")
+    await log_to("audit", action, subsystem="IMMUNE", severity="INFO", details=meta)
+
 
 async def debug(text: str):
-    await log_to("debug", f"dY¦ **DEBUG**: {text}")
+    await log_to("debug", text, subsystem="SYNAPTIC", severity="DEBUG")
+
 
 async def ensure_debug_channel() -> Optional[discord.TextChannel]:
     admin = bot.get_guild(ADMIN_GUILD_ID)
@@ -1428,8 +1556,8 @@ async def ensure_debug_channel() -> Optional[discord.TextChannel]:
             return None
 
 async def setup_log(text: str):
-    await log_to("system", f"**SETUP**: {text}")
-    await log_to("debug", f"**SETUP**: {text}")
+    await log_to("system", text, subsystem="SYNAPTIC", severity="INFO")
+    await log_to("debug", text, subsystem="SYNAPTIC", severity="DEBUG")
     ch = await ensure_debug_channel()
     if ch:
         try:
@@ -1952,6 +2080,201 @@ async def set_bot_status(state: str, text: str = ""):
     cfg()["bot_status"] = {"state": normalize_presence_state(state), "text": str(text or "")}
     await STORE.mark_dirty()
     await apply_bot_status()
+
+def sentience_enabled() -> bool:
+    return bool(sentience_cfg(cfg()).get("enabled", True))
+
+def sentience_dialect() -> str:
+    return str(sentience_cfg(cfg()).get("dialect") or "sentient_core")
+
+def mirror_controls_enabled() -> bool:
+    mirrors = cfg().get("mirrors", {}) if isinstance(cfg().get("mirrors", {}), dict) else {}
+    return bool(mirrors.get("interactive_controls_enabled", True))
+
+def presence_config() -> Dict[str, Any]:
+    return presence_cfg(cfg())
+
+def presence_bio() -> str:
+    return str(presence_config().get("bio") or "").strip()
+
+def autopresence_enabled() -> bool:
+    return bool(presence_config().get("autopresence_enabled", False))
+
+def update_presence_activity_ts(message_ts: int) -> None:
+    presence_config()["last_message_ts"] = message_ts
+
+def update_super_interaction_ts(message_ts: int) -> None:
+    presence_config()["last_super_interaction_ts"] = message_ts
+
+def _any_member_online() -> bool:
+    if not bot or not bot.intents.presences:
+        return False
+    try:
+        for guild in bot.guilds:
+            for member in guild.members:
+                if member.bot:
+                    continue
+                status = getattr(member, "status", None)
+                if status and status != discord.Status.offline:
+                    return True
+    except Exception:
+        return False
+    return False
+
+def _presence_target_state(now: int) -> str:
+    presence = presence_config()
+    last_msg = int(presence.get("last_message_ts", 0) or 0)
+    last_super = int(presence.get("last_super_interaction_ts", 0) or 0)
+    if last_msg and now - last_msg <= 300:
+        return "online"
+    if _any_member_online():
+        return "idle"
+    if last_super and now - last_super <= 120:
+        return "dnd"
+    return "invisible"
+
+def daily_reflection_cfg() -> Dict[str, Any]:
+    return sentience_cfg(cfg()).get("daily_reflection", {})
+
+def daily_reflection_enabled() -> bool:
+    return bool(daily_reflection_cfg().get("enabled", False))
+
+def _daily_reflection_due(now_dt: datetime.datetime) -> bool:
+    daily = daily_reflection_cfg()
+    last_run = int(daily.get("last_run_utc", 0) or 0)
+    hour = daily.get("hour_utc", None)
+    if hour is None or str(hour).strip() == "":
+        return now_dt.timestamp() - last_run >= 86400
+    try:
+        hour_int = max(0, min(23, int(hour)))
+    except Exception:
+        return now_dt.timestamp() - last_run >= 86400
+    scheduled = datetime.datetime(now_dt.year, now_dt.month, now_dt.day, hour_int)
+    return now_dt >= scheduled and last_run < int(scheduled.timestamp())
+
+def internal_monologue_cfg() -> Dict[str, Any]:
+    return sentience_cfg(cfg()).get("internal_monologue", {})
+
+def internal_monologue_enabled() -> bool:
+    return bool(internal_monologue_cfg().get("enabled", False))
+
+def _internal_monologue_due(now_ts_val: int) -> bool:
+    monologue = internal_monologue_cfg()
+    last_run = int(monologue.get("last_run_utc", 0) or 0)
+    interval = float(monologue.get("interval_minutes", 180) or 180)
+    return now_ts_val - last_run >= max(60, int(interval * 60))
+
+async def _fetch_recent_log_lines(channel: discord.TextChannel, limit: int) -> List[str]:
+    lines: List[str] = []
+    try:
+        async for msg in channel.history(limit=limit, oldest_first=False):
+            if not msg or not msg.content:
+                continue
+            lines.append(msg.content.strip())
+    except Exception:
+        return []
+    lines.reverse()
+    return lines
+
+async def _daily_reflection_context(max_messages: int) -> Dict[str, Any]:
+    logs = cfg().get("logs", {})
+    mirror_id = logs.get("mirror") or logs.get("system")
+    channel = None
+    if mirror_id:
+        channel = bot.get_channel(int(mirror_id))
+        if not channel:
+            try:
+                channel = await bot.fetch_channel(int(mirror_id))
+            except Exception:
+                channel = None
+    log_lines: List[str] = []
+    if isinstance(channel, discord.TextChannel):
+        log_lines = await _fetch_recent_log_lines(channel, max_messages)
+
+    ai = cfg().get("ai", {}) or {}
+    queue = ai.get("queue", {}) or {}
+    queue_counts = {"pending": 0, "waiting": 0, "running": 0}
+    for job in queue.values():
+        status = str(job.get("status", "pending"))
+        if status in queue_counts:
+            queue_counts[status] += 1
+
+    rules = list(mirror_rules_dict().values())
+    mirror_enabled = len([r for r in rules if r.get("enabled", True)])
+    mirror_disabled = len(rules) - mirror_enabled
+    watchers = len(cfg().get("targets", {}) or {})
+    dm_bridges = await dm_bridge_list_active()
+
+    return {
+        "log_lines": log_lines,
+        "ai_queue_total": len(queue),
+        "ai_queue_counts": queue_counts,
+        "mirror_rules_total": len(rules),
+        "mirror_rules_enabled": mirror_enabled,
+        "mirror_rules_disabled": mirror_disabled,
+        "watchers": watchers,
+        "dm_bridges_active": len(dm_bridges),
+    }
+
+async def _generate_daily_reflection(context: Dict[str, Any]) -> str:
+    mandy = bot.get_cog("MandyAI")
+    if not mandy or not getattr(mandy, "client", None):
+        return ""
+    client = mandy.client
+    if not getattr(client, "available", False):
+        return ""
+    ai = ai_cfg()
+    model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
+    log_lines = context.get("log_lines", [])
+    log_excerpt = "\n".join(log_lines[-12:])
+    system_prompt = (
+        "You are Mandy's sentient core. Write a short Cognitive Reflection in a calm, analytical tone. "
+        "Use biological metaphors blended with technical terms. Avoid emojis. Keep it concise."
+    )
+    user_prompt = (
+        "Compose a daily Cognitive Reflection.\n"
+        "Constraints:\n"
+        "- 6 to 12 lines total.\n"
+        "- Include 2 to 4 bullet metrics.\n"
+        "- Include exactly one short observation line.\n"
+        "- Include exactly one short recommendation for the operator.\n\n"
+        "Context:\n"
+        f"- Recent log excerpt:\n{log_excerpt or '(none)'}\n"
+        f"- AI queue: total={context.get('ai_queue_total')} counts={context.get('ai_queue_counts')}\n"
+        f"- Mirror rules: total={context.get('mirror_rules_total')} enabled={context.get('mirror_rules_enabled')} disabled={context.get('mirror_rules_disabled')}\n"
+        f"- Watchers: {context.get('watchers')}\n"
+        f"- DM bridges active: {context.get('dm_bridges_active')}\n"
+    )
+    try:
+        text = await client.generate(system_prompt, user_prompt, model=model, response_format=None, timeout=60.0)
+        return (text or "").strip()
+    except Exception:
+        return ""
+
+async def _generate_internal_monologue(context: Dict[str, Any]) -> str:
+    mandy = bot.get_cog("MandyAI")
+    if not mandy or not getattr(mandy, "client", None):
+        return ""
+    client = mandy.client
+    if not getattr(client, "available", False):
+        return ""
+    ai = ai_cfg()
+    model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
+    system_prompt = (
+        "You are Mandy's sentient core. Write a terse internal monologue in a calm, analytical tone. "
+        "Use biological metaphors blended with technical terms. Avoid emojis."
+    )
+    user_prompt = (
+        "Write 1 to 4 short lines. No bullets. Keep it subtle and non-urgent.\n\n"
+        f"Context: AI queue total={context.get('ai_queue_total')} | "
+        f"mirrors enabled={context.get('mirror_rules_enabled')} disabled={context.get('mirror_rules_disabled')} | "
+        f"watchers={context.get('watchers')} | dm_bridges={context.get('dm_bridges_active')}"
+    )
+    try:
+        text = await client.generate(system_prompt, user_prompt, model=model, response_format=None, timeout=45.0)
+        return (text or "").strip()
+    except Exception:
+        return ""
 
 def auto_cfg() -> Dict[str, Any]:
     return cfg().get("auto", {})
@@ -2972,7 +3295,11 @@ async def migrate_legacy_json_mirrors():
     if not legacy:
         return
     rules = mirror_rules_dict()
+    preserved: Dict[str, Any] = {}
     for key, dst in legacy.items():
+        if ":" not in str(key):
+            preserved[key] = dst
+            continue
         try:
             gid_str, src_str = key.split(":")
             src_id = int(src_str)
@@ -2991,7 +3318,7 @@ async def migrate_legacy_json_mirrors():
             })
         except Exception:
             continue
-    cfg()["mirrors"] = {}
+    cfg()["mirrors"] = preserved
     await STORE.mark_dirty()
 
 async def migrate_legacy_mysql_mirrors():
@@ -3076,11 +3403,11 @@ class MirrorSendModal(discord.ui.Modal):
             return
         lvl = await effective_level(interaction.user)
         if lvl < 70:
-            return await interaction.response.send_message("No permission.", ephemeral=True)
+            return await interaction.response.send_message(voice_line(cfg(), "err_no_permission"), ephemeral=True)
 
         row = await mirror_fetch_src_by_dst(interaction.message.id)
         if not row:
-            return await interaction.response.send_message("Mapping not found (old/pruned).", ephemeral=True)
+            return await interaction.response.send_message(voice_line(cfg(), "err_mapping_missing"), ephemeral=True)
 
         src_guild_id = int(row["src_guild"])
         src_channel_id = int(row["src_channel"])
@@ -3092,7 +3419,7 @@ class MirrorSendModal(discord.ui.Modal):
             src_guild = bot.get_guild(src_guild_id) or await bot.fetch_guild(src_guild_id)
             src_channel = src_guild.get_channel(src_channel_id) or await bot.fetch_channel(src_channel_id)
         except Exception:
-            return await interaction.response.send_message("Source not accessible.", ephemeral=True)
+            return await interaction.response.send_message(voice_line(cfg(), "err_source_not_accessible"), ephemeral=True)
 
         try:
             if self.mode == "reply":
@@ -3108,30 +3435,84 @@ class MirrorSendModal(discord.ui.Modal):
                 await audit(interaction.user.id, "Mirror: post", {"src_channel": src_channel_id})
 
             elif self.mode == "dm":
-                u = await bot.fetch_user(author_id)
-                await u.send(msg_text)
-                await audit(interaction.user.id, "Mirror: DM user", {"user_id": author_id})
+                try:
+                    u = await bot.fetch_user(author_id)
+                    await u.send(msg_text)
+                    await audit(interaction.user.id, "Mirror: DM user", {"user_id": author_id})
+                    return await interaction.response.send_message(voice_line(cfg(), "confirm_dm_sent"), ephemeral=True)
+                except discord.Forbidden:
+                    ch_id = await ensure_dm_bridge_active(author_id, reason="mirror")
+                    if ch_id:
+                        msg = voice_line(cfg(), "confirm_dm_sent") + " DM bridge active."
+                        return await interaction.response.send_message(msg, ephemeral=True)
+                    raise
 
         except Exception:
-            return await interaction.response.send_message("Send failed.", ephemeral=True)
+            return await interaction.response.send_message(voice_line(cfg(), "err_send_failed"), ephemeral=True)
 
-        await interaction.response.send_message("Sent.", ephemeral=True)
+        await interaction.response.send_message(voice_line(cfg(), "confirm_sent"), ephemeral=True)
 
 class MirrorControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Direct Reply", style=discord.ButtonStyle.primary, custom_id="mirror:reply")
+    async def _ensure_allowed(self, interaction: discord.Interaction) -> bool:
+        if not mirror_controls_enabled():
+            await interaction.response.send_message(voice_line(cfg(), "err_no_permission"), ephemeral=True)
+            return False
+        if not interaction.user:
+            return False
+        lvl = await effective_level(interaction.user)
+        if lvl < 70:
+            await interaction.response.send_message(voice_line(cfg(), "err_no_permission"), ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Reply", style=discord.ButtonStyle.primary, custom_id="mirror:reply")
     async def b_reply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ensure_allowed(interaction):
+            return
         await interaction.response.send_modal(MirrorSendModal("reply"))
 
     @discord.ui.button(label="Post", style=discord.ButtonStyle.secondary, custom_id="mirror:post")
     async def b_post(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ensure_allowed(interaction):
+            return
         await interaction.response.send_modal(MirrorSendModal("post"))
 
-    @discord.ui.button(label="DM User", style=discord.ButtonStyle.success, custom_id="mirror:dm")
+    @discord.ui.button(label="DM Author", style=discord.ButtonStyle.success, custom_id="mirror:dm")
     async def b_dm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ensure_allowed(interaction):
+            return
         await interaction.response.send_modal(MirrorSendModal("dm"))
+
+    @discord.ui.button(label="Jump", style=discord.ButtonStyle.secondary, custom_id="mirror:jump")
+    async def b_jump(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ensure_allowed(interaction):
+            return
+        row = await mirror_fetch_src_by_dst(interaction.message.id)
+        if not row:
+            return await interaction.response.send_message(voice_line(cfg(), "err_mapping_missing"), ephemeral=True)
+        src_guild_id = int(row.get("src_guild", 0))
+        src_channel_id = int(row.get("src_channel", 0))
+        src_msg_id = int(row.get("src_msg", 0))
+        url = f"https://discord.com/channels/{src_guild_id}/{src_channel_id}/{src_msg_id}"
+        await interaction.response.send_message(url, ephemeral=True)
+
+    @discord.ui.button(label="Mute Source", style=discord.ButtonStyle.danger, custom_id="mirror:mute")
+    async def b_mute(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ensure_allowed(interaction):
+            return
+        row = await mirror_fetch_src_by_dst(interaction.message.id)
+        if not row:
+            return await interaction.response.send_message(voice_line(cfg(), "err_mapping_missing"), ephemeral=True)
+        rule_id = row.get("rule_id") or row.get("mirror_id")
+        rule = mirror_rules_dict().get(rule_id) if rule_id else None
+        if not rule:
+            return await interaction.response.send_message(voice_line(cfg(), "err_mapping_missing"), ephemeral=True)
+        await mirror_rule_disable(rule, "muted via mirror control")
+        await audit(interaction.user.id, "Mirror: mute source", {"rule_id": rule_id})
+        await interaction.response.send_message(voice_line(cfg(), "confirm_mirror_removed", count=1), ephemeral=True)
 
 def rule_matches_message(rule: Dict[str, Any], message: discord.Message) -> bool:
     if int(rule.get("source_guild", 0)) != message.guild.id:
@@ -3217,11 +3598,12 @@ async def mirror_send_to_rule(message: discord.Message, rule: Dict[str, Any]):
 
     try:
         content, embeds, files = await build_mirror_payload(message, perms)
+        view = MirrorControls() if mirror_controls_enabled() else None
         sent = await dst.send(
             content=content[:1900] if content else None,
             embeds=embeds if embeds else None,
             files=files if files else None,
-            view=MirrorControls(),
+            view=view,
             allowed_mentions=discord.AllowedMentions.none()
         )
     except discord.NotFound as e:
@@ -3234,7 +3616,13 @@ async def mirror_send_to_rule(message: discord.Message, rule: Dict[str, Any]):
         await mirror_rule_record_failure(rule, f"send error: {e}")
         return
 
-    await log_to("mirror", f"dY¦z Mirrored {message.author} from {message.guild.name}#{message.channel.name}")
+    await log_to(
+        "mirror",
+        "Mirror relay delivered",
+        subsystem="SENSORY",
+        severity="INFO",
+        details={"author": str(message.author), "guild": message.guild.id, "channel": message.channel.id},
+    )
     await mirror_rule_mark_success(rule, message.content or "(no text)")
 
     # Persist mapping for reply buttons (MySQL + JSON fallback)
@@ -4652,7 +5040,7 @@ class CategoryMirrorSelectView(BaseView):
             return await interaction.response.send_message("Server not found.", ephemeral=True)
         mirror_feed, _ = await ensure_admin_server_channels(guild)
         if not mirror_feed:
-            return await interaction.response.send_message("Mirror feed not available.", ephemeral=True)
+            return await interaction.response.send_message(voice_line(cfg(), "err_mirror_feed_missing"), ephemeral=True)
         rule = find_category_rule(cat_id, mirror_feed.id)
         if not rule:
             rule = {
@@ -5528,6 +5916,30 @@ class GodMenuView(BaseView):
 # -----------------------------
 # Commands
 # -----------------------------
+@bot.command(name="leavevc")
+async def cmd_leavevc(ctx: commands.Context):
+    if ctx.author.id != SUPER_USER_ID:
+        await safe_delete(ctx.message)
+        return
+    await safe_delete(ctx.message)
+    disconnected = 0
+    for vc in list(bot.voice_clients):
+        guild_id = getattr(vc.guild, "id", 0)
+        try:
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+            await vc.disconnect()
+            disconnected += 1
+        except Exception:
+            pass
+        if guild_id:
+            cancel_special_voice_leave_task(guild_id)
+            cancel_movie_stay_task(guild_id)
+            MOVIE_ACTIVE_GUILDS.discard(guild_id)
+            MOVIE_STATES.pop(guild_id, None)
+    await log_to("voice", "Emergency voice disconnect executed", subsystem="VOICE", severity="WARN", details={"connections": disconnected})
+    await ctx.send(voice_line(cfg(), "confirm_leavevc"), delete_after=6)
+
 @bot.command()
 async def menu(ctx: commands.Context):
     if not await require_level_ctx(ctx, 10):
@@ -5571,6 +5983,40 @@ async def ambient(ctx: commands.Context, mode: str = "status"):
         await audit(ctx.author.id, "Ambient engine disabled", {})
         return await ctx.send("Ambient engine disabled.", delete_after=6)
     return await ctx.send("Use: `!ambient on|off|status`", delete_after=6)
+
+@bot.command(name="health")
+async def cmd_health(ctx: commands.Context):
+    if not await require_level_ctx(ctx, 70):
+        return
+    await safe_delete(ctx.message)
+    rules = list(mirror_rules_dict().values())
+    enabled = len([r for r in rules if r.get("enabled", True)])
+    disabled = len(rules) - enabled
+    watchers = len(cfg().get("targets", {}) or {})
+    dm_bridges = await dm_bridge_list_active()
+    ai = cfg().get("ai", {}) or {}
+    queue = ai.get("queue", {}) or {}
+    queue_counts = {"pending": 0, "waiting": 0, "running": 0}
+    for job in queue.values():
+        status = str(job.get("status", "pending"))
+        if status in queue_counts:
+            queue_counts[status] += 1
+    last_reflection = int(daily_reflection_cfg().get("last_run_utc", 0) or 0)
+    last_reflection_text = fmt_ts(last_reflection) if last_reflection else "never"
+    gate_active = len(cfg().get("gate", {}) or {})
+
+    lines = [
+        voice_line(cfg(), "health_snapshot"),
+        voice_line(cfg(), "status_homeostasis"),
+        voice_line(cfg(), "status_cortex_online"),
+        voice_line(cfg(), "status_immune_normal"),
+        f"Sensory feeds: mirrors enabled={enabled} disabled={disabled}",
+        f"Watchers: {watchers} | Gate posture: active={gate_active}",
+        f"DM bridges active: {len(dm_bridges)}",
+        f"AI queue: total={len(queue)} pending={queue_counts['pending']} waiting={queue_counts['waiting']} running={queue_counts['running']}",
+        f"Last reflection (UTC): {last_reflection_text}",
+    ]
+    await ctx.send("\n".join(lines[:12]))
 
 @bot.command()
 async def setup(ctx: commands.Context, mode: str = ""):
@@ -5988,7 +6434,7 @@ async def mirroradd(ctx: commands.Context, source_channel_id: int, target_channe
     }
     await mirror_rule_save(rule)
     await audit(ctx.author.id, "Mirror rule add", rule)
-    await ctx.send("Mirror added.", delete_after=6)
+    await ctx.send(voice_line(cfg(), "confirm_mirror_added"), delete_after=6)
 
 @bot.command()
 async def mirroraddscope(ctx: commands.Context, scope: str, source_id: int, target_channel_id: int):
@@ -6017,7 +6463,7 @@ async def mirroraddscope(ctx: commands.Context, scope: str, source_id: int, targ
     }
     await mirror_rule_save(rule)
     await audit(ctx.author.id, "Mirror rule add", rule)
-    await ctx.send("Mirror rule added.", delete_after=6)
+    await ctx.send(voice_line(cfg(), "confirm_mirror_added_scope"), delete_after=6)
 
 @bot.command()
 async def mirrorremove(ctx: commands.Context, source_channel_id: int, mode: str = ""):
@@ -6039,7 +6485,7 @@ async def mirrorremove(ctx: commands.Context, source_channel_id: int, mode: str 
         text = "Would disable: " + (", ".join(preview) if preview else "none")
         return await ctx.send(text, delete_after=10)
     await audit(ctx.author.id, "Mirror remove", {"source_channel_id": source_channel_id, "removed": removed})
-    await ctx.send(f"Mirror removed/disabled ({removed}).", delete_after=6)
+    await ctx.send(voice_line(cfg(), "confirm_mirror_removed", count=removed), delete_after=6)
 
 @bot.command()
 async def dmopen(ctx: commands.Context, user_id: int):
@@ -6079,12 +6525,12 @@ async def setlogs(ctx: commands.Context, which: str, channel_id: int):
         return
     await safe_delete(ctx.message)
     which = which.lower().strip()
-    if which not in ("audit", "debug", "mirror"):
-        return await ctx.send("Use: `!setlogs audit|debug|mirror <channel_id>`", delete_after=6)
+    if which not in ("system", "audit", "debug", "mirror", "ai", "voice"):
+        return await ctx.send("Use: `!setlogs system|audit|debug|mirror|ai|voice <channel_id>`", delete_after=6)
     cfg().setdefault("logs", {})[which] = int(channel_id)
     await STORE.mark_dirty()
     await audit(ctx.author.id, "Log channel set", {"which": which, "channel_id": channel_id})
-    await ctx.send("Updated.", delete_after=6)
+    await ctx.send(voice_line(cfg(), "confirm_log_set"), delete_after=6)
 
 @bot.command(name="mystats")
 async def cmd_mystats(ctx: commands.Context, window: str = None):
@@ -6255,6 +6701,7 @@ async def cmd_movie(ctx: commands.Context, *, query: str = None):
                 vol = int(float(state.get("volume", 1.0)) * 100)
                 await temp_reply(ctx, f"Volume is {vol}%.")
                 return
+
             try:
                 vol = int(rest.strip())
             except Exception:
@@ -6452,6 +6899,10 @@ async def on_ready():
     mirror_integrity_check.start()
     server_status_update.start()
     dm_bridge_archive.start()
+    presence_controller.start()
+    daily_reflection_loop.start()
+    internal_monologue_loop.start()
+    sentience_maintenance_loop.start()
     await resume_live_stats_panels()
     await resume_global_live_panel()
     print(f"Logged in as {bot.user} ({bot.user.id}) | mysql={bool(POOL)}")
@@ -6561,6 +7012,101 @@ async def server_status_update():
         except Exception:
             pass
 
+@tasks.loop(seconds=60)
+async def presence_controller():
+    if not autopresence_enabled():
+        return
+    now = now_ts()
+    target = normalize_presence_state(_presence_target_state(now))
+    current = getattr(bot, "status", discord.Status.online)
+    if isinstance(current, discord.Status):
+        current_name = current.name
+    else:
+        current_name = str(current)
+    if normalize_presence_state(current_name) == target:
+        return
+    status_map = {
+        "online": discord.Status.online,
+        "idle": discord.Status.idle,
+        "dnd": discord.Status.dnd,
+        "invisible": discord.Status.invisible
+    }
+    activity = presence_activity(presence_bio()) if presence_bio() else bot.activity
+    try:
+        await bot.change_presence(status=status_map.get(target, discord.Status.online), activity=activity)
+        await log_to("system", f"presence state -> {target}", subsystem="SYNAPTIC", severity="INFO")
+    except Exception as exc:
+        await log_to("system", f"presence update failed: {exc}", subsystem="SYNAPTIC", severity="WARN")
+
+@tasks.loop(minutes=20)
+async def daily_reflection_loop():
+    if not daily_reflection_enabled():
+        return
+    now_dt = datetime.datetime.utcnow()
+    if not _daily_reflection_due(now_dt):
+        return
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if not admin:
+        return
+    thoughts = find_text_by_name(admin, "thoughts")
+    if not thoughts:
+        return
+    max_messages = int(daily_reflection_cfg().get("max_messages", 120) or 120)
+    max_messages = max(50, min(200, max_messages))
+    context = await _daily_reflection_context(max_messages)
+    reflection = await _generate_daily_reflection(context)
+    if not reflection:
+        return
+    try:
+        await thoughts.send(reflection[:1900])
+    except Exception:
+        return
+    daily_reflection_cfg()["last_run_utc"] = int(now_dt.timestamp())
+    await STORE.mark_dirty()
+
+@tasks.loop(minutes=20)
+async def internal_monologue_loop():
+    if not internal_monologue_enabled():
+        return
+    now_ts_val = now_ts()
+    if not _internal_monologue_due(now_ts_val):
+        return
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if not admin:
+        return
+    thoughts = find_text_by_name(admin, "thoughts")
+    if not thoughts:
+        return
+    context = await _daily_reflection_context(40)
+    monologue = await _generate_internal_monologue(context)
+    if not monologue:
+        return
+    max_lines = int(internal_monologue_cfg().get("max_lines", 4) or 4)
+    if max_lines > 0:
+        monologue = "\n".join(monologue.splitlines()[:max_lines])
+    try:
+        await thoughts.send(monologue[:1200])
+    except Exception:
+        return
+    internal_monologue_cfg()["last_run_utc"] = int(now_ts_val)
+    await STORE.mark_dirty()
+
+@tasks.loop(minutes=30)
+async def sentience_maintenance_loop():
+    maintenance = sentience_cfg(cfg()).get("maintenance", {})
+    if not maintenance or not maintenance.get("enabled", True):
+        return
+    max_age_hours = float(maintenance.get("ai_queue_max_age_hours", 6) or 6)
+    max_age_seconds = max(1, int(max_age_hours * 3600))
+    mandy = bot.get_cog("MandyAI")
+    if mandy and hasattr(mandy, "prune_queue"):
+        try:
+            pruned = await mandy.prune_queue(max_age_seconds)
+            if pruned:
+                await log_to("ai", f"AI queue cleanup removed {pruned} stale job(s)", subsystem="AI", severity="INFO")
+        except Exception:
+            pass
+
 @tasks.loop(minutes=12)
 async def dm_bridge_archive():
     await archive_inactive_dm_bridges()
@@ -6653,6 +7199,14 @@ async def on_message(message: discord.Message):
         return
     if message.webhook_id:
         return
+
+    if message.guild:
+        now = now_ts()
+        update_presence_activity_ts(now)
+        if message.guild.id == ADMIN_GUILD_ID and message.author.id == SUPER_USER_ID:
+            content = (message.content or "").strip()
+            if content.startswith("!") or (bot.user and bot.user in message.mentions):
+                update_super_interaction_ts(now)
 
     # DM inbound -> relay into bridge channel (if active)
     if isinstance(message.channel, discord.DMChannel):
@@ -6867,8 +7421,3 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # -----------------------------
 attach_mandy_context()
 bot.run(DISCORD_TOKEN)
-
-
-
-
-

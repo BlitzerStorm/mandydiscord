@@ -36,7 +36,9 @@ These are primarily managed through the menus, but key commands exist:
 - `!mirrorremove <source_channel_id>`: Remove mirror rule(s) for a channel.
 - `!dmopen <user_id>`: Open DM bridge (admin server).
 - `!dmclose <user_id>`: Close DM bridge.
-- `!setlogs <system|audit|debug|mirror> <channel_id>`: Route logs.
+- `!setlogs <system|audit|debug|mirror|ai|voice> <channel_id>`: Route logs.
+- `!health`: Health snapshot (staff/admin).
+- `!leavevc`: Emergency voice disconnect (SUPERUSER).
 
 ## Stats panels
 - `!mystats [window]`: Your stats for this server.

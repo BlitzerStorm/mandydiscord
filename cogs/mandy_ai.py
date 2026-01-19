@@ -571,6 +571,23 @@ class MandyAI(commands.Cog):
                 counts[status] += 1
         return counts
 
+    async def prune_queue(self, max_age_seconds: int) -> int:
+        cutoff = _now_ts() - max(1, int(max_age_seconds))
+        removed: List[str] = []
+        async with self._queue_lock:
+            for job_id, job in list(self._queue().items()):
+                created_at = int(job.get("created_at", 0) or 0)
+                if created_at and created_at < cutoff:
+                    self._queue().pop(job_id, None)
+                    removed.append(job_id)
+            if removed:
+                await self._mark_dirty()
+        for job_id in removed:
+            task = self._queue_tasks.pop(job_id, None)
+            if task:
+                task.cancel()
+        return len(removed)
+
     def _counter_inc(self, key: str, value: int = 1) -> None:
         counters = self._runtime.setdefault("counters", {})
         counters[key] = int(counters.get(key, 0)) + int(value)

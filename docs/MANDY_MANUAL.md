@@ -113,6 +113,36 @@ Targets (`database.json.command_channels`):
 - `user`: normal command channel name (default `command-requests`)
 - `god`: GOD command channel name (default `admin-chat`)
 
+## Sentience Layer (Optional)
+
+Mandy can run a lightweight sentience layer that changes tone, status posture, and daily reflections.
+
+Core toggles:
+- `database.json.sentience.enabled`: master switch
+- `database.json.sentience.dialect`: `sentient_core` or `plain`
+
+Presence controller (bio never changes):
+- `database.json.presence.bio`: activity text (set once; never modified by code)
+- `database.json.presence.autopresence_enabled`: enable status automation
+- Rules: recent messages => online; otherwise idle if members online; otherwise dnd if SUPERUSER active in admin hub; else invisible
+
+Daily cognition report:
+- `database.json.sentience.daily_reflection.enabled`: enable daily reflection
+- `database.json.sentience.daily_reflection.hour_utc`: optional hour (0-23)
+- `database.json.sentience.daily_reflection.max_messages`: context size for logs
+- Posts to `#thoughts` in the admin hub if the channel exists (silent skip if missing).
+
+Internal monologue (optional):
+- `database.json.sentience.internal_monologue.enabled`: enable periodic monologue
+- `database.json.sentience.internal_monologue.interval_minutes`: spacing between posts
+- `database.json.sentience.internal_monologue.max_lines`: target line count
+
+Mirror interactivity:
+- `database.json.mirrors.interactive_controls_enabled`: buttons under mirrored messages
+
+Self-maintenance:
+- `database.json.sentience.maintenance.ai_queue_max_age_hours`: drop stale AI jobs
+
 ## Core Commands (Prefix: `!`)
 
 Quick reference lives in `COMMANDS.md`. The highlights:
@@ -124,6 +154,8 @@ Quick reference lives in `COMMANDS.md`. The highlights:
 ### Setup / Ops (admin hub only)
 - `!setup bootstrap`
 - `!setup fullsync` / `!setup destructive` (SUPERUSER only)
+- `!leavevc`: emergency voice disconnect (SUPERUSER only)
+- `!health`: health snapshot (level >= 70)
 
 ### Watchers / Mirrors / DM bridges
 - `!watchers` / `!watcher`: show watch list (level >= 50)
@@ -133,7 +165,7 @@ Quick reference lives in `COMMANDS.md`. The highlights:
 - `!mirroraddscope <server|category|channel> <source_id> <target_channel_id>` (level >= 70)
 - `!mirrorremove <source_channel_id> [simulate]` (level >= 70)
 - `!dmopen <user_id>` / `!dmclose <user_id>` (admin hub only, level >= 70)
-- `!setlogs <audit|debug|mirror> <channel_id>` (level >= 90)
+- `!setlogs <system|audit|debug|mirror|ai|voice> <channel_id>` (level >= 90)
 
 ### Stats
 - `!mystats [daily|weekly|monthly|yearly|rolling24]`
@@ -254,6 +286,13 @@ Mandy supports unified mirror rules stored in `database.json.mirror_rules` (and 
 ### Reactions on mirror feeds
 - Reacting to a mirrored message in the admin hub will mirror that emoji back onto the original source message (when permissions allow).
 
+### Interactive controls (optional)
+When enabled, mirrored messages in the admin hub include buttons:
+- Reply (send a reply back to the origin)
+- DM Author (send DM or open a DM bridge)
+- Jump (link to source message)
+- Mute Source (disable the mirror rule)
+
 ## Ark + Phoenix Protocol (Rebuild With Memory)
 
 Mandy can snapshot a server (Ark) and rebuild it (Phoenix) with analysis and safety gates.
@@ -312,6 +351,7 @@ Staff tools:
 - After the VIP exits, the bot waits ~27 seconds and disconnects.
 - Ensure `ffmpeg` is installed and the bot retains `CONNECT/SPEAK` plus `SEND_MESSAGES` rights where it should speak afterward.
 - While a `!movie` session is active in a guild, the VIP auto-join clip is suppressed to avoid competing audio.
+- Emergency exit: `!leavevc` forces a hard disconnect from all voice channels (SUPERUSER only).
 
 ## Stats (Local + Global)
 
@@ -344,14 +384,17 @@ Commands (GOD):
 ## Configuration Reference (database.json)
 
 Top-level keys you will edit most often:
-- `logs`: channel IDs for `system|audit|debug|mirror`
+- `logs`: channel IDs for `system|audit|debug|mirror|ai|voice`
 - `command_channels`: routing mode + channel names
 - `rbac.role_levels`: role-name -> numeric level mapping
 - `permissions`: user-id -> numeric level overrides
 - `ai`: Gemini models, cooldown, limits, queue, installed extensions
 - `auto`: auto-setup/backfill toggles
+- `presence`: bio + autopresence controller toggles
+- `sentience`: dialect, daily reflection schedule, maintenance toggles
 - `targets`: watchers (JSON)
 - `mirror_rules`: mirrors (unified rules)
+- `mirrors.interactive_controls_enabled`: mirror buttons in admin hub
 - `dm_bridges`: DM bridge state
 - `ark_snapshots`, `phoenix_keys`, `memory`, `onboarding`
 - `layout`, `channel_topics`, `pinned_text`: what `!setup` creates and pins
