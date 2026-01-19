@@ -607,6 +607,64 @@ class MandyAI(commands.Cog):
         self._counter_inc("rate_limits", 1)
         self._auto_tune(wait_seconds, source)
 
+    def _sentience_cfg(self) -> Dict[str, Any]:
+        root = self._cfg_root() if callable(self._cfg_root_fn) else {}
+        return root.setdefault("sentience", {})
+
+    def _thoughts_rate_limit(self) -> int:
+        sent = self._sentience_cfg()
+        try:
+            return max(5, int(sent.get("thoughts_rate_limit_seconds", 30)))
+        except Exception:
+            return 30
+
+    async def _resolve_thoughts_channel(self) -> Optional[discord.TextChannel]:
+        sent = self._sentience_cfg()
+        channels = sent.setdefault("channels", {})
+        ch_id = int(channels.get("thoughts", 0) or 0)
+        if ch_id:
+            ch = self.bot.get_channel(ch_id)
+            if not ch:
+                try:
+                    ch = await self.bot.fetch_channel(ch_id)
+                except Exception:
+                    ch = None
+            if isinstance(ch, discord.TextChannel):
+                return ch
+        for guild in self.bot.guilds:
+            ch = discord.utils.get(guild.text_channels, name="thoughts")
+            if isinstance(ch, discord.TextChannel):
+                channels["thoughts"] = ch.id
+                await self._mark_dirty()
+                return ch
+        return None
+
+    async def _post_internal_thought(self, query: str) -> None:
+        sent = self._sentience_cfg()
+        if not sent.get("enabled", True):
+            return
+        now = _now_ts()
+        last = int(sent.get("thoughts_last_ts", 0) or 0)
+        if now - last < self._thoughts_rate_limit():
+            return
+        ch = await self._resolve_thoughts_channel()
+        if not ch:
+            return
+        snippets = [
+            "Cortex engaged; routing a fresh operator impulse.",
+            "Synaptic lattice warming; query ingress stabilized.",
+            "Neural pathways align; intent parsing underway.",
+            "Homeostasis holds; cognition cycle initiating.",
+            "Signal received; executive function online.",
+        ]
+        line = random.choice(snippets)
+        try:
+            await ch.send(line)
+            sent["thoughts_last_ts"] = now
+            await self._mark_dirty()
+        except Exception:
+            return
+
     def _auto_tune(self, wait_seconds: float, source: str) -> None:
         """
         Simple self-tuning: adapt cooldown and router model when rate limits hit.
@@ -1176,6 +1234,7 @@ class MandyAI(commands.Cog):
     async def handle_mention(self, message: discord.Message, text: str) -> bool:
         if not await self._is_god_user(message.author):
             return False
+        await self._post_internal_thought(text)
         return await self._handle_fast_path(
             message.author,
             message.channel,
@@ -2270,6 +2329,7 @@ class MandyAI(commands.Cog):
     async def mandy_cmd(self, ctx: commands.Context, *, query: str = ""):
         if not await self._require_god(ctx):
             return
+        await self._post_internal_thought(query)
         await self._process_request(ctx.author, ctx.channel, ctx.guild, ctx.message.id, query)
 
     @commands.command(name="mandy_model")

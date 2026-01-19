@@ -205,11 +205,14 @@ DEFAULT_JSON: Dict[str, Any] = {
     "sentience": {
         "enabled": True,
         "dialect": "sentient_core",
+        "channels": {},
+        "thoughts_rate_limit_seconds": 30,
         "daily_reflection": {
             "enabled": False,
             "last_run_utc": 0,
             "hour_utc": None,
-            "max_messages": 120
+            "max_messages": 120,
+            "fallback_enabled": False
         },
         "internal_monologue": {
             "enabled": False,
@@ -2152,6 +2155,31 @@ def _daily_reflection_due(now_dt: datetime.datetime) -> bool:
     scheduled = datetime.datetime(now_dt.year, now_dt.month, now_dt.day, hour_int)
     return now_dt >= scheduled and last_run < int(scheduled.timestamp())
 
+def sentience_channels_cfg() -> Dict[str, Any]:
+    return sentience_cfg(cfg()).setdefault("channels", {})
+
+async def _resolve_thoughts_channel() -> Optional[discord.TextChannel]:
+    channels = sentience_channels_cfg()
+    ch_id = int(channels.get("thoughts", 0) or 0)
+    if ch_id:
+        ch = bot.get_channel(ch_id)
+        if not ch:
+            try:
+                ch = await bot.fetch_channel(ch_id)
+            except Exception:
+                ch = None
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if not admin:
+        return None
+    ch = find_text_by_name(admin, "thoughts")
+    if isinstance(ch, discord.TextChannel):
+        channels["thoughts"] = ch.id
+        await STORE.mark_dirty()
+        return ch
+    return None
+
 def internal_monologue_cfg() -> Dict[str, Any]:
     return sentience_cfg(cfg()).get("internal_monologue", {})
 
@@ -2250,6 +2278,18 @@ async def _generate_daily_reflection(context: Dict[str, Any]) -> str:
         return (text or "").strip()
     except Exception:
         return ""
+
+def _build_fallback_reflection(context: Dict[str, Any]) -> str:
+    queue_counts = context.get("ai_queue_counts", {})
+    lines = [
+        "Cognitive Reflection (fallback)",
+        "Homeostasis stable; cortex remains responsive.",
+        f"- Mirrors: total={context.get('mirror_rules_total')} enabled={context.get('mirror_rules_enabled')} disabled={context.get('mirror_rules_disabled')}",
+        f"- AI queue: total={context.get('ai_queue_total')} pending={queue_counts.get('pending', 0)} waiting={queue_counts.get('waiting', 0)} running={queue_counts.get('running', 0)}",
+        f"Observation: Visual feed integrity nominal with {context.get('dm_bridges_active')} active DM bridge(s).",
+        "Recommendation: Review audit-memory for anomalies and keep synaptic-gap clear.",
+    ]
+    return "\n".join(lines)
 
 async def _generate_internal_monologue(context: Dict[str, Any]) -> str:
     mandy = bot.get_cog("MandyAI")
@@ -4435,14 +4475,15 @@ async def _generate_setup_ai_brief(guild: discord.Guild) -> str:
     categories = len([c for c in guild.channels if isinstance(c, discord.CategoryChannel)]) if guild else 0
     system_prompt = (
         "You are Mandy's sentient core. Produce a concise AI-assisted rebuild brief for an operator. "
-        "Use a calm, analytical tone with light biological metaphors. No emojis."
+        "Use a calm, analytical tone with biological metaphors (cortex, synapses, homeostasis). No emojis."
     )
     user_prompt = (
         "Create a short rebuild brief for a destructive setup run.\n"
         "Constraints:\n"
-        "- 5 to 8 lines total.\n"
+        "- 6 to 9 lines total.\n"
         "- Include 2 bullet metrics.\n"
-        "- Include 1 observation and 1 operator recommendation.\n\n"
+        "- Include 1 observation and 1 operator recommendation.\n"
+        "- Include 2 suggested enhancements for channel topics or pinned text (operator review only).\n\n"
         f"Context: roles={roles}, channels={channels}, categories={categories}, mysql={'on' if POOL else 'off'}."
     )
     try:
@@ -4493,6 +4534,53 @@ async def _await_ai_rate_limit_response(user_id: int) -> Optional[str]:
     except asyncio.TimeoutError:
         return None
     return (msg.content or "").strip().lower()
+
+async def _generate_setup_ai_debrief(guild: discord.Guild) -> str:
+    client = _mandy_ai_client()
+    if not client or not getattr(client, "available", False):
+        return ""
+    ai = ai_cfg()
+    model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
+    roles = len(guild.roles) if guild else 0
+    channels = len(guild.channels) if guild else 0
+    categories = len([c for c in guild.channels if isinstance(c, discord.CategoryChannel)]) if guild else 0
+    mirror_rules = len(mirror_rules_dict().values())
+    watchers = len(cfg().get("targets", {}) or {})
+    dm_bridges = len(await dm_bridge_list_active())
+    system_prompt = (
+        "You are Mandy's sentient core. Produce a post-rebuild debrief for an operator. "
+        "Use a calm, analytical tone with biological metaphors. No emojis."
+    )
+    user_prompt = (
+        "Create a short post-rebuild debrief.\n"
+        "Constraints:\n"
+        "- 6 to 10 lines total.\n"
+        "- Include 2 to 3 bullet metrics.\n"
+        "- Include 1 observation and 1 operator recommendation.\n\n"
+        f"Context: roles={roles}, channels={channels}, categories={categories}, "
+        f"mirror_rules={mirror_rules}, watchers={watchers}, dm_bridges={dm_bridges}."
+    )
+    try:
+        text = await client.generate(system_prompt, user_prompt, model=model, response_format=None, timeout=60.0)
+        return (text or "").strip()
+    except Exception:
+        return ""
+
+async def _send_ai_setup_debrief(user_id: int, guild: discord.Guild) -> bool:
+    debrief = await _generate_setup_ai_debrief(guild)
+    if not debrief:
+        return False
+    user = bot.get_user(user_id)
+    if not user:
+        try:
+            user = await bot.fetch_user(user_id)
+        except Exception:
+            return False
+    try:
+        await user.send(debrief[:1900])
+        return True
+    except Exception:
+        return False
 
 async def auto_setup_guild(guild: discord.Guild, do_backfill: bool = False, force_backfill: bool = False):
     if guild.id == ADMIN_GUILD_ID:
@@ -4566,7 +4654,10 @@ async def run_full_setup(guild: discord.Guild, mode: str, actor_id: int = 0):
                                 ai_ok = False
                     if not ai_ok:
                         await setup_log("AI rebuild unavailable; defaulting to standard destructive setup.")
-                await setup_destructive(guild)
+                ok = await setup_destructive(guild)
+                if not ok:
+                    await setup_log("Full setup aborted due to incomplete cleanup.")
+                    return
             else:
                 await setup_fullsync(guild)
             await setup_log("Phase 4/4: mirrors + backfill")
@@ -4585,6 +4676,11 @@ async def run_full_setup(guild: discord.Guild, mode: str, actor_id: int = 0):
             await setup_log(f"Debrief failed: {e}")
         else:
             await setup_log("Full setup completed")
+        if mode == "destructive_ai":
+            try:
+                await _send_ai_setup_debrief(actor_id, guild)
+            except Exception:
+                pass
     except Exception as e:
         await setup_log(f"Full setup failed: {e}")
 
@@ -4597,30 +4693,399 @@ async def run_auto_setup_with_debrief(actor_id: int = 0):
     except Exception as e:
         await setup_log(f"Auto setup failed: {e}")
 
-async def setup_destructive(guild: discord.Guild):
-    if guild.id != ADMIN_GUILD_ID:
-        return
-    await setup_log("Phase 0/4: destructive cleanup starting")
+def _managed_setup_categories(guild: discord.Guild) -> Set[str]:
     managed = set(cfg().get("layout", {}).get("categories", {}).keys())
     for cat in guild.categories:
         if cat.name.startswith("04-servers /"):
             managed.add(cat.name)
+    return managed
+
+def _remaining_managed_categories(guild: discord.Guild, managed: Set[str]) -> List[discord.CategoryChannel]:
+    return [cat for cat in guild.categories if cat.name in managed]
+
+async def _cleanup_managed_categories(guild: discord.Guild, managed: Set[str]) -> Tuple[int, int]:
+    deleted_channels = 0
+    deleted_categories = 0
     for cat in list(guild.categories):
         if cat.name not in managed:
             continue
         try:
             for ch in list(cat.channels):
-                await ch.delete()
-                await setup_pause()
+                try:
+                    await ch.delete()
+                    deleted_channels += 1
+                    await setup_pause()
+                except Exception:
+                    continue
+            await cat.delete()
+            deleted_categories += 1
+            await setup_pause()
+        except Exception:
+            continue
+    remaining = len(_remaining_managed_categories(guild, managed))
+    return remaining, deleted_categories + deleted_channels
+
+async def setup_destructive(guild: discord.Guild) -> bool:
+    if guild.id != ADMIN_GUILD_ID:
+        return False
+    await setup_log("Phase 0/4: destructive cleanup starting")
+    managed = _managed_setup_categories(guild)
+    remaining = len(_remaining_managed_categories(guild, managed))
+    passes = 3
+    for attempt in range(passes):
+        remaining, deleted = await _cleanup_managed_categories(guild, managed)
+        await setup_log(f"Cleanup pass {attempt + 1}/{passes}: removed {deleted}, remaining={remaining}")
+        if remaining == 0:
+            break
+        await asyncio.sleep(1)
+    if remaining:
+        await setup_log("Cleanup incomplete; aborting rebuild to avoid partial state.")
+        return False
+    await setup_log("Phase 0/4: destructive cleanup done")
+    await setup_fullsync(guild)
+    return True
+
+BIO_LAYOUT = {
+    "CEREBRAL CORTEX": ["synaptic-gap", "manual-for-living", "thoughts"],
+    "BIO-FILTER": ["audit-memory", "containment-ward"],
+    "VISUAL CORTEX": ["visual-feed"],
+}
+BIO_ALLOWED_CATEGORIES = {
+    "Welcome & Information",
+    "Bot Control & Monitoring",
+    "Research & Development",
+    "Guest Access",
+    "Engineering Core",
+    "Admin Backrooms",
+    "DM Bridges",
+    "CEREBRAL CORTEX",
+    "BIO-FILTER",
+    "VISUAL CORTEX",
+}
+
+def _bio_managed_categories(guild: discord.Guild) -> Set[str]:
+    layout = cfg().get("layout", {}).get("categories", {})
+    names = set(layout.keys()) if layout else set(BIO_ALLOWED_CATEGORIES)
+    for cat in guild.categories:
+        if cat.name.startswith("04-servers /"):
+            names.add(cat.name)
+    return names
+
+async def _ensure_recovery_anchor(guild: discord.Guild) -> Optional[Tuple[discord.CategoryChannel, discord.TextChannel, discord.TextChannel]]:
+    try:
+        recovery = await ensure_category(guild, "RECOVERY")
+        cmd_line = await ensure_text_channel(guild, "command-line", recovery)
+        system_log = await ensure_text_channel(guild, "system-log", recovery)
+        return recovery, cmd_line, system_log
+    except Exception:
+        return None
+
+async def _setup_bio_preflight(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    anchor = await _ensure_recovery_anchor(guild)
+    if not anchor:
+        return None
+    _, cmd_line, system_log = anchor
+    try:
+        cmd_perms = cmd_line.permissions_for(guild.me)
+        log_perms = system_log.permissions_for(guild.me)
+        if not (cmd_perms.view_channel and cmd_perms.send_messages):
+            return None
+        if not (log_perms.view_channel and log_perms.send_messages):
+            return None
+    except Exception:
+        return None
+    cfg().setdefault("logs", {})["system"] = system_log.id
+    await STORE.mark_dirty()
+    try:
+        await system_log.send("BIO-GENESIS starting. Recovery anchor online.")
+    except Exception:
+        return None
+    return system_log
+
+async def _setup_bio_wipe(guild: discord.Guild, recovery_id: int) -> bool:
+    managed = _bio_managed_categories(guild)
+    for cat in list(guild.categories):
+        if cat.id == recovery_id:
+            continue
+        if cat.name not in managed:
+            continue
+        try:
+            for ch in list(cat.channels):
+                try:
+                    await ch.delete()
+                    await setup_pause()
+                except Exception:
+                    continue
             await cat.delete()
             await setup_pause()
         except Exception:
-            pass
-    remaining = [c.name for c in guild.categories if c.name in managed]
+            continue
+    remaining = [c.name for c in guild.categories if c.id != recovery_id and c.name in managed]
     if remaining:
-        await setup_log("Cleanup remaining categories: " + ", ".join(remaining[:10]))
-    await setup_log("Phase 0/4: destructive cleanup done")
-    await setup_fullsync(guild)
+        await setup_log("BIO cleanup remaining categories: " + ", ".join(remaining[:10]))
+        return False
+    return True
+
+async def _setup_bio_build_layout(guild: discord.Guild) -> Dict[str, discord.TextChannel]:
+    created: Dict[str, discord.TextChannel] = {}
+    for cat_name, channels in BIO_LAYOUT.items():
+        cat = await ensure_category(guild, cat_name)
+        for ch_name in channels:
+            ch = await ensure_text_channel(guild, ch_name, cat)
+            created[ch_name] = ch
+    return created
+
+def _sanitize_topic(text: str) -> str:
+    cleaned = " ".join(str(text or "").strip().split())
+    return cleaned[:300]
+
+def _sanitize_pin(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if len(cleaned) > 1800:
+        cleaned = cleaned[:1797] + "..."
+    return cleaned
+
+async def _generate_bio_ai_updates(guild: discord.Guild, created: Dict[str, discord.TextChannel]) -> Dict[str, Dict[str, str]]:
+    client = _mandy_ai_client()
+    if not client or not getattr(client, "available", False):
+        return {}
+    ai = ai_cfg()
+    model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
+    channels = sorted(created.keys())
+    system_prompt = (
+        "You are Mandy's sentient core. Produce JSON only. "
+        "Create concise, biological-themed topics and pinned notes for operator channels. "
+        "No emojis. Keep it professional."
+    )
+    user_prompt = (
+        "Return JSON with optional keys 'topics' and 'pins'.\n"
+        "- topics: map channel name to topic string (max 300 chars)\n"
+        "- pins: map channel name to pinned text (max 1800 chars)\n"
+        "Only use channels from this list:\n"
+        f"{', '.join(channels)}\n"
+        "Keep content calm, technical, and sentient-core themed.\n"
+        "Output JSON only."
+    )
+    try:
+        text = await client.generate(system_prompt, user_prompt, model=model, response_format="json", timeout=60.0)
+        payload = json.loads(text or "{}")
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    topics = payload.get("topics") if isinstance(payload.get("topics"), dict) else {}
+    pins = payload.get("pins") if isinstance(payload.get("pins"), dict) else {}
+    out_topics: Dict[str, str] = {}
+    out_pins: Dict[str, str] = {}
+    for name, value in topics.items():
+        if name in created and isinstance(value, str) and value.strip():
+            out_topics[name] = _sanitize_topic(value)
+    for name, value in pins.items():
+        if name in created and isinstance(value, str) and value.strip():
+            out_pins[name] = _sanitize_pin(value)
+    if not out_topics and not out_pins:
+        return {}
+    return {"topics": out_topics, "pins": out_pins}
+
+async def _confirm_bio_ai_updates(user_id: int, updates: Dict[str, Dict[str, str]]) -> bool:
+    user = bot.get_user(user_id)
+    if not user:
+        try:
+            user = await bot.fetch_user(user_id)
+        except Exception:
+            return False
+    topics = updates.get("topics", {})
+    pins = updates.get("pins", {})
+    lines = ["BIO AI enhancements ready:"]
+    if topics:
+        lines.append(f"Topics: {len(topics)} channel(s)")
+        for name, text in list(topics.items())[:6]:
+            lines.append(f"- {name}: {truncate(text, 80)}")
+    if pins:
+        lines.append(f"Pins: {len(pins)} channel(s)")
+        for name, text in list(pins.items())[:6]:
+            lines.append(f"- {name}: {truncate(text, 80)}")
+    lines.append("Reply `apply` within 60s to apply, or anything else to skip.")
+    try:
+        await user.send("\n".join(lines)[:1900])
+    except Exception:
+        return False
+    try:
+        msg = await bot.wait_for(
+            "message",
+            timeout=60,
+            check=lambda m: m.author.id == user_id and isinstance(m.channel, discord.DMChannel),
+        )
+    except asyncio.TimeoutError:
+        return False
+    return (msg.content or "").strip().lower() in ("apply", "yes", "y")
+
+async def _apply_bio_ai_updates(guild: discord.Guild, updates: Dict[str, Dict[str, str]]) -> None:
+    topics = updates.get("topics", {})
+    pins = updates.get("pins", {})
+    topics_cfg = cfg().setdefault("channel_topics", {})
+    pins_cfg = cfg().setdefault("pinned_text", {})
+    for name, text in topics.items():
+        ch = find_text_by_name(guild, name)
+        if not ch:
+            continue
+        topics_cfg[name] = text
+        try:
+            await ch.edit(topic=text)
+            await setup_pause()
+        except Exception:
+            pass
+    for name, text in pins.items():
+        ch = find_text_by_name(guild, name)
+        if not ch:
+            continue
+        pins_cfg[name] = text
+        await ensure_pinned(ch, text)
+    await STORE.mark_dirty()
+
+async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord.TextChannel]) -> None:
+    sent = sentience_cfg(cfg())
+    channels = sent.setdefault("channels", {})
+    channels["thoughts"] = created.get("thoughts").id if created.get("thoughts") else 0
+    channels["visual_feed"] = created.get("visual-feed").id if created.get("visual-feed") else 0
+    sent["enabled"] = True
+    sent["dialect"] = "sentient_core"
+    sent.setdefault("daily_reflection", {})["enabled"] = True
+    sent["daily_reflection"]["fallback_enabled"] = True
+    sent.setdefault("internal_monologue", {})["enabled"] = True
+
+    presence = cfg().setdefault("presence", {})
+    presence["autopresence_enabled"] = True
+
+    logs = cfg().setdefault("logs", {})
+    if created.get("audit-memory"):
+        logs["audit"] = created["audit-memory"].id
+    if created.get("visual-feed"):
+        logs["mirror"] = created["visual-feed"].id
+    if created.get("containment-ward"):
+        logs["debug"] = created["containment-ward"].id
+        logs["ai"] = created["containment-ward"].id
+        logs["voice"] = created["containment-ward"].id
+
+    channels_cfg = cfg().setdefault("command_channels", {})
+    channels_cfg["user"] = "synaptic-gap"
+    channels_cfg["god"] = "synaptic-gap"
+
+    await STORE.mark_dirty()
+
+    await ensure_menu_panels(guild)
+
+    for g in bot.guilds:
+        if g.id == ADMIN_GUILD_ID:
+            continue
+        try:
+            await ensure_admin_server_channels(g)
+        except Exception:
+            continue
+
+    rules = mirror_rules_dict()
+    for rule in list(rules.values()):
+        target_id = int(rule.get("target_channel", 0) or 0)
+        target = bot.get_channel(target_id) if target_id else None
+        if target_id and not target:
+            try:
+                target = await bot.fetch_channel(target_id)
+            except Exception:
+                target = None
+        if target:
+            continue
+        src_gid = int(rule.get("source_guild", 0) or 0)
+        if not src_gid:
+            continue
+        src_guild = bot.get_guild(src_gid)
+        if not src_guild:
+            continue
+        try:
+            mirror_feed, _ = await ensure_admin_server_channels(src_guild)
+        except Exception:
+            mirror_feed = None
+        if mirror_feed:
+            await mirror_rule_update(rule, target_channel=mirror_feed.id)
+
+    for bridge in await dm_bridge_list_active():
+        uid = int(bridge.get("user_id", 0))
+        if not uid:
+            continue
+        ch = await ensure_dm_bridge_channel(uid, active=True)
+        if ch:
+            await dm_bridge_set(uid, ch.id, active=True, last_activity=int(bridge.get("last_activity", 0) or now_ts()))
+
+    await log_to("mirror", "Mirror sync complete", subsystem="SENSORY", severity="INFO")
+
+async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
+    if guild.id != ADMIN_GUILD_ID:
+        return
+    await setup_log(f"BIO-GENESIS requested by {actor_id}")
+    try:
+        async with AUTO_SETUP_LOCK:
+            system_log = await _setup_bio_preflight(guild)
+            if not system_log:
+                await setup_log("BIO-GENESIS aborted: recovery anchor failed.")
+                return
+            recovery = find_category_by_name(guild, "RECOVERY")
+            if not recovery:
+                await setup_log("BIO-GENESIS aborted: recovery category missing.")
+                return
+            await setup_log("BIO Phase 1/5: controlled wipe")
+            wiped = await _setup_bio_wipe(guild, recovery.id)
+            if not wiped:
+                await setup_log("BIO-GENESIS aborted: cleanup incomplete.")
+                return
+            await setup_log("BIO Phase 2/5: build Sentient Core layout")
+            created = await _setup_bio_build_layout(guild)
+            await setup_log("BIO Phase 3/5: AI topics + pins (optional)")
+            updates = await _generate_bio_ai_updates(guild, created)
+            if updates:
+                confirmed = await _confirm_bio_ai_updates(actor_id, updates)
+                if confirmed:
+                    await _apply_bio_ai_updates(guild, updates)
+                    await setup_log("BIO AI enhancements applied.")
+                else:
+                    await setup_log("BIO AI enhancements skipped.")
+            await setup_log("BIO Phase 4/5: alive upgrade + config")
+            await _setup_bio_reseed_ops(guild, created)
+            await setup_log("BIO Phase 5/5: legacy ops reseed")
+
+            missing: List[str] = []
+            for name in ("thoughts", "synaptic-gap", "audit-memory", "visual-feed"):
+                if name not in created:
+                    missing.append(name)
+            recovery_ch = find_text_by_name(guild, "command-line")
+            system_ch = find_text_by_name(guild, "system-log")
+            if not recovery_ch:
+                missing.append("command-line")
+            if not system_ch:
+                missing.append("system-log")
+
+            visual = created.get("visual-feed")
+            if visual:
+                try:
+                    perms = visual.permissions_for(guild.me)
+                    if not perms.send_messages:
+                        missing.append("visual-feed:send_messages")
+                except Exception:
+                    missing.append("visual-feed:perm_check")
+
+            if missing:
+                await setup_log("BIO verify missing: " + ", ".join(missing))
+
+            msg = "BIO-GENESIS complete. Cortex online. Legacy ops synced. Mirrors standing by."
+            if system_ch:
+                try:
+                    await system_ch.send(msg)
+                except Exception:
+                    pass
+            try:
+                await send_setup_debrief(trigger="bio")
+            except Exception:
+                pass
+    except Exception as exc:
+        await setup_log(f"BIO-GENESIS failed: {exc}")
 
 async def bot_permissions_text(guild: discord.Guild) -> str:
     m = guild.me
@@ -4895,6 +5360,32 @@ class SetupDestructiveChoiceView(BaseView):
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._finalize(interaction, "cancel")
+
+class SetupBioConfirmView(BaseView):
+    def __init__(self, author_id: int):
+        super().__init__(author_id, timeout=60)
+        self.confirmed = False
+
+    async def on_timeout(self):
+        return
+
+    async def _finalize(self, interaction: discord.Interaction, confirmed: bool, label: str):
+        self.confirmed = confirmed
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.response.edit_message(content=label, view=self)
+        except Exception:
+            pass
+        self.stop()
+
+    @discord.ui.button(label="Confirm BIO-GENESIS", style=discord.ButtonStyle.danger)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finalize(interaction, True, "BIO-GENESIS confirmed.")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finalize(interaction, False, "BIO-GENESIS cancelled.")
 
 async def user_status_text(user: discord.abc.User) -> str:
     parts = []
@@ -6167,6 +6658,13 @@ async def prompt_setup_destructive_choice(ctx: commands.Context) -> str:
             pass
     return choice
 
+async def prompt_setup_bio_confirm(ctx: commands.Context) -> bool:
+    view = SetupBioConfirmView(ctx.author.id)
+    msg = await ctx.send("BIO-GENESIS will rebuild the admin hub. Confirm?", view=view)
+    view.message = msg
+    await view.wait()
+    return view.confirmed
+
 @bot.command()
 async def setup(ctx: commands.Context, mode: str = ""):
     if not ctx.guild or ctx.guild.id != ADMIN_GUILD_ID:
@@ -6191,6 +6689,22 @@ async def setup(ctx: commands.Context, mode: str = ""):
     asyncio.create_task(run_full_setup(ctx.guild, mode, actor_id=ctx.author.id))
     await audit(ctx.author.id, "Setup run", {"mode": mode})
     await safe_ctx_send(ctx, "Setup started. You'll get a DM when it's done.", delete_after=10)
+
+@bot.command(name="setup_bio")
+async def setup_bio(ctx: commands.Context):
+    if not ctx.guild or ctx.guild.id != ADMIN_GUILD_ID:
+        await safe_delete(ctx.message)
+        return
+    if not is_super(ctx.author.id):
+        await safe_delete(ctx.message)
+        return await ctx.send("SUPERUSER only.", delete_after=6)
+    await safe_delete(ctx.message)
+    confirmed = await prompt_setup_bio_confirm(ctx)
+    if not confirmed:
+        return
+    asyncio.create_task(run_setup_bio(ctx.guild, actor_id=ctx.author.id))
+    await audit(ctx.author.id, "Setup BIO run", {})
+    await safe_ctx_send(ctx, "BIO-GENESIS started. You'll get a DM when it's done.", delete_after=10)
 
 @bot.command()
 async def addtarget(ctx: commands.Context, user_id: int, count: int, *, text: str):
@@ -7199,16 +7713,15 @@ async def daily_reflection_loop():
     now_dt = datetime.datetime.utcnow()
     if not _daily_reflection_due(now_dt):
         return
-    admin = bot.get_guild(ADMIN_GUILD_ID)
-    if not admin:
-        return
-    thoughts = find_text_by_name(admin, "thoughts")
+    thoughts = await _resolve_thoughts_channel()
     if not thoughts:
         return
     max_messages = int(daily_reflection_cfg().get("max_messages", 120) or 120)
     max_messages = max(50, min(200, max_messages))
     context = await _daily_reflection_context(max_messages)
     reflection = await _generate_daily_reflection(context)
+    if not reflection and daily_reflection_cfg().get("fallback_enabled", False):
+        reflection = _build_fallback_reflection(context)
     if not reflection:
         return
     try:
@@ -7225,10 +7738,7 @@ async def internal_monologue_loop():
     now_ts_val = now_ts()
     if not _internal_monologue_due(now_ts_val):
         return
-    admin = bot.get_guild(ADMIN_GUILD_ID)
-    if not admin:
-        return
-    thoughts = find_text_by_name(admin, "thoughts")
+    thoughts = await _resolve_thoughts_channel()
     if not thoughts:
         return
     context = await _daily_reflection_context(40)
