@@ -797,6 +797,22 @@ class MandyAI(commands.Cog):
     async def _send_chunks(self, channel: discord.abc.Messageable, text: str):
         for chunk in _chunk_text(text, MAX_MESSAGE_LEN):
             if chunk:
+                try:
+                    if isinstance(channel, discord.DMChannel):
+                        enabled_fn = getattr(self.bot, "mandy_dm_ai_is_enabled", None)
+                        user = getattr(channel, "recipient", None)
+                        uid = int(user.id) if user else 0
+                        if uid and callable(enabled_fn) and await enabled_fn(uid):
+                            if callable(self.log_to):
+                                await self.log_to(
+                                    "ai",
+                                    "Mandy DM response",
+                                    subsystem="AI",
+                                    severity="INFO",
+                                    details={"user_id": uid, "text": chunk[:500]},
+                                )
+                except Exception:
+                    pass
                 await channel.send(chunk)
 
     async def _notify_user(self, user_id: int, channel_id: int, text: str):
@@ -886,6 +902,18 @@ class MandyAI(commands.Cog):
             if message.mentions:
                 return int(message.mentions[0].id)
         match = re.search(r"<@!?(\d+)>", text or "")
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+        return None
+
+    def _extract_mention_channel_id(self, text: str, message: Optional[discord.Message]) -> Optional[int]:
+        if message and getattr(message, "channel_mentions", None):
+            if message.channel_mentions:
+                return int(message.channel_mentions[0].id)
+        match = re.search(r"<#(\d+)>", text or "")
         if match:
             try:
                 return int(match.group(1))
@@ -1046,6 +1074,24 @@ class MandyAI(commands.Cog):
             return self._split_targets(match.group(2).strip())
         return None
 
+    def _parse_close_dm_bridge_request(self, text: str) -> Optional[str]:
+        match = re.match(r"^dmclose\s+(.+)$", text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        match = re.match(
+            r"^(close|archive)\s+(dm\s+bridge|dm|bridge)\s+(.+)$",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(3).strip()
+        match = re.match(r"^(close|archive)\s+(?:this\s+)?(\d{5,})$", text, re.IGNORECASE)
+        if match:
+            return match.group(2).strip()
+        if re.match(r"^(close|archive)\s+this$", text, re.IGNORECASE):
+            return "__this__"
+        return None
+
     def _split_targets(self, text: str) -> List[str]:
         cleaned = re.sub(r"\s+and\s+", ",", text, flags=re.IGNORECASE)
         parts = [p.strip() for p in cleaned.split(",") if p.strip()]
@@ -1118,6 +1164,42 @@ class MandyAI(commands.Cog):
             return True
         if lower == "selftest":
             await self._send_chunks(channel, await self._run_selftest(user, guild, channel))
+            return True
+
+        close_target = self._parse_close_dm_bridge_request(text)
+        if close_target:
+            if not self.tools:
+                await self._send_chunks(channel, "Tool registry missing.")
+                return True
+            target_id = None
+            if close_target == "__this__":
+                target_id = int(getattr(channel, "id", 0) or 0)
+                if not target_id:
+                    await self._send_chunks(channel, "No channel context for DM bridge.")
+                    return True
+            else:
+                channel_id = self._extract_mention_channel_id(close_target, message)
+                if channel_id:
+                    target_id = int(channel_id)
+                else:
+                    uid, candidates = await self._resolve_user(guild, close_target, message, author=user)
+                    if uid:
+                        target_id = int(uid)
+                    elif candidates:
+                        await self._prompt_user_pick(
+                            channel,
+                            user.id,
+                            guild,
+                            {"tool": "close_dm_bridge", "args": {}, "user_arg": "user_id"},
+                            candidates,
+                        )
+                        return True
+                    else:
+                        await self._send_chunks(channel, "User not found. Try @mention, exact nickname, or a user ID.")
+                        return True
+            actions = [{"tool": "close_dm_bridge", "args": {"user_id": target_id}}]
+            results = await self._execute_actions(user.id, actions, guild=guild, channel=channel)
+            await self._send_chunks(channel, "\n".join(results))
             return True
 
         dm_match = self._parse_dm_request(text)
@@ -1542,6 +1624,7 @@ class MandyAI(commands.Cog):
             "Do not fabricate answers or claim to have executed actions without ACTION.\n"
             "If the user request is ambiguous, return NEEDS_CONFIRMATION with a clarification question.\n"
             "If the user asks to DM/privately message someone, you MUST use send_dm.\n"
+            "If the user asks to close/archive a DM bridge, you MUST use close_dm_bridge.\n"
             "For BUILD_TOOL, include actions to run the new tool if it solves the request.\n"
             f"Capabilities snapshot (JSON): {snapshot_text}\n"
         )
@@ -1765,6 +1848,7 @@ class MandyAI(commands.Cog):
             "list_watchers",
             "list_mirror_rules",
             "disable_mirror_rule",
+            "close_dm_bridge",
         }
         for action in actions:
             tool = action.get("tool")

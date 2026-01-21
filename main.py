@@ -33,7 +33,7 @@ from capability_registry import CapabilityRegistry
 from tool_plugin_manager import ToolPluginManager
 from cooldown_store import CooldownStore
 import ambient_engine
-from resolver import GuildIndexCache, parse_user_id, rank_members_global, pick_best
+from resolver import GuildIndexCache, parse_channel_id, parse_user_id, rank_members_global, pick_best
 from sentience_layer import sentience_cfg, presence_cfg, voice_line
 
 # -----------------------------
@@ -144,6 +144,8 @@ DEFAULT_JSON: Dict[str, Any] = {
     "server_info_messages": {},
     "mirror_message_map": {},  # json mirror message mapping (rule_id -> list)
     "dm_bridges": {},    # fallback dm bridges: "user_id" -> admin_channel_id
+    "dm_bridge_controls": {},  # user_id -> {channel_id, message_id}
+    "dm_ai": {},         # dm user_id -> ai session metadata
     "bot_status": {      # presence state + text
         "state": "online",
         "text": ""
@@ -1780,6 +1782,21 @@ class ToolRegistry:
         except Exception as exc:
             raise ValueError(f"dm failed: {exc}") from exc
 
+    async def close_dm_bridge(self, user_id: int, actor_id: int = 0):
+        uid = self._as_int(user_id, "user_id")
+        info = await dm_bridge_get(uid)
+        if not info:
+            alt_uid = await dm_bridge_user_for_channel(uid)
+            if alt_uid:
+                uid = int(alt_uid)
+                info = await dm_bridge_get(uid)
+        if not info:
+            raise ValueError("dm bridge not found")
+        await dm_bridge_close(uid)
+        if actor_id:
+            await audit(actor_id, "DM bridge close", {"user_id": uid})
+        return {"user_id": uid, "status": "closed"}
+
     async def set_bot_status(self, state: str, text: str):
         st = self._as_text(state, "state", 16)
         msg = self._as_text(text, "text", 120)
@@ -2001,6 +2018,7 @@ def attach_mandy_context():
     bot.mandy_store = STORE
     bot.mandy_audit = audit
     bot.mandy_log_to = log_to
+    bot.mandy_dm_ai_is_enabled = dm_ai_is_enabled
     bot.mandy_effective_level = effective_level
     bot.mandy_require_level_ctx = require_level_ctx
 
@@ -2041,6 +2059,53 @@ def admin_category_name(guild: discord.Guild) -> str:
 
 def mirror_rules_dict() -> Dict[str, Any]:
     return cfg().setdefault("mirror_rules", {})
+
+MIRROR_RULE_INDEX: Dict[str, Dict[int, List[Dict[str, Any]]]] = {
+    "server": {},
+    "category": {},
+    "channel": {},
+}
+MIRROR_RULE_INDEX_DIRTY = True
+MIRROR_RULE_INDEX_MTIME = 0.0
+
+def mark_mirror_rule_index_dirty() -> None:
+    global MIRROR_RULE_INDEX_DIRTY
+    MIRROR_RULE_INDEX_DIRTY = True
+
+def _rebuild_mirror_rule_index() -> None:
+    global MIRROR_RULE_INDEX, MIRROR_RULE_INDEX_DIRTY, MIRROR_RULE_INDEX_MTIME
+    index: Dict[str, Dict[int, List[Dict[str, Any]]]] = {
+        "server": {},
+        "category": {},
+        "channel": {},
+    }
+    for rule in mirror_rules_dict().values():
+        if not rule.get("enabled", True):
+            continue
+        scope = rule.get("scope", "channel")
+        if scope not in index:
+            scope = "channel"
+        if scope == "server":
+            key = int(rule.get("source_id", 0) or rule.get("source_guild", 0))
+        else:
+            key = int(rule.get("source_id", 0))
+        if key:
+            index[scope].setdefault(key, []).append(rule)
+    MIRROR_RULE_INDEX = index
+    MIRROR_RULE_INDEX_DIRTY = False
+    MIRROR_RULE_INDEX_MTIME = STORE.last_mtime
+
+def mirror_rules_for_message(message: discord.Message) -> List[Dict[str, Any]]:
+    global MIRROR_RULE_INDEX_MTIME
+    if MIRROR_RULE_INDEX_DIRTY or STORE.last_mtime > MIRROR_RULE_INDEX_MTIME + 0.0001:
+        _rebuild_mirror_rule_index()
+    channel = message.channel
+    candidates: List[Dict[str, Any]] = []
+    candidates.extend(MIRROR_RULE_INDEX["channel"].get(channel.id, []))
+    if channel.category:
+        candidates.extend(MIRROR_RULE_INDEX["category"].get(channel.category.id, []))
+    candidates.extend(MIRROR_RULE_INDEX["server"].get(message.guild.id, []))
+    return candidates
 
 async def watchers_report(limit: int = 50) -> List[str]:
     def fmt(uid, count, current, text):
@@ -2851,23 +2916,27 @@ async def stop_live_stats_panel(guild_id: int, delete_message: bool = True):
 
 async def live_stats_loop(guild_id: int, channel_id: int, message_id: int, window: str):
     try:
+        ch: Optional[discord.TextChannel] = None
+        msg: Optional[discord.Message] = None
         while True:
             await asyncio.sleep(10)
             guild = bot.get_guild(guild_id)
             if not guild:
                 break
-            ch = bot.get_channel(channel_id)
             if not ch:
+                ch = bot.get_channel(channel_id)
+                if not ch:
+                    try:
+                        ch = await bot.fetch_channel(channel_id)
+                    except Exception:
+                        break
+                if not isinstance(ch, discord.TextChannel):
+                    break
+            if msg is None:
                 try:
-                    ch = await bot.fetch_channel(channel_id)
+                    msg = ch.get_partial_message(message_id)
                 except Exception:
                     break
-            if not isinstance(ch, discord.TextChannel):
-                break
-            try:
-                msg = await ch.fetch_message(message_id)
-            except Exception:
-                break
             emb, changed = await chat_stats_build_live_embed(guild, window)
             try:
                 await msg.edit(embed=emb)
@@ -3019,20 +3088,24 @@ async def stop_global_live_panel(delete_message: bool = True):
 
 async def global_live_stats_loop(channel_id: int, message_id: int, window: str):
     try:
+        ch: Optional[discord.TextChannel] = None
+        msg: Optional[discord.Message] = None
         while True:
             await asyncio.sleep(10)
-            ch = bot.get_channel(channel_id)
             if not ch:
+                ch = bot.get_channel(channel_id)
+                if not ch:
+                    try:
+                        ch = await bot.fetch_channel(channel_id)
+                    except Exception:
+                        break
+                if not isinstance(ch, discord.TextChannel):
+                    break
+            if msg is None:
                 try:
-                    ch = await bot.fetch_channel(channel_id)
+                    msg = ch.get_partial_message(message_id)
                 except Exception:
                     break
-            if not isinstance(ch, discord.TextChannel):
-                break
-            try:
-                msg = await ch.fetch_message(message_id)
-            except Exception:
-                break
             emb, changed = await chat_stats_build_global_embed(window)
             try:
                 await msg.edit(embed=emb)
@@ -3115,6 +3188,43 @@ async def _setup_pause_on_rate_limit(exc: Exception) -> None:
 # -----------------------------
 # Watchers (your JSON targets) + optional MySQL sync
 # -----------------------------
+MYSQL_WATCHER_CACHE = {"ids": set(), "last_sync": 0}
+MYSQL_WATCHER_CACHE_DIRTY = True
+MYSQL_WATCHER_CACHE_TTL = 30
+MYSQL_WATCHER_CACHE_LOCK: Optional[asyncio.Lock] = None
+
+def mark_mysql_watcher_cache_dirty() -> None:
+    global MYSQL_WATCHER_CACHE_DIRTY
+    MYSQL_WATCHER_CACHE_DIRTY = True
+
+async def mysql_watchers_refresh(force: bool = False) -> None:
+    global MYSQL_WATCHER_CACHE_DIRTY, MYSQL_WATCHER_CACHE_LOCK
+    if not POOL:
+        return
+    now = now_ts()
+    if not force and not MYSQL_WATCHER_CACHE_DIRTY:
+        last_sync = int(MYSQL_WATCHER_CACHE.get("last_sync", 0))
+        if now - last_sync < MYSQL_WATCHER_CACHE_TTL:
+            return
+    if MYSQL_WATCHER_CACHE_LOCK is None:
+        MYSQL_WATCHER_CACHE_LOCK = asyncio.Lock()
+    async with MYSQL_WATCHER_CACHE_LOCK:
+        now = now_ts()
+        if not force and not MYSQL_WATCHER_CACHE_DIRTY:
+            last_sync = int(MYSQL_WATCHER_CACHE.get("last_sync", 0))
+            if now - last_sync < MYSQL_WATCHER_CACHE_TTL:
+                return
+        rows = await db_all("SELECT user_id FROM watchers")
+        MYSQL_WATCHER_CACHE["ids"] = {
+            int(row["user_id"]) for row in rows if row and row.get("user_id") is not None
+        }
+        MYSQL_WATCHER_CACHE["last_sync"] = now
+        MYSQL_WATCHER_CACHE_DIRTY = False
+
+def mysql_watcher_id_set() -> Set[int]:
+    ids = MYSQL_WATCHER_CACHE.get("ids")
+    return ids if isinstance(ids, set) else set()
+
 async def watcher_tick(message: discord.Message):
     if message.author.bot:
         return
@@ -3139,20 +3249,27 @@ async def watcher_tick(message: discord.Message):
 
     # 2) Optional MySQL watcher mirror (safe): if a user has a row in watchers table
     if POOL:
-        row = await db_one("SELECT threshold, current, text FROM watchers WHERE user_id=%s", (message.author.id,))
-        if row:
-            cur = int(row["current"]) + 1
-            thr = int(row["threshold"])
-            text = str(row["text"] or "")
-            if cur >= thr:
-                cur = 0
-                replies = [x.strip() for x in text.split("|") if x.strip()]
-                if replies:
-                    try:
-                        await message.reply(random.choice(replies))
-                    except Exception:
-                        pass
-            await db_exec("UPDATE watchers SET current=%s WHERE user_id=%s", (cur, message.author.id))
+        should_check = True
+        try:
+            await mysql_watchers_refresh()
+            should_check = message.author.id in mysql_watcher_id_set()
+        except Exception:
+            should_check = True
+        if should_check:
+            row = await db_one("SELECT threshold, current, text FROM watchers WHERE user_id=%s", (message.author.id,))
+            if row:
+                cur = int(row["current"]) + 1
+                thr = int(row["threshold"])
+                text = str(row["text"] or "")
+                if cur >= thr:
+                    cur = 0
+                    replies = [x.strip() for x in text.split("|") if x.strip()]
+                    if replies:
+                        try:
+                            await message.reply(random.choice(replies))
+                        except Exception:
+                            pass
+                await db_exec("UPDATE watchers SET current=%s WHERE user_id=%s", (cur, message.author.id))
 
 # -----------------------------
 # Mirror: unified rules + Buttons (Reply/Post/DM)
@@ -3243,6 +3360,7 @@ async def mirror_rule_save(rule: Dict[str, Any]):
     rule = normalize_rule(rule)
     rules = mirror_rules_dict()
     rules[rule["rule_id"]] = rule
+    mark_mirror_rule_index_dirty()
     await STORE.mark_dirty()
     if POOL:
         await mirror_rule_save_db(rule)
@@ -3283,6 +3401,7 @@ async def mirror_rule_delete(rule: Dict[str, Any], reason: str):
         return
     rules = mirror_rules_dict()
     rules.pop(rid, None)
+    mark_mirror_rule_index_dirty()
     await STORE.mark_dirty()
     if POOL:
         try:
@@ -3329,6 +3448,7 @@ async def mirror_rules_sync():
     for rid, rule in rules.items():
         if rid not in db_ids:
             await mirror_rule_save_db(rule)
+    mark_mirror_rule_index_dirty()
     await STORE.mark_dirty()
 
 def find_server_scope_rule(guild_id: int) -> Optional[Dict[str, Any]]:
@@ -3884,19 +4004,15 @@ async def mirror_send_to_rule(message: discord.Message, rule: Dict[str, Any]):
 async def mirror_tick(message: discord.Message):
     if not message.guild:
         return
-    rules = mirror_rules_dict()
-    if not rules:
-        return
-    matched: List[Dict[str, Any]] = []
-    for rule in rules.values():
-        if not rule.get("enabled", True):
-            continue
-        if rule_matches_message(rule, message):
-            matched.append(rule)
-    if not matched:
+    candidates = mirror_rules_for_message(message)
+    if not candidates:
         return
     seen = set()
-    for rule in matched:
+    for rule in candidates:
+        if not rule.get("enabled", True):
+            continue
+        if not rule_matches_message(rule, message):
+            continue
         tgt = int(rule.get("target_channel", 0))
         if tgt in seen:
             continue
@@ -4035,6 +4151,10 @@ async def ensure_dm_bridge_channel(user_id: int, active: bool = True) -> Optiona
             await setup_pause()
         except Exception:
             pass
+    try:
+        await ensure_dm_bridge_controls(user_id, ch)
+    except Exception:
+        pass
     return ch
 
 async def ensure_dm_bridge_active(user_id: int, reason: str = "auto") -> Optional[int]:
@@ -4057,6 +4177,88 @@ async def dm_bridge_close(user_id: int):
         if ch:
             await audit(SUPER_USER_ID, "DM bridge archived", {"user_id": user_id, "channel_id": ch.id})
     await dm_bridge_set(user_id, int(info.get("channel_id", 0)) if info else 0, active=False, last_activity=now_ts())
+    await dm_ai_disable(user_id, reason="bridge_closed")
+
+def dm_bridge_controls_state() -> Dict[str, Any]:
+    return cfg().setdefault("dm_bridge_controls", {})
+
+def dm_ai_state() -> Dict[str, Any]:
+    return cfg().setdefault("dm_ai", {})
+
+async def dm_ai_enable(user_id: int, enabled_by: int, bridge_channel_id: int):
+    state = dm_ai_state()
+    state[str(user_id)] = {
+        "enabled_at": now_ts(),
+        "enabled_by": int(enabled_by),
+        "bridge_channel_id": int(bridge_channel_id or 0),
+    }
+    await STORE.mark_dirty()
+    if enabled_by:
+        await audit(enabled_by, "DM AI enabled", {"user_id": user_id, "channel_id": bridge_channel_id})
+
+async def dm_ai_disable(user_id: int, reason: str = "", actor_id: int = 0):
+    state = dm_ai_state()
+    if state.pop(str(user_id), None) is not None:
+        await STORE.mark_dirty()
+        if actor_id:
+            await audit(actor_id, "DM AI disabled", {"user_id": user_id, "reason": reason})
+
+async def dm_ai_is_enabled(user_id: int) -> bool:
+    state = dm_ai_state()
+    if str(user_id) not in state:
+        return False
+    info = await dm_bridge_get(user_id)
+    if not info or not info.get("active"):
+        await dm_ai_disable(user_id, reason="bridge_inactive")
+        return False
+    return True
+
+def dm_bridge_controls_content(user_id: int, channel_id: int) -> str:
+    state = dm_ai_state().get(str(user_id), {}) if isinstance(dm_ai_state(), dict) else {}
+    enabled = "on" if state else "off"
+    enabled_at = fmt_ts(int(state.get("enabled_at", 0) or 0))
+    by_id = int(state.get("enabled_by", 0) or 0)
+    by_text = f"<@{by_id}>" if by_id else "n/a"
+    return (
+        f"**DM Bridge Controls**\n"
+        f"- User: <@{user_id}>\n"
+        f"- Bridge: <#{channel_id}>\n"
+        f"- AI: {enabled} | enabled_at={enabled_at} | enabled_by={by_text}"
+    )
+
+async def ensure_dm_bridge_controls(user_id: int, ch: discord.TextChannel):
+    if not ch or not isinstance(ch, discord.TextChannel):
+        return
+    state = dm_bridge_controls_state()
+    current = state.get(str(user_id), {}) if isinstance(state.get(str(user_id)), dict) else {}
+    msg_id = int(current.get("message_id", 0) or 0)
+    ch_id = int(current.get("channel_id", 0) or 0)
+    content = dm_bridge_controls_content(user_id, ch.id)
+    view = DmBridgeControlView(user_id)
+
+    msg = None
+    if msg_id and ch_id == ch.id:
+        try:
+            msg = await ch.fetch_message(msg_id)
+        except Exception:
+            msg = None
+    if not msg:
+        try:
+            msg = await ch.send(content, view=view)
+            try:
+                await msg.pin()
+            except Exception:
+                pass
+        except Exception:
+            return
+    else:
+        try:
+            await msg.edit(content=content, view=view)
+        except Exception:
+            pass
+
+    state[str(user_id)] = {"channel_id": ch.id, "message_id": msg.id}
+    await STORE.mark_dirty()
 
 async def dm_bridge_list_active() -> List[Dict[str, Any]]:
     bridges: List[Dict[str, Any]] = []
@@ -6484,6 +6686,7 @@ class WatcherConfigModal(discord.ui.Modal):
         VALUES (%s,%s,0,%s)
         ON DUPLICATE KEY UPDATE threshold=VALUES(threshold), text=VALUES(text);
         """, (self.user_id, count, text))
+        mark_mysql_watcher_cache_dirty()
         await audit(interaction.user.id, "Watcher set (mysql)", {"user_id": self.user_id, "threshold": count})
         await interaction.response.send_message("MySQL watcher saved.", ephemeral=True)
 
@@ -6500,6 +6703,7 @@ async def remove_watcher(mode: str, user_id: int, actor_id: int) -> str:
     if not POOL:
         return "MySQL not enabled."
     await db_exec("DELETE FROM watchers WHERE user_id=%s", (user_id,))
+    mark_mysql_watcher_cache_dirty()
     await audit(actor_id, "Watcher removed (mysql)", {"user_id": user_id})
     return "MySQL watcher removed."
 
@@ -6645,6 +6849,82 @@ class WatcherMenuView(BaseView):
             return await interaction.response.send_message("Select a user.", ephemeral=True)
         msg = await remove_watcher("mysql", self.target, interaction.user.id)
         await interaction.response.send_message(msg, ephemeral=True)
+
+class DmBridgeControlView(BaseView):
+    def __init__(self, target_user_id: int):
+        super().__init__(author_id=0, timeout=3600)
+        self.target_user_id = int(target_user_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        try:
+            lvl = await effective_level(interaction.user)
+        except Exception:
+            lvl = 0
+        if lvl < 70:
+            await interaction.response.send_message("Admin only.", ephemeral=True)
+            return False
+        return True
+
+    async def _update_message(self, interaction: discord.Interaction, note: str = ""):
+        content = dm_bridge_controls_content(self.target_user_id, interaction.channel.id)
+        if note:
+            content = content + f"\n{note}"
+        try:
+            await interaction.response.edit_message(content=content, view=self)
+        except Exception:
+            try:
+                await interaction.response.send_message(note or "Updated.", ephemeral=True)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="AI On", style=discord.ButtonStyle.success)
+    async def ai_on_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            lvl = await effective_level(interaction.user)
+        except Exception:
+            lvl = 0
+        if lvl < MANDY_GOD_LEVEL:
+            return await interaction.response.send_message("GOD only.", ephemeral=True)
+        ch_id = await ensure_dm_bridge_active(self.target_user_id, reason="ai")
+        if not ch_id:
+            return await interaction.response.send_message("Failed to open bridge.", ephemeral=True)
+        await dm_ai_enable(self.target_user_id, interaction.user.id, ch_id)
+        await log_to(
+            "ai",
+            "DM AI enabled via bridge menu",
+            subsystem="AI",
+            severity="INFO",
+            details={"user_id": self.target_user_id, "channel_id": ch_id, "actor_id": interaction.user.id},
+        )
+        await self._update_message(interaction, note="AI enabled.")
+
+    @discord.ui.button(label="AI Off", style=discord.ButtonStyle.secondary)
+    async def ai_off_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            lvl = await effective_level(interaction.user)
+        except Exception:
+            lvl = 0
+        if lvl < MANDY_GOD_LEVEL:
+            return await interaction.response.send_message("GOD only.", ephemeral=True)
+        await dm_ai_disable(self.target_user_id, reason="manual", actor_id=interaction.user.id)
+        await log_to(
+            "ai",
+            "DM AI disabled via bridge menu",
+            subsystem="AI",
+            severity="INFO",
+            details={"user_id": self.target_user_id, "actor_id": interaction.user.id},
+        )
+        await self._update_message(interaction, note="AI disabled.")
+
+    @discord.ui.button(label="Archive Bridge", style=discord.ButtonStyle.danger)
+    async def archive_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await dm_bridge_close(self.target_user_id)
+        await audit(interaction.user.id, "DM bridge close", {"user_id": self.target_user_id})
+        await self._update_message(interaction, note="Bridge archived.")
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary)
+    async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update_message(interaction)
 
 class DmBridgeMenuView(BaseView):
     def __init__(self, author_id: int, guild_id: Optional[int] = None, page: int = 0):
@@ -7792,6 +8072,102 @@ async def dmclose(ctx: commands.Context, user_id: int):
     await ctx.send("Closed.", delete_after=6)
 
 @bot.command()
+async def dmai(ctx: commands.Context, mode: str = "", target: str = ""):
+    if not ctx.guild or ctx.guild.id != ADMIN_GUILD_ID:
+        await safe_delete(ctx.message)
+        return
+    if not await require_level_ctx(ctx, MANDY_GOD_LEVEL):
+        return
+    await safe_delete(ctx.message)
+
+    known = {"on", "off", "status", "list", "enable", "disable", "start", "stop"}
+    mode = (mode or "").lower().strip()
+    if mode and mode not in known:
+        target = mode
+        mode = "status"
+    if not mode:
+        mode = "list"
+
+    async def resolve_target(token: str) -> Tuple[Optional[int], str]:
+        token = (token or "").strip()
+        if token in ("this", "here"):
+            if not isinstance(ctx.channel, discord.TextChannel):
+                return None, "No channel context."
+            uid = await dm_bridge_user_for_channel(ctx.channel.id)
+            if not uid:
+                return None, "Channel is not a DM bridge."
+            return int(uid), ""
+        ch_id = parse_channel_id(token)
+        if ch_id:
+            uid = await dm_bridge_user_for_channel(ch_id)
+            if not uid:
+                return None, "Channel is not a DM bridge."
+            return int(uid), ""
+        uid = parse_user_id(token)
+        if uid:
+            return int(uid), ""
+        return None, "Target must be a user ID/mention, DM bridge channel, or `this`."
+
+    if mode in ("on", "enable", "start"):
+        if not target:
+            return await ctx.send("Use: `!dmai on <user_id|@user|#channel|this>`", delete_after=6)
+        uid, err = await resolve_target(target)
+        if err:
+            return await ctx.send(err, delete_after=6)
+        ch_id = await ensure_dm_bridge_active(uid, reason="ai")
+        if not ch_id:
+            return await ctx.send("Could not open DM bridge.", delete_after=6)
+        await dm_ai_enable(uid, ctx.author.id, ch_id)
+        return await ctx.send(f"DM AI enabled for <@{uid}>.", delete_after=6)
+
+    if mode in ("off", "disable", "stop"):
+        if not target:
+            return await ctx.send("Use: `!dmai off <user_id|@user|#channel|this>`", delete_after=6)
+        uid, err = await resolve_target(target)
+        if err:
+            return await ctx.send(err, delete_after=6)
+        await dm_ai_disable(uid, reason="manual", actor_id=ctx.author.id)
+        return await ctx.send(f"DM AI disabled for <@{uid}>.", delete_after=6)
+
+    if mode == "status" and target:
+        uid, err = await resolve_target(target)
+        if err:
+            return await ctx.send(err, delete_after=6)
+        enabled = await dm_ai_is_enabled(uid)
+        state = dm_ai_state().get(str(uid), {})
+        enabled_at = fmt_ts(int(state.get("enabled_at", 0)))
+        ch_id = int(state.get("bridge_channel_id", 0))
+        ch_text = f"<#{ch_id}>" if ch_id else "n/a"
+        status = "active" if enabled else "inactive"
+        return await ctx.send(
+            f"DM AI {status} for <@{uid}> | bridge={ch_text} | enabled_at={enabled_at}",
+            delete_after=10,
+        )
+
+    if mode == "list":
+        entries = list(dm_ai_state().items())
+        if not entries:
+            return await ctx.send("No DM AI sessions.", delete_after=6)
+        lines: List[str] = []
+        for uid_str, entry in entries:
+            try:
+                uid = int(uid_str)
+            except Exception:
+                continue
+            enabled = await dm_ai_is_enabled(uid)
+            if not enabled:
+                continue
+            ch_id = int(entry.get("bridge_channel_id", 0))
+            enabled_at = fmt_ts(int(entry.get("enabled_at", 0)))
+            ch_text = f"<#{ch_id}>" if ch_id else "n/a"
+            lines.append(f"{uid} (<@{uid}>) | bridge={ch_text} | enabled_at={enabled_at}")
+        if not lines:
+            return await ctx.send("No active DM AI sessions.", delete_after=6)
+        return await ctx.send("DM AI sessions:\n" + "\n".join(lines[:25]))
+
+    return await ctx.send("Use: `!dmai on|off|status|list <target>`", delete_after=6)
+
+@bot.command()
 async def setlogs(ctx: commands.Context, which: str, channel_id: int):
     if not await require_level_ctx(ctx, 90):
         return
@@ -8512,6 +8888,7 @@ async def on_message(message: discord.Message):
 
     # DM inbound -> relay into bridge channel (if active)
     if isinstance(message.channel, discord.DMChannel):
+        ai_enabled = False
         try:
             ch_id = await dm_bridge_channel_for_user(message.author.id)
             if not ch_id:
@@ -8521,8 +8898,42 @@ async def on_message(message: discord.Message):
                 if isinstance(ch, discord.TextChannel):
                     await ch.send(f"dY` **{message.author}**: {message.content}")
                     await dm_bridge_touch(message.author.id)
+            ai_enabled = await dm_ai_is_enabled(message.author.id)
         except Exception:
             pass
+        if ai_enabled and (message.content or message.attachments):
+            try:
+                await log_to(
+                    "ai",
+                    "DM AI user message",
+                    subsystem="AI",
+                    severity="INFO",
+                    details={
+                        "user_id": message.author.id,
+                        "message_id": message.id,
+                        "text": truncate(message.content or "", 500),
+                    },
+                )
+            except Exception:
+                pass
+            mandy = bot.get_cog("MandyAI")
+            if not mandy:
+                try:
+                    await maybe_load_mandy_extension()
+                except Exception:
+                    mandy = None
+                mandy = bot.get_cog("MandyAI")
+            if mandy:
+                try:
+                    await mandy._process_request(
+                        message.author,
+                        message.channel,
+                        None,
+                        message.id,
+                        message.content or "",
+                    )
+                except Exception as e:
+                    await debug(f"mandy dm ai error: {e}")
         return
 
     # Prefix command enforcement

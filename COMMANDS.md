@@ -11,6 +11,7 @@ The bot supports both **classic commands** and **natural language** (via Mandy A
 - `!mandy_limits`: Show cooldown + rate-limit tracking.
 - `!mandy_queue`: Show queued AI jobs.
 - `!mandy_cancel <job_id>`: Cancel a queued AI job.
+- `!dmai on|off|status|list <target>`: Toggle DM AI mode for a user/bridge (GOD-only, admin server).
 
 ### Natural-language examples
 - `dm john hey` / `dm john, sarah hey` (multi-target)
@@ -37,6 +38,7 @@ These are primarily managed through the menus, but key commands exist:
 - `!mirrorremove <source_channel_id>`: Remove mirror rule(s) for a channel.
 - `!dmopen <user_id>`: Open DM bridge (admin server).
 - `!dmclose <user_id>`: Close DM bridge.
+- DM bridge channels include a pinned control panel to archive or toggle DM AI (AI toggles require GOD).
 - `!setlogs <system|audit|debug|mirror|ai|voice> <channel_id>`: Route logs.
 - `!health`: Health snapshot (staff/admin).
 - `!leavevc`: Emergency voice disconnect (SUPERUSER).
