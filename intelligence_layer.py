@@ -1,3 +1,4 @@
+import inspect
 import re
 import time
 import uuid
@@ -16,6 +17,7 @@ from resolver import (
     parse_user_id,
     pick_best,
     rank_channels,
+    rank_channels_global,
     rank_members,
     rank_roles,
 )
@@ -279,6 +281,18 @@ class UniversalIntelligenceLayer:
             return IntentMatch(spec=top.spec, score=0.0, match=None)
         return top
 
+    async def _power_mode_enabled(self, user: discord.User) -> bool:
+        fn = getattr(self.bot, "mandy_power_mode_enabled", None)
+        if not callable(fn):
+            return False
+        try:
+            res = fn(user)
+            if inspect.isawaitable(res):
+                res = await res
+            return bool(res)
+        except Exception:
+            return False
+
     async def process(
         self,
         user: discord.User,
@@ -311,6 +325,8 @@ class UniversalIntelligenceLayer:
                 return False
             await self._dispatch_clarify(user, channel, guild, plan)
             return True
+        if plan.confirm and await self._power_mode_enabled(user):
+            plan.confirm = False
         if plan.confirm:
             await self._dispatch_confirm(user, channel, guild, plan)
             return True
@@ -933,7 +949,22 @@ class UniversalIntelligenceLayer:
         index = self._index_cache.get(guild)
         candidates = rank_channels(guild, token, recent_ids=self._recent_channel_ids(context), index=index)
         picked = pick_best(candidates)
-        return picked, candidates
+        if picked:
+            return picked, candidates
+        if candidates:
+            return None, candidates
+
+        global_candidates = rank_channels_global(
+            self.bot,
+            token,
+            prefer_guild_id=guild.id if guild else None,
+            cache=self._index_cache,
+            limit=6,
+        )
+        picked_global = pick_best(global_candidates, min_score=0.8, gap=0.05)
+        if picked_global:
+            return int(picked_global), []
+        return None, global_candidates
 
     async def _resolve_role(
         self,

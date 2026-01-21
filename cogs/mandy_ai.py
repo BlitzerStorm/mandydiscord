@@ -548,8 +548,15 @@ class MandyAI(commands.Cog):
         ai = self._cfg()
         return str(ai.get("default_model") or "gemini-2.5-flash-lite")
 
+    def _power_mode_enabled(self) -> bool:
+        root = self._cfg_root()
+        mandy = root.get("mandy", {}) if isinstance(root, dict) else {}
+        return bool(mandy.get("power_mode", False))
+
     def _cooldown_seconds(self) -> int:
         ai = self._cfg()
+        if self._power_mode_enabled():
+            return 0
         try:
             return max(0, int(ai.get("cooldown_seconds", 5)))
         except Exception:
@@ -1036,6 +1043,13 @@ class MandyAI(commands.Cog):
 
     def _parse_dm_request(self, text: str) -> Optional[Tuple[List[str], str]]:
         match = re.match(
+            r"^(dm|message|privately\s+message)\s+(this|here)(\s+user)?$",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            return ["__this__"], ""
+        match = re.match(
             r"^(dm|message|privately\s+message)\s+(.+?)\s+\"(.+)\"$",
             text,
             re.IGNORECASE,
@@ -1121,22 +1135,7 @@ class MandyAI(commands.Cog):
         text = self._normalize_query(query)
         if not text:
             return False
-        
-        # Universal intelligence layer - handles natural language commands
-        if self._intelligence:
-            try:
-                if await self._intelligence.process(
-                    user,
-                    channel,
-                    guild,
-                    message,
-                    text,
-                    allow_intent_choice=False,
-                ):
-                    return True
-            except Exception as e:
-                print(f"Intelligence layer error (falling back): {e}")
-        
+
         lower = text.lower()
 
         if lower in ("tools", "tool", "capabilities"):
@@ -1214,6 +1213,19 @@ class MandyAI(commands.Cog):
             resolved_ids: List[int] = []
             unresolved: List[Tuple[str, List[Tuple[int, str]]]] = []
             for target_text in targets:
+                token = (target_text or "").strip().lower()
+                if token in ("this", "this user", "here", "__this__"):
+                    if message and isinstance(message.channel, discord.TextChannel):
+                        bridge_fn = getattr(self.bot, "mandy_dm_bridge_user_for_channel", None)
+                        if callable(bridge_fn):
+                            try:
+                                uid = await bridge_fn(message.channel.id)
+                            except Exception:
+                                uid = None
+                            if uid:
+                                if uid not in resolved_ids:
+                                    resolved_ids.append(uid)
+                                continue
                 uid, candidates = await self._resolve_user(guild, target_text, message, author=user)
                 if uid:
                     if uid not in resolved_ids:
@@ -1242,6 +1254,21 @@ class MandyAI(commands.Cog):
                 summary += "\nErrors:\n" + "\n".join(err_lines[:5])
             await self._send_chunks(channel, summary)
             return True
+
+        # Universal intelligence layer - handles natural language commands
+        if self._intelligence:
+            try:
+                if await self._intelligence.process(
+                    user,
+                    channel,
+                    guild,
+                    message,
+                    text,
+                    allow_intent_choice=True,
+                ):
+                    return True
+            except Exception as e:
+                print(f"Intelligence layer error (falling back): {e}")
         summary_limit = self._parse_transcript_summarize(text)
         if summary_limit:
             await self._summarize_transcript(user, channel, guild, summary_limit, query_text=text)
@@ -1620,6 +1647,7 @@ class MandyAI(commands.Cog):
             "If user wants chat, explanation, brainstorming, prefer TALK. "
             "If user requests a new command/feature, prefer DESIGN_TOOL. "
             "If action is risky/irreversible, return NEEDS_CONFIRMATION.\n"
+            "For TALK: be direct, helpful, and creative when appropriate. Ask a short clarification question if needed.\n"
             "BUILD-IF-MISSING: If the request cannot be satisfied using allowed tools, return DESIGN_TOOL. "
             "Do not fabricate answers or claim to have executed actions without ACTION.\n"
             "If the user request is ambiguous, return NEEDS_CONFIRMATION with a clarification question.\n"
@@ -2109,6 +2137,8 @@ class MandyAI(commands.Cog):
             self._cooldowns[user.id] = now
 
         text_query = query.strip()
+        power_mode = self._power_mode_enabled()
+        confirmed_local = confirmed or power_mode
 
         msg = None
         if message_id and hasattr(channel, "fetch_message"):
@@ -2172,13 +2202,14 @@ class MandyAI(commands.Cog):
             "guild_id": guild.id if guild else 0,
             "channel_id": getattr(channel, "id", 0),
             "message_id": message_id,
-            "confirmed": confirmed,
+            "confirmed": confirmed_local,
+            "power_mode": power_mode,
         }
         if extra_context:
             context.update(extra_context)
 
         try:
-            payload = await self._call_router(text_query, transcript, context, confirmed, guild, channel)
+            payload = await self._call_router(text_query, transcript, context, confirmed_local, guild, channel)
         except LocalRateLimitError as exc:
             if from_queue:
                 raise
@@ -2224,7 +2255,7 @@ class MandyAI(commands.Cog):
             return
         if intent == "BUILD_TOOL":
             build = payload.get("build") or {}
-            if not confirmed:
+            if not confirmed_local:
                 slug = str(build.get("slug") or "")
                 question = f"Proposed BUILD: {slug}. Proceed?"
                 view = ConfirmView(self, user.id, getattr(channel, "id", 0), text_query)
@@ -2243,6 +2274,17 @@ class MandyAI(commands.Cog):
             self._counter_inc("builds", 1)
             return
         if intent == "NEEDS_CONFIRMATION":
+            if power_mode and not confirmed:
+                return await self._process_request(
+                    user,
+                    channel,
+                    guild,
+                    message_id,
+                    text_query,
+                    confirmed=True,
+                    from_queue=from_queue,
+                    extra_context=extra_context,
+                )
             confirm = payload.get("confirm") or {}
             question = str(confirm.get("question") or "Confirm?")
             view = ConfirmView(self, user.id, getattr(channel, "id", 0), text_query)
@@ -2482,6 +2524,22 @@ class MandyAI(commands.Cog):
                 f"- {model} ({entry.get('date')}): count={entry.get('count', 0)} tokens={entry.get('tokens', 0)}"
             )
         await self._send_chunks(ctx.channel, "\n".join(lines))
+
+    @commands.command(name="mandy_power")
+    async def mandy_power(self, ctx: commands.Context, mode: str = "status"):
+        if not await self._require_god(ctx):
+            return
+        root = self._cfg_root()
+        mandy = root.setdefault("mandy", {})
+        mode = (mode or "status").lower().strip()
+        if mode in ("on", "enable", "true", "1"):
+            mandy["power_mode"] = True
+            await self._mark_dirty()
+        elif mode in ("off", "disable", "false", "0"):
+            mandy["power_mode"] = False
+            await self._mark_dirty()
+        status = "ON" if mandy.get("power_mode", False) else "OFF"
+        await self._send_chunks(ctx.channel, f"Mandy power mode: {status}.")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(MandyAI(bot))

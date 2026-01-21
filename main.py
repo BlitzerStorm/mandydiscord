@@ -203,7 +203,8 @@ DEFAULT_JSON: Dict[str, Any] = {
         "installed_extensions": []
     },
     "mandy": {
-        "mention_dm_cooldowns": {}
+        "mention_dm_cooldowns": {},
+        "power_mode": True
     },
     "sentience": {
         "enabled": True,
@@ -1642,6 +1643,10 @@ async def effective_level(member: discord.abc.User) -> int:
         lvl = max(lvl, max_role)
     return lvl
 
+def mandy_power_mode_enabled(_: Optional[discord.abc.User] = None) -> bool:
+    mandy = cfg().get("mandy", {}) or {}
+    return bool(mandy.get("power_mode", False))
+
 async def require_level_ctx(ctx: commands.Context, min_level: int) -> bool:
     lvl = await effective_level(ctx.author)
     if lvl >= min_level:
@@ -1853,6 +1858,9 @@ class ToolRegistry:
         guild_token = self._as_text(guild or "", "guild", 100).strip()
         max_users = self._as_int(limit or 0, "limit") if limit else 0
 
+        def _norm(s: str) -> str:
+            return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
+
         guilds = list(self.bot.guilds)
         if guild_token:
             gid = None
@@ -1861,8 +1869,16 @@ class ToolRegistry:
             if gid:
                 guilds = [g for g in guilds if g.id == gid]
             else:
-                norm = guild_token.lower()
-                guilds = [g for g in guilds if g.name.lower() == norm]
+                token_norm = _norm(guild_token)
+                exact = [g for g in guilds if _norm(g.name) == token_norm]
+                if exact:
+                    guilds = exact
+                else:
+                    contains = [g for g in guilds if token_norm and token_norm in _norm(g.name)]
+                    if len(contains) == 1:
+                        guilds = contains
+                    else:
+                        raise ValueError("guild not found (use exact name or guild id)")
         if not guilds:
             raise ValueError("guild not found")
 
@@ -2138,6 +2154,8 @@ def attach_mandy_context():
     bot.mandy_audit = audit
     bot.mandy_log_to = log_to
     bot.mandy_dm_ai_is_enabled = dm_ai_is_enabled
+    bot.mandy_dm_bridge_user_for_channel = dm_bridge_user_for_channel
+    bot.mandy_power_mode_enabled = mandy_power_mode_enabled
     bot.mandy_effective_level = effective_level
     bot.mandy_require_level_ctx = require_level_ctx
 

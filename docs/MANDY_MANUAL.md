@@ -232,6 +232,7 @@ Commands:
 - `!mandy_queue`: show queued jobs
 - `!mandy_cancel <job_id>`: cancel a job
 - `!mandy_limits`: show cooldown + usage counters
+- `!mandy_power on|off|status`: toggle power mode (removes local cooldown + confirmation prompts)
 
 ### Prompting tips
 Fast Path examples:
