@@ -157,6 +157,33 @@ CAPABILITY_DEFS: Dict[str, Dict[str, Any]] = {
         "cost_tier": "normal",
         "pass_actor": False,
     },
+    "broadcast_message": {
+        "description": "Broadcast a message to a channel name across all servers.",
+        "required": ["channel", "text"],
+        "optional": [],
+        "args": {
+            "channel": {"type": "str", "min_len": 1, "max_len": 100},
+            "text": {"type": "str", "min_len": 1, "max_len": 1900},
+        },
+        "permissions": "GOD",
+        "side_effects": "state-changing",
+        "cost_tier": "expensive",
+        "pass_actor": True,
+    },
+    "broadcast_dm": {
+        "description": "Broadcast a DM to users across all servers (or a specific server).",
+        "required": ["text"],
+        "optional": ["guild", "limit"],
+        "args": {
+            "text": {"type": "str", "min_len": 1, "max_len": 1900},
+            "guild": {"type": "str", "min_len": 1, "max_len": 100},
+            "limit": {"type": "int", "min": 1, "max": 200000},
+        },
+        "permissions": "GOD",
+        "side_effects": "state-changing",
+        "cost_tier": "expensive",
+        "pass_actor": True,
+    },
     "close_dm_bridge": {
         "description": "Close/archive a DM bridge for a user.",
         "required": ["user_id"],

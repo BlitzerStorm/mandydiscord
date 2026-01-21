@@ -146,6 +146,26 @@ class UniversalIntelligenceLayer:
                 confirm=True,
             ),
             IntentSpec(
+                name="broadcast_message",
+                capability="broadcast_message",
+                keywords=["broadcast", "announce", "send", "msg", "message", "all", "servers"],
+                patterns=[
+                    rx(r"^(?:broadcast|announce|send|msg|message)\s+(?:to\s+)?all\s+(?:servers|guilds)\s+(?:in\s+)?(?P<channel>.+?)\s*(?:->|:)\s*(?P<message>.+)$"),
+                    rx(r"^(?:broadcast|announce|send|msg|message)\s+all\s+(?:servers|guilds)\s+(?P<message>.+?)\s+(?:in|to)\s+(?P<channel>.+)$"),
+                ],
+                confirm=True,
+            ),
+            IntentSpec(
+                name="broadcast_dm",
+                capability="broadcast_dm",
+                keywords=["dm", "message", "send", "all", "servers", "users"],
+                patterns=[
+                    rx(r"^(?:dm|message|send)\s+all\s+(?:servers|users|members)\s+in\s+(?P<guild>.+?)\s*(?:->|:)\s*(?P<message>.+)$"),
+                    rx(r"^(?:dm|message|send)\s+all\s+(?:servers|users|members)\s*(?:->|:)?\s*(?P<message>.+)$"),
+                ],
+                confirm=True,
+            ),
+            IntentSpec(
                 name="mirror_create",
                 capability="create_mirror",
                 keywords=["mirror", "relay", "link", "sync"],
@@ -312,6 +332,10 @@ class UniversalIntelligenceLayer:
             return await self._plan_send_dm(intent, user, guild, raw_text, context)
         if spec.name == "send_message":
             return await self._plan_send_message(intent, user, guild, raw_text, context)
+        if spec.name == "broadcast_message":
+            return await self._plan_broadcast_message(intent, raw_text)
+        if spec.name == "broadcast_dm":
+            return await self._plan_broadcast_dm(intent, raw_text)
         if spec.name == "mirror_create":
             return await self._plan_mirror_create(intent, user, guild, raw_text, context)
         if spec.name == "add_watcher":
@@ -498,6 +522,65 @@ class UniversalIntelligenceLayer:
             confidence=intent.score,
             confirm=intent.spec.confirm,
             summary=f"Send message to <#{channel_id}>.",
+        )
+
+    async def _plan_broadcast_message(self, intent: IntentMatch, raw_text: str) -> ActionPlan:
+        channel_text, message_text = self._extract_target_message(raw_text, intent.match, field="channel")
+        if not channel_text:
+            return ActionPlan(
+                capability=intent.spec.capability,
+                actions=[],
+                args={},
+                confidence=intent.score,
+                confirm=False,
+                summary="Broadcast message.",
+                clarify={"kind": "text", "field": "channel", "prompt": "Which channel name should I broadcast to?"},
+            )
+        if not message_text:
+            return ActionPlan(
+                capability=intent.spec.capability,
+                actions=[],
+                args={"channel": channel_text},
+                confidence=intent.score,
+                confirm=False,
+                summary="Broadcast message.",
+                clarify={"kind": "text", "field": "message", "prompt": "What message should I broadcast?"},
+            )
+        return ActionPlan(
+            capability=intent.spec.capability,
+            actions=[{"tool": "broadcast_message", "args": {"channel": channel_text, "text": message_text}}],
+            args={"channel": channel_text, "text": message_text},
+            confidence=intent.score,
+            confirm=intent.spec.confirm,
+            summary=f"Broadcast message to #{channel_text}.",
+        )
+
+    async def _plan_broadcast_dm(self, intent: IntentMatch, raw_text: str) -> ActionPlan:
+        guild_text = ""
+        message_text = ""
+        if intent.match:
+            guild_text = (intent.match.groupdict().get("guild") or "").strip()
+            message_text = (intent.match.groupdict().get("message") or "").strip()
+        if not message_text:
+            return ActionPlan(
+                capability=intent.spec.capability,
+                actions=[],
+                args={},
+                confidence=intent.score,
+                confirm=False,
+                summary="Broadcast DM.",
+                clarify={"kind": "text", "field": "message", "prompt": "What DM should I send to everyone?"},
+            )
+        args = {"text": message_text}
+        if guild_text:
+            args["guild"] = guild_text
+        return ActionPlan(
+            capability=intent.spec.capability,
+            actions=[{"tool": "broadcast_dm", "args": args}],
+            args=args,
+            confidence=intent.score,
+            confirm=intent.spec.confirm,
+            summary="Broadcast DM to all users.",
         )
 
     async def _plan_mirror_create(
@@ -1078,6 +1161,27 @@ class UniversalIntelligenceLayer:
             if channel_id and message_text:
                 plan.actions = [{"tool": "send_message", "args": {"channel_id": int(channel_id), "text": str(message_text)}}]
                 plan.args = {"channel_id": int(channel_id), "text": str(message_text)}
+
+        if plan.capability == "broadcast_message":
+            channel_text = plan.args.get("channel")
+            message_text = plan.args.get("message") or plan.args.get("text")
+            if channel_text and message_text:
+                plan.actions = [{"tool": "broadcast_message", "args": {"channel": str(channel_text), "text": str(message_text)}}]
+                plan.args = {"channel": str(channel_text), "text": str(message_text)}
+
+        if plan.capability == "broadcast_dm":
+            message_text = plan.args.get("message") or plan.args.get("text")
+            if message_text:
+                args = {"text": str(message_text)}
+                if plan.args.get("guild"):
+                    args["guild"] = str(plan.args.get("guild"))
+                if plan.args.get("limit"):
+                    try:
+                        args["limit"] = int(plan.args.get("limit"))
+                    except Exception:
+                        pass
+                plan.actions = [{"tool": "broadcast_dm", "args": args}]
+                plan.args = args
 
         if plan.capability == "create_mirror":
             src_id = plan.args.get("source_channel_id")

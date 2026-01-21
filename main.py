@@ -1782,6 +1782,125 @@ class ToolRegistry:
         except Exception as exc:
             raise ValueError(f"dm failed: {exc}") from exc
 
+    async def broadcast_message(self, channel: str, text: str, actor_id: int = 0):
+        channel_token = self._as_text(channel, "channel", 100).strip()
+        content = self._as_text(text, "text", 1900).strip()
+        if not channel_token:
+            raise ValueError("channel required")
+        if not content:
+            raise ValueError("text cannot be empty")
+
+        channel_id = parse_channel_id(channel_token)
+        sent = 0
+        failed = 0
+        targets = 0
+
+        if channel_id:
+            ch = self.bot.get_channel(channel_id)
+            if not ch:
+                try:
+                    ch = await self.bot.fetch_channel(channel_id)
+                except Exception as exc:
+                    raise ValueError("channel not found") from exc
+            if not isinstance(ch, discord.TextChannel):
+                raise ValueError("channel must be a text channel")
+            targets = 1
+            perms = ch.permissions_for(ch.guild.me)
+            if not perms.send_messages:
+                raise ValueError("missing send_messages permission")
+            try:
+                await ch.send(content)
+                sent = 1
+            except Exception as exc:
+                raise ValueError(f"send failed: {exc}") from exc
+            if actor_id:
+                await audit(actor_id, "Broadcast message", {"channel_id": channel_id, "sent": sent})
+            return {"sent": sent, "targets": targets, "failed": failed}
+
+        name = channel_token.lstrip("#").strip().lower()
+        if not name:
+            raise ValueError("channel required")
+        for guild in self.bot.guilds:
+            ch = None
+            for cand in guild.text_channels:
+                if cand.name.lower() == name:
+                    ch = cand
+                    break
+            if not ch:
+                continue
+            targets += 1
+            perms = ch.permissions_for(ch.guild.me)
+            if not perms.send_messages:
+                failed += 1
+                continue
+            try:
+                await ch.send(content)
+                sent += 1
+            except Exception:
+                failed += 1
+        if actor_id:
+            await audit(
+                actor_id,
+                "Broadcast message",
+                {"channel": name, "sent": sent, "targets": targets, "failed": failed},
+            )
+        return {"sent": sent, "targets": targets, "failed": failed}
+
+    async def broadcast_dm(self, text: str, guild: str = "", limit: int = 0, actor_id: int = 0):
+        content = self._as_text(text, "text", 1900).strip()
+        if not content:
+            raise ValueError("text cannot be empty")
+        guild_token = self._as_text(guild or "", "guild", 100).strip()
+        max_users = self._as_int(limit or 0, "limit") if limit else 0
+
+        guilds = list(self.bot.guilds)
+        if guild_token:
+            gid = None
+            if guild_token.isdigit():
+                gid = int(guild_token)
+            if gid:
+                guilds = [g for g in guilds if g.id == gid]
+            else:
+                norm = guild_token.lower()
+                guilds = [g for g in guilds if g.name.lower() == norm]
+        if not guilds:
+            raise ValueError("guild not found")
+
+        sent = 0
+        failed = 0
+        targets = 0
+        seen: Set[int] = set()
+        for g in guilds:
+            for member in g.members:
+                if member.bot:
+                    continue
+                if member.id in seen:
+                    continue
+                seen.add(member.id)
+                targets += 1
+                try:
+                    await member.send(content)
+                    sent += 1
+                except Exception:
+                    failed += 1
+                if max_users and targets >= max_users:
+                    break
+            if max_users and targets >= max_users:
+                break
+        if actor_id:
+            await audit(
+                actor_id,
+                "Broadcast DM",
+                {
+                    "guild": guild_token or "all",
+                    "sent": sent,
+                    "targets": targets,
+                    "failed": failed,
+                    "limit": max_users,
+                },
+            )
+        return {"sent": sent, "targets": targets, "failed": failed}
+
     async def close_dm_bridge(self, user_id: int, actor_id: int = 0):
         uid = self._as_int(user_id, "user_id")
         info = await dm_bridge_get(uid)

@@ -241,6 +241,8 @@ Fast Path examples:
 - `!mandy mirror #general to #archive`
 - `!mandy stats weekly for john`
 - `!mandy set status dnd building Mandy OS`
+- `!mandy broadcast all servers in #announcements: maintenance at 5pm`
+- `!mandy dm all users: maintenance at 5pm`
 
 Gemini examples (tool + reasoning):
 - `!mandy summarize the last 50 messages in #debug-logs`
