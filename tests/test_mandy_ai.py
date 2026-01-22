@@ -120,7 +120,7 @@ def _install_discord_stubs():
 
 _install_discord_stubs()
 
-from capability_registry import CapabilityRegistry
+from mandy.capability_registry import CapabilityRegistry
 from cogs.mandy_ai import ConfirmView, MandyAI
 
 

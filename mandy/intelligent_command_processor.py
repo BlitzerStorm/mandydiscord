@@ -9,7 +9,7 @@ import discord
 from typing import Optional, Dict, List, Tuple, Any
 from difflib import SequenceMatcher
 import time
-from resolver import GuildIndexCache, pick_best, rank_members_global
+from .resolver import GuildIndexCache, pick_best, rank_members_global
 
 
 class IntentRecognizer:
@@ -764,4 +764,3 @@ class IntelligentCommandProcessor:
         except Exception as e:
             await channel.send(f"❌ Failed to get queue: {str(e)}")
             return False
-

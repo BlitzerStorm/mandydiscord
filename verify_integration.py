@@ -11,10 +11,10 @@ def check_files():
     """Check all required files exist."""
     files_to_check = {
         "cogs/mandy_ai.py": "MandyAI cog with embedded intelligent processor",
-        "intelligent_command_processor.py": "Core intelligent command engine",
+        "mandy/intelligent_command_processor.py": "Core intelligent command engine",
         "main.py": "Bot initialization",
-        "capability_registry.py": "Tool registry",
-        "tool_plugin_manager.py": "Plugin manager",
+        "mandy/capability_registry.py": "Tool registry",
+        "mandy/tool_plugin_manager.py": "Plugin manager",
     }
     
     print("=" * 60)
@@ -37,7 +37,7 @@ def check_integration():
     print("=" * 60)
     
     checks = {
-        "Import statement": "from intelligent_command_processor import IntelligentCommandProcessor",
+        "Import statement": "from mandy.intelligent_command_processor import IntelligentCommandProcessor",
         "Processor init": "self._intelligent_processor = IntelligentCommandProcessor(bot)",
         "Executor class": "class _ManydAICommandExecutor:",
         "Handler integration": "if self._intelligent_processor:",
@@ -76,7 +76,7 @@ def check_processor():
     }
     
     try:
-        with open("intelligent_command_processor.py", "r") as f:
+        with open("mandy/intelligent_command_processor.py", "r") as f:
             content = f.read()
         
         all_found = True
@@ -88,7 +88,7 @@ def check_processor():
         
         return all_found
     except Exception as e:
-        print(f"❌ Error reading intelligent_command_processor.py: {e}")
+        print(f"❌ Error reading mandy/intelligent_command_processor.py: {e}")
         return False
 
 def check_executor():

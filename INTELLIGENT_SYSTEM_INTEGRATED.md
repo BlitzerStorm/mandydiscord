@@ -12,7 +12,7 @@ The intelligent command processor has been **properly embedded** into your Disco
    - Hooked processor into `_handle_fast_path()` method (runs FIRST before traditional parsing)
    - Added `_ManydAICommandExecutor` class to bridge intelligent output to actual tools
 
-2. **[intelligent_command_processor.py](intelligent_command_processor.py)** - Core Engine:
+2. **[mandy/intelligent_command_processor.py](mandy/intelligent_command_processor.py)** - Core Engine:
    - `IntentRecognizer`: Matches 8 command types with natural language patterns
    - `ArgumentExtractor`: Fuzzy user/message/number extraction
    - `ContextMemory`: Tracks user context for pronoun resolution
@@ -178,7 +178,7 @@ This means:
 
 ## Code Statistics
 
-- **intelligent_command_processor.py**: 550 lines (6 classes)
+- **mandy/intelligent_command_processor.py**: 550 lines (6 classes)
 - **mandy_ai.py additions**: 180 lines (executor + integration)
 - **Total new code**: 730 lines
 - **External dependencies**: 0 (only discord.py)

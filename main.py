@@ -15,8 +15,6 @@
 
 import discord
 from discord.ext import commands, tasks
-import aiofiles
-import aiomysql
 import asyncio
 import json
 import os
@@ -27,447 +25,114 @@ import datetime
 import hashlib
 from typing import Optional, Dict, Any, List, Tuple, Set
 import secrets
-import urllib.parse
-import yt_dlp
-from capability_registry import CapabilityRegistry
-from tool_plugin_manager import ToolPluginManager
-from cooldown_store import CooldownStore
-import ambient_engine
-from resolver import GuildIndexCache, parse_channel_id, parse_user_id, rank_members_global, pick_best
-from sentience_layer import sentience_cfg, presence_cfg, voice_line
-
-# -----------------------------
-# IDs / Constants
-# -----------------------------
-ADMIN_GUILD_ID = 1273147628942524416
-SUPER_USER_ID = 741470965359443970
-AUTO_GOD_ID = 677193230265090059
-MANDY_GOD_LEVEL = 90
-MENTION_DM_COOLDOWN_SECONDS = 600
-
-DB_JSON_PATH = "database.json"
-PASSWORDS_PATH = "passwords.txt"
-
-SPECIAL_VOICE_USER_ID = 741470965359443970
-SPECIAL_VOICE_URL = "https://youtu.be/UukrfHmWmuY"
-VOICE_QUIT_DELAY_SECONDS = 27
-VOICE_EXIT_PHRASES = [
-    "Excellent conversation we had in the VC, do you agree?",
-    "That got me thinking: best VC yet, right?",
-    "What a call, definitely excellent, wouldn't you say?",
-    "I'll always remember that VC; was it as great for you?",
-    "Top-tier voice chat there, agreed?",
-    "Can't stop smiling about that VC; you feel the same?"
-]
-
-SPECIAL_VOICE_LEAVE_TASKS: Dict[int, asyncio.Task] = {}
-MOVIE_PROMPT_TIMEOUT_SECONDS = 60
-MOVIE_STAY_DEFAULT_MINUTES = 15
-MOVIE_STAY_MAX_MINUTES = 30
-MOVIE_QUEUE_LIMIT = 25
-MOVIE_ACTIVE_GUILDS: Set[int] = set()
-MOVIE_STATES: Dict[int, Dict[str, Any]] = {}
-MOVIE_STAY_TASKS: Dict[int, asyncio.Task] = {}
-
-GUEST_ROLE_NAME = "Guest"
-QUARANTINE_ROLE_NAME = "Quarantine"
-STAFF_ROLE_NAME = "Staff"
-ADMIN_ROLE_NAME = "Admin"
-GOD_ROLE_NAME = "GOD"
-
-ROLE_LEVEL_DEFAULTS = {
-    GOD_ROLE_NAME: 90,
-    ADMIN_ROLE_NAME: 70,
-    STAFF_ROLE_NAME: 50,
-    GUEST_ROLE_NAME: 1,
-    QUARANTINE_ROLE_NAME: 1
-}
-
-MIRROR_FAIL_THRESHOLD = 3
-MIRROR_CACHE_REFRESH = 10
-SERVER_STATUS_REFRESH = 60
-INTEGRITY_REFRESH = 60
-CLEANUP_RESPONSE_TTL = 20
-
-DEFAULT_AI_LIMITS = {
-    "gemini-2.5-pro": {"rpm": 5, "tpm": 250000, "rpd": 100},
-    "gemini-2.5-flash": {"rpm": 10, "tpm": 250000, "rpd": 250},
-    "gemini-2.5-flash-lite": {"rpm": 15, "tpm": 250000, "rpd": 1000},
-    "gemini-3-pro-preview": {"rpm": 2, "tpm": 250000, "rpd": 50},
-    "imagen-3": {"rpm": 2, "rpd": 50},
-}
-
-# -----------------------------
-# Secrets loader
-# -----------------------------
-def load_secrets(path: str = PASSWORDS_PATH) -> Dict[str, str]:
-    data: Dict[str, str] = {}
-    if not os.path.exists(path):
-        return data
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#") or "=" not in s:
-                continue
-            k, v = s.split("=", 1)
-            data[k.strip()] = v.strip()
-    return data
-
-SECRETS = load_secrets()
-
-DISCORD_TOKEN = SECRETS.get("DISCORD_TOKEN") or os.getenv("DISCORD_TOKEN")
-SERVER_PASSWORD = SECRETS.get("SERVER_PASSWORD") or os.getenv("SERVER_PASSWORD") or ""
-
-MYSQL_HOST = SECRETS.get("MYSQL_HOST") or os.getenv("MYSQL_HOST")
-MYSQL_DB   = SECRETS.get("MYSQL_DB") or os.getenv("MYSQL_DB")
-MYSQL_USER = SECRETS.get("MYSQL_USER") or os.getenv("MYSQL_USER")
-MYSQL_PASS = SECRETS.get("MYSQL_PASS") or os.getenv("MYSQL_PASS")
-GEMINI_API_KEY = SECRETS.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
-
-MYSQL_ENABLED = bool(MYSQL_HOST and MYSQL_DB and MYSQL_USER is not None)
-
-if not DISCORD_TOKEN:
-    raise SystemExit("Missing DISCORD_TOKEN in passwords.txt or env")
-
-# -----------------------------
-# JSON Store (live-edit)
-# -----------------------------
-DEFAULT_JSON: Dict[str, Any] = {
-    "targets": {},       # your watcher targets live here
-    "mirrors": {         # legacy: "guild:src_channel" -> dst_channel
-        "interactive_controls_enabled": True
-    },
-    "mirror_rules": {},  # new unified mirror rules
-    "mirror_status": {}, # per-guild last mirror
-    "admin_servers": {}, # admin server mirror/status channels
-    "server_status_messages": {},
-    "server_info_messages": {},
-    "mirror_message_map": {},  # json mirror message mapping (rule_id -> list)
-    "dm_bridges": {},    # fallback dm bridges: "user_id" -> admin_channel_id
-    "dm_bridge_controls": {},  # user_id -> {channel_id, message_id}
-    "dm_ai": {},         # dm user_id -> ai session metadata
-    "bot_status": {      # presence state + text
-        "state": "online",
-        "text": ""
-    },
-    "presence": {
-        "bio": "",
-        "autopresence_enabled": False,
-        "last_message_ts": 0,
-        "last_super_interaction_ts": 0
-    },
-    "ambient_engine": {
-        "enabled": True,
-        "last_typing": 0,
-        "last_presence": 0
-    },
-    "permissions": {},   # json perms: "user_id" -> level
-    "gate": {},          # gate state: "user_id" -> {channel, tries}
-    "mirror_fail_threshold": MIRROR_FAIL_THRESHOLD,
-    "logs": {            # log channel ids
-        "system": None,
-        "audit": None,
-        "debug": None,
-        "mirror": None,
-        "ai": None,
-        "voice": None
-    },
-    "command_channels": {
-        "user": "command-requests",
-        "god": "admin-chat",
-        "mode": "off"  # off=anywhere, hard=clean + forward, soft=remind only
-    },
-    "menu_messages": {},
-    "rbac": {
-        "role_levels": ROLE_LEVEL_DEFAULTS.copy()
-    },
-    "auto": {
-        "setup": True,
-        "backfill": True,
-        "backfill_limit": 50,
-        "backfill_per_channel": 20,
-        "backfill_delay": 0.2
-    },
-    "tuning": {
-        "setup_delay": 1.0
-    },
-    "ai": {
-        "default_model": "gemini-2.5-flash-lite",
-        "router_model": "gemini-2.5-flash-lite",
-        "tts_model": "",
-        "cooldown_seconds": 5,
-        "limits": DEFAULT_AI_LIMITS.copy(),
-        "queue": {},
-        "rolling": {},
-        "daily": {},
-        "installed_extensions": []
-    },
-    "mandy": {
-        "mention_dm_cooldowns": {},
-        "power_mode": True
-    },
-    "sentience": {
-        "enabled": True,
-        "dialect": "sentient_core",
-        "channels": {},
-        "thoughts_rate_limit_seconds": 30,
-        "menu_style": "default",
-        "daily_reflection": {
-            "enabled": False,
-            "last_run_utc": 0,
-            "hour_utc": None,
-            "max_messages": 120,
-            "fallback_enabled": False
-        },
-        "internal_monologue": {
-            "enabled": False,
-            "last_run_utc": 0,
-            "interval_minutes": 180,
-            "max_lines": 4
-        },
-        "maintenance": {
-            "enabled": True,
-            "ai_queue_max_age_hours": 6
-        }
-    },
-    "diagnostics": {
-        "channel_id": 0,
-        "message_id": 0,
-        "last_update": 0
-    },
-    "manual": {
-        "channel_id": 0,
-        "last_hash": "",
-        "last_message_id": 0,
-        "last_upload": 0,
-        "auto_upload_enabled": False
-    },
-    "memory": {
-        "events": []  # long-term sentiment / notes
-    },
-    "ark_snapshots": {},
-    "phoenix_keys": {},
-    "onboarding": {
-        "rules_channel_id": 0,
-        "role_name": "Citizen",
-        "phrases": ["i agree"]
-    },
-    "backfill_state": {
-        "done": {}
-    },
-    "chat_stats": {},
-    "chat_stats_backfill_done": {},
-    "chat_stats_live_message": {},
-    "chat_stats_global_live_message": {},
-    "layout": {
-        "categories": {
-            "Welcome & Information": ["rules-and-guidelines", "announcements", "guest-briefing"],
-            "Bot Control & Monitoring": ["bot-status", "command-requests", "error-reporting"],
-            "Research & Development": ["algorithm-discussion", "data-analysis"],
-            "Guest Access": ["guest-chat", "guest-feedback", "quarantine"],
-            "Engineering Core": ["core-chat", "system-logs", "audit-logs", "debug-logs", "mirror-logs"],
-            "Admin Backrooms": ["admin-chat", "server-management"],
-            "DM Bridges": []
-        }
-    },
-    "channel_topics": {
-        "rules-and-guidelines": "Read these first. Required for all members.",
-        "announcements": "Server announcements and updates.",
-        "guest-briefing": "How to join and get approved.",
-        "guest-chat": "Guest chat (limited).",
-        "guest-feedback": "Feedback and questions from guests.",
-        "quarantine": "Restricted holding channel.",
-        "bot-status": "Bot status updates and presence controls.",
-        "command-requests": "User command requests. Commands outside this channel are removed.",
-        "error-reporting": "Report issues or errors with commands.",
-        "core-chat": "Core engineering discussion.",
-        "algorithm-discussion": "Research ideas, algorithms, and experiments.",
-        "data-analysis": "Data analysis, metrics, and reports.",
-        "system-logs": "System log stream (general).",
-        "audit-logs": "Audit trail for privileged actions.",
-        "debug-logs": "Debug output and diagnostics.",
-        "mirror-logs": "Mirror pipeline events and failures.",
-        "admin-chat": "GOD-only commands and admin coordination.",
-        "server-management": "Server ops notes and maintenance."
-    },
-    "pinned_text": {
-        "rules-and-guidelines": (
-            "dY\"O **Rules & Guidelines**\n"
-            "- Be respectful.\n"
-            "- No spam.\n"
-            "- Follow staff instructions.\n\n"
-            "**Commands (prefix):**\n"
-            "- `!menu`\n"
-            "- `!godmenu`\n"
-            "- `!setup fullsync`\n"
-        ),
-        "bot-status": (
-            "dY\"O **Bot Status & Help**\n"
-            "Menus auto-populate in command channels.\n"
-        ),
-        "system-logs": (
-            "dY\"O **System Logs**\n"
-            "General system log stream.\n"
-        ),
-        "command-requests": (
-            "dY\"O **Command Requests**\n"
-            "Use the menu panel below for user tools.\n"
-        ),
-        "error-reporting": (
-            "dY\"O **Error Reporting**\n"
-            "Post issues with timestamps and screenshots if possible.\n"
-        ),
-        "audit-logs": (
-            "dY\"O **Audit Logs**\n"
-            "Privileged actions and security events.\n"
-        ),
-        "debug-logs": (
-            "dY\"O **Debug Logs**\n"
-            "Diagnostic output and errors.\n"
-        ),
-        "mirror-logs": (
-            "dY\"O **Mirror Logs**\n"
-            "Mirror events, failures, and status.\n"
-        ),
-        "guest-briefing": (
-            "dY\"O **Guest Briefing**\n"
-            "This server uses a password gate. Ask staff if youƒ?Tre stuck.\n"
-        ),
-        "quarantine": (
-            "dY\"O **Quarantine**\n"
-            "Quarantined users wait here until staff releases them.\n"
-        ),
-        "admin-chat": (
-            "dY\"O **Admin Chat**\n"
-            "GOD-only command channel. Use the panel below.\n"
-        )
-    }
-}
-
-
-
-def chunk_lines(lines: list, header: str, limit: int = 1900) -> list:
-    """Chunk text with a header repeated per chunk."""
-    chunks = []
-    cur = header
-    for line in lines:
-        if len(cur) + len(line) + 1 > limit:
-            chunks.append(cur)
-            cur = header
-        cur += "\n" + line
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
-def memory_state() -> Dict[str, Any]:
-    return cfg().setdefault("memory", {}).setdefault("events", [])
-
-
-async def memory_add(kind: str, text: str, meta: Optional[Dict[str, Any]] = None):
-    events = cfg().setdefault("memory", {}).setdefault("events", [])
-    events.append({
-        "ts": now_ts(),
-        "kind": kind,
-        "text": truncate(text, 500),
-        "meta": meta or {},
-    })
-    # keep last 200 events to stay lean
-    if len(events) > 200:
-        del events[:-200]
-    await STORE.mark_dirty()
-
-
-def memory_recent(limit: int = 10) -> List[Dict[str, Any]]:
-    events = list(cfg().setdefault("memory", {}).get("events", []))
-    return list(events[-limit:])
-
-
-def ark_snapshots() -> Dict[str, Any]:
-    return cfg().setdefault("ark_snapshots", {})
-
-
-def phoenix_keys() -> Dict[str, str]:
-    return cfg().setdefault("phoenix_keys", {})
-
-
-async def request_elevation(action: str, reason: str, meta: Optional[Dict[str, Any]] = None):
-    """Ask SUPERUSER for help when Mandy lacks permissions."""
-    await audit(SUPER_USER_ID, f"Assist requested: {action}", {"reason": reason, **(meta or {})})
-    try:
-        owner = await bot.fetch_user(SUPER_USER_ID)
-        msg = f"Assist requested for `{action}`: {reason}"
-        if meta:
-            msg += f"\nmeta: {meta}"
-        await owner.send(msg)
-    except Exception:
-        pass
-
-
-def classify_mood(text: str) -> str:
-    lower = (text or "").lower()
-    negative = ("angry", "mad", "hate", "annoyed", "wtf", "stupid", "dumb", "trash")
-    positive = ("love", "awesome", "great", "thanks", "thank you", "nice", "cool")
-    if any(w in lower for w in positive):
-        return "positive"
-    if any(w in lower for w in negative):
-        return "negative"
-    return "neutral"
-
-
-def bot_missing_permissions(guild: discord.Guild) -> List[str]:
-    m = guild.me
-    if not m:
-        return ["unknown"]
-    perms = m.guild_permissions
-    missing = []
-    for name in (
-        "view_channel",
-        "read_message_history",
-        "send_messages",
-        "manage_channels",
-        "manage_roles",
-        "manage_messages",
-    ):
-        if not getattr(perms, name, False):
-            missing.append(name)
-    return missing
-
-
-async def send_owner_server_report(guild: discord.Guild, reason: str = ""):
-    if not guild:
-        return
-    owner = guild.owner
-    if not owner and guild.owner_id:
-        try:
-            owner = await bot.fetch_user(guild.owner_id)
-        except Exception:
-            owner = None
-    if not owner:
-        return
-
-    members = list(guild.members or [])
-    member_names = [m.display_name for m in members][:25]
-    targets = cfg().get("targets", {})
-    watcher_hits = [uid for uid in targets.keys() if guild.get_member(int(uid))]
-    missing = bot_missing_permissions(guild)
-
-    lines = [
-        f"Server report ({reason}): {guild.name} ({guild.id})",
-        f"Members: {len(members)}",
-        "Sample members: " + (", ".join(member_names) if member_names else "none"),
-        f"Watchers in this server: {len(watcher_hits)}",
-    ]
-    if watcher_hits:
-        lines.append("Watcher IDs: " + ", ".join(watcher_hits[:15]))
-    if missing and missing != ["unknown"]:
-        lines.append("Missing permissions: " + ", ".join(missing))
-    else:
-        lines.append("Missing permissions: none")
-    try:
-        await owner.send("\n".join(lines))
-    except Exception:
-        pass
+from mandy.capability_registry import CapabilityRegistry
+from mandy.tool_plugin_manager import ToolPluginManager
+from mandy.app.config import (
+    ADMIN_GUILD_ID,
+    SUPER_USER_ID,
+    AUTO_GOD_ID,
+    MANDY_GOD_LEVEL,
+    MENTION_DM_COOLDOWN_SECONDS,
+    SPECIAL_VOICE_USER_ID,
+    MOVIE_STAY_DEFAULT_MINUTES,
+    MOVIE_STAY_MAX_MINUTES,
+    GUEST_ROLE_NAME,
+    QUARANTINE_ROLE_NAME,
+    STAFF_ROLE_NAME,
+    ADMIN_ROLE_NAME,
+    GOD_ROLE_NAME,
+    ROLE_LEVEL_DEFAULTS,
+    MIRROR_FAIL_THRESHOLD,
+    MIRROR_CACHE_REFRESH,
+    SERVER_STATUS_REFRESH,
+    INTEGRITY_REFRESH,
+    CLEANUP_RESPONSE_TTL,
+    DISCORD_TOKEN,
+    SERVER_PASSWORD,
+    GEMINI_API_KEY,
+)
+from mandy.app.store import STORE, MENTION_COOLDOWN, cfg, ai_cfg
+from mandy.app import state
+from mandy.app.tasking import spawn_task
+from mandy.app.db import (
+    db_init,
+    db_exec,
+    db_one,
+    db_all,
+    ensure_table_columns,
+    db_column_exists,
+    ensure_mirror_rules_columns,
+    ensure_watchers_columns,
+    ensure_users_permissions_columns,
+    ensure_mirrors_columns,
+    ensure_mirror_messages_columns,
+    ensure_dm_bridges_columns,
+    ensure_audit_logs_columns,
+    db_calibrate,
+    db_purge_all,
+    db_bootstrap,
+)
+from mandy.app.logging import log_to, audit, debug, ensure_debug_channel, setup_log
+from mandy.app.watchers import mark_mysql_watcher_cache_dirty, watcher_tick, watchers_report
+from mandy.app.setup import (
+    setup_delay_base,
+    setup_pause,
+    _setup_pause_on_rate_limit,
+)
+from mandy.app.media import (
+    start_special_user_voice,
+    cancel_special_voice_leave_task,
+    schedule_special_voice_leave,
+    movie_state,
+    cancel_movie_stay_task,
+    schedule_movie_stay_task,
+    movie_get_voice_client,
+    movie_start_playback,
+    movie_handle_track_end,
+    movie_queue_add,
+    movie_stop,
+    movie_set_volume,
+    movie_pause,
+    movie_resume,
+    movie_skip,
+    movie_find_voice_targets,
+    movie_resolve_target,
+    send_movie_menu,
+    MovieTargetSelect,
+    MovieLinkModal,
+    MovieVolumeModal,
+    MovieStayModal,
+    MovieControlView,
+    SPECIAL_VOICE_LEAVE_TASKS,
+    MOVIE_ACTIVE_GUILDS,
+    MOVIE_STATES,
+    MOVIE_STAY_TASKS,
+)
+from mandy.app.core import (
+    chunk_lines,
+    memory_state,
+    memory_add,
+    memory_recent,
+    ark_snapshots,
+    phoenix_keys,
+    request_elevation,
+    classify_mood,
+    bot_missing_permissions,
+    send_owner_server_report,
+    serialize_overwrites,
+    deserialize_overwrites,
+    strip_bot_mentions,
+    is_youtube_url,
+    normalize_youtube_url,
+    now_ts,
+    fmt_ts,
+    truncate,
+    get_role,
+    admin_category_name,
+)
+from mandy import ambient_engine
+from mandy.resolver import parse_channel_id, parse_user_id, rank_members_global, pick_best
+from mandy.sentience_layer import sentience_cfg, presence_cfg, voice_line
 
 def guild_word_freq(guild_id: int, window: str = "rolling24") -> Dict[str, int]:
     gstate = chat_stats_guild_state(guild_id)
@@ -501,653 +166,6 @@ def build_dynamic_blueprint(guild: discord.Guild) -> Dict[str, Any]:
 
     return {"categories": categories, "notes": notes, "top_words": top_words}
 
-
-def serialize_overwrites(channel: discord.abc.GuildChannel) -> Dict[str, Any]:
-    ow = {}
-    try:
-        for target, perms in channel.overwrites.items():
-            key = f"role:{target.id}" if isinstance(target, discord.Role) else f"user:{target.id}"
-            ow[key] = {
-                "allow": perms.value,
-                "deny": perms._from_pair()[1].value if hasattr(perms, "_from_pair") else perms.value ^ (~perms).value
-            }
-    except Exception:
-        pass
-    return ow
-
-
-def deserialize_overwrites(guild: discord.Guild, data: Dict[str, Any]) -> Dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
-    result: Dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {}
-    for key, perms in (data or {}).items():
-        try:
-            kind, sid = key.split(":", 1)
-            sid = int(sid)
-            target = guild.get_role(sid) if kind == "role" else guild.get_member(sid)
-            if not target:
-                continue
-            allow_val = int(perms.get("allow", 0))
-            deny_val = int(perms.get("deny", 0))
-            overw = discord.Permissions(allow_val).pair(discord.Permissions(deny_val))
-            result[target] = overw
-        except Exception:
-            continue
-    return result
-
-class JsonStore:
-    def __init__(self, path: str):
-        self.path = path
-        self.lock = asyncio.Lock()
-        self.data: Dict[str, Any] = {}
-        self.dirty = False
-        self.last_mtime = 0.0
-
-    def _deep_merge(self, base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
-        for k, v in overlay.items():
-            if isinstance(v, dict) and isinstance(base.get(k), dict):
-                base[k] = self._deep_merge(base[k], v)
-            else:
-                base[k] = v
-        return base
-
-    async def load(self) -> None:
-        async with self.lock:
-            if not os.path.exists(self.path):
-                self.data = json.loads(json.dumps(DEFAULT_JSON))
-                self.dirty = True
-                await self.flush_locked()
-                return
-            self.last_mtime = os.path.getmtime(self.path)
-            async with aiofiles.open(self.path, "r", encoding="utf-8") as f:
-                raw = await f.read()
-            try:
-                loaded = json.loads(raw)
-            except Exception:
-                loaded = {}
-            self.data = self._deep_merge(json.loads(json.dumps(DEFAULT_JSON)), loaded)
-
-    async def reload_if_changed(self) -> None:
-        async with self.lock:
-            if not os.path.exists(self.path):
-                return
-            mtime = os.path.getmtime(self.path)
-            if mtime > self.last_mtime + 0.0001:
-                async with aiofiles.open(self.path, "r", encoding="utf-8") as f:
-                    raw = await f.read()
-                try:
-                    loaded = json.loads(raw)
-                except Exception:
-                    return
-                self.data = self._deep_merge(json.loads(json.dumps(DEFAULT_JSON)), loaded)
-                self.last_mtime = mtime
-
-    async def mark_dirty(self) -> None:
-        async with self.lock:
-            self.dirty = True
-
-    async def flush(self) -> None:
-        async with self.lock:
-            await self.flush_locked()
-
-    async def flush_locked(self) -> None:
-        if not self.dirty:
-            return
-        tmp = self.path + ".tmp"
-        async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(self.data, indent=2, ensure_ascii=False))
-        os.replace(tmp, self.path)
-        self.dirty = False
-        if os.path.exists(self.path):
-            self.last_mtime = os.path.getmtime(self.path)
-
-STORE = JsonStore(DB_JSON_PATH)
-MENTION_COOLDOWN = CooldownStore(STORE)
-
-def cfg() -> Dict[str, Any]:
-    return STORE.data
-
-def ai_cfg() -> Dict[str, Any]:
-    ai = cfg().setdefault("ai", {})
-    ai.setdefault("default_model", "gemini-2.5-flash-lite")
-    ai.setdefault("router_model", ai.get("default_model") or "gemini-2.5-flash-lite")
-    ai.setdefault("tts_model", "")
-    ai.setdefault("cooldown_seconds", 5)
-    ai.setdefault("limits", json.loads(json.dumps(DEFAULT_AI_LIMITS)))
-    ai.setdefault("queue", {})
-    ai.setdefault("rolling", {})
-    ai.setdefault("daily", {})
-    ai.setdefault("installed_extensions", [])
-    return ai
-
-def strip_bot_mentions(text: str, bot_id: int) -> str:
-    if not text or not bot_id:
-        return ""
-    cleaned = re.sub(rf"<@!?{bot_id}>", "", text)
-    return " ".join(cleaned.split())
-
-def is_youtube_url(url: str) -> bool:
-    if not url:
-        return False
-    try:
-        parsed = urllib.parse.urlparse(url.strip())
-    except Exception:
-        return False
-    if parsed.scheme not in ("http", "https"):
-        return False
-    host = (parsed.netloc or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    if host == "youtu.be":
-        return True
-    if host == "youtube.com" or host.endswith(".youtube.com"):
-        return True
-    return False
-
-def normalize_youtube_url(url: str) -> str:
-    if not url:
-        return ""
-    normalized = url.strip()
-    if normalized and not re.match(r"^https?://", normalized, re.IGNORECASE):
-        normalized = "https://" + normalized
-    return normalized
-
-YTDL_OPTIONS = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "no_warnings": True,
-    "ignoreerrors": True,
-    "default_search": "auto",
-}
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
-
-class YTDLSource(discord.PCMVolumeTransformer):
-    ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
-
-    def __init__(self, source: discord.AudioSource, *, data: Dict[str, Any]):
-        super().__init__(source)
-        self.data = data
-        self.url = data.get("url")
-
-    @classmethod
-    async def from_url(cls, url: str, *, loop: Optional[asyncio.AbstractEventLoop] = None, stream: bool = True):
-        if loop is None:
-            loop = asyncio.get_running_loop()
-
-        data = await loop.run_in_executor(
-            None, lambda: cls.ytdl.extract_info(url, download=not stream)
-        )
-        if not data:
-            raise ValueError("Unable to retrieve voice media metadata.")
-        if "entries" in data:
-            data = data["entries"][0]
-        if not data:
-            raise ValueError("Unable to resolve a playable voice entry.")
-
-        source = discord.FFmpegPCMAudio(data["url"], **FFMPEG_OPTIONS)
-        return cls(source, data=data)
-
-async def start_special_user_voice(channel: discord.VoiceChannel) -> None:
-    try:
-        guild = channel.guild
-        voice_client = discord.utils.get(bot.voice_clients, guild=guild)
-        if not voice_client:
-            voice_client = await channel.connect()
-        elif voice_client.channel != channel:
-            await voice_client.move_to(channel)
-
-        if voice_client.is_playing():
-            voice_client.stop()
-
-        loop = asyncio.get_running_loop()
-        source = await YTDLSource.from_url(SPECIAL_VOICE_URL, loop=loop, stream=True)
-
-        def _after_play(error: Optional[Exception] = None) -> None:
-            if error:
-                loop.call_soon_threadsafe(
-                    lambda: spawn_task(
-                        debug(f"special voice playback failed: {error}"),
-                        "voice",
-                    )
-                )
-
-        voice_client.play(source, after=_after_play)
-    except Exception as exc:
-        await debug(f"special voice setup failed: {exc}")
-
-async def _special_voice_leave_flow(guild: discord.Guild) -> None:
-    try:
-        await asyncio.sleep(VOICE_QUIT_DELAY_SECONDS)
-        voice_client = discord.utils.get(bot.voice_clients, guild=guild)
-        if voice_client and voice_client.is_connected():
-            if voice_client.is_playing():
-                voice_client.stop()
-            await voice_client.disconnect()
-    except asyncio.CancelledError:
-        return
-    except Exception as exc:
-        await debug(f"special voice tear-down failed: {exc}")
-
-def cancel_special_voice_leave_task(guild_id: int) -> None:
-    task = SPECIAL_VOICE_LEAVE_TASKS.pop(guild_id, None)
-    if task and not task.done():
-        task.cancel()
-
-def schedule_special_voice_leave(guild: discord.Guild) -> None:
-    cancel_special_voice_leave_task(guild.id)
-    task = spawn_task(_special_voice_leave_flow(guild), "voice")
-    SPECIAL_VOICE_LEAVE_TASKS[guild.id] = task
-    task.add_done_callback(lambda _: SPECIAL_VOICE_LEAVE_TASKS.pop(guild.id, None))
-
-def movie_state(guild_id: int) -> Dict[str, Any]:
-    state = MOVIE_STATES.setdefault(guild_id, {})
-    state.setdefault("queue", [])
-    state.setdefault("volume", 1.0)
-    state.setdefault("stay_until", 0)
-    state.setdefault("channel_id", 0)
-    state.setdefault("now_title", "")
-    state.setdefault("now_url", "")
-    return state
-
-def cancel_movie_stay_task(guild_id: int) -> None:
-    task = MOVIE_STAY_TASKS.pop(guild_id, None)
-    if task and not task.done():
-        task.cancel()
-
-def schedule_movie_stay_task(guild_id: int) -> None:
-    cancel_movie_stay_task(guild_id)
-    state = MOVIE_STATES.get(guild_id)
-    if not state:
-        return
-    stay_until = int(state.get("stay_until", 0) or 0)
-    if stay_until <= now_ts():
-        return
-
-    async def _wait_then_cleanup() -> None:
-        await asyncio.sleep(max(0, stay_until - now_ts()))
-        await _movie_cleanup(guild_id)
-
-    task = spawn_task(_wait_then_cleanup(), "movie")
-    MOVIE_STAY_TASKS[guild_id] = task
-    task.add_done_callback(lambda _: MOVIE_STAY_TASKS.pop(guild_id, None))
-
-async def _movie_cleanup(guild_id: int) -> None:
-    state = MOVIE_STATES.get(guild_id)
-    guild = bot.get_guild(guild_id)
-    voice_client = discord.utils.get(bot.voice_clients, guild=guild) if guild else None
-    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
-        return
-    if state and state.get("queue"):
-        return
-    stay_until = int(state.get("stay_until", 0) or 0) if state else 0
-    if stay_until and now_ts() < stay_until:
-        schedule_movie_stay_task(guild_id)
-        return
-    MOVIE_ACTIVE_GUILDS.discard(guild_id)
-    if voice_client and voice_client.is_connected():
-        try:
-            await voice_client.disconnect()
-        except Exception:
-            pass
-    if state:
-        state["queue"] = []
-        state["stay_until"] = 0
-        state["channel_id"] = 0
-        state["now_title"] = ""
-        state["now_url"] = ""
-
-async def movie_get_voice_client(guild: discord.Guild, channel: discord.VoiceChannel) -> Optional[discord.VoiceClient]:
-    voice_client = discord.utils.get(bot.voice_clients, guild=guild)
-    if not voice_client:
-        voice_client = await channel.connect()
-    elif voice_client.channel != channel:
-        await voice_client.move_to(channel)
-    return voice_client
-
-async def movie_start_playback(
-    guild: discord.Guild,
-    channel: discord.VoiceChannel,
-    url: str,
-    clear_queue: bool = False,
-) -> None:
-    state = movie_state(guild.id)
-    if clear_queue:
-        state["queue"] = []
-    cancel_special_voice_leave_task(guild.id)
-    MOVIE_ACTIVE_GUILDS.add(guild.id)
-    voice_client = await movie_get_voice_client(guild, channel)
-    if not voice_client:
-        raise RuntimeError("Unable to join voice channel.")
-    if voice_client.is_playing() or voice_client.is_paused():
-        voice_client.stop()
-
-    loop = asyncio.get_running_loop()
-    source = await YTDLSource.from_url(url, loop=loop, stream=True)
-    source.volume = float(state.get("volume", 1.0))
-    state["channel_id"] = channel.id
-    state["now_title"] = str(source.data.get("title") or "")
-    state["now_url"] = url
-
-    def _after_play(error: Optional[Exception] = None) -> None:
-        if error:
-            loop.call_soon_threadsafe(
-                lambda: spawn_task(debug(f"movie playback failed: {error}"), "movie")
-            )
-        loop.call_soon_threadsafe(
-            lambda: spawn_task(movie_handle_track_end(guild.id), "movie")
-        )
-
-    voice_client.play(source, after=_after_play)
-
-async def movie_handle_track_end(guild_id: int) -> None:
-    state = MOVIE_STATES.get(guild_id)
-    if not state:
-        await _movie_cleanup(guild_id)
-        return
-    if state.get("queue"):
-        next_url = state["queue"].pop(0)
-        guild = bot.get_guild(guild_id)
-        channel_id = int(state.get("channel_id", 0) or 0)
-        channel = guild.get_channel(channel_id) if guild else None
-        if isinstance(channel, discord.VoiceChannel):
-            try:
-                await movie_start_playback(guild, channel, next_url)
-                return
-            except Exception as exc:
-                await debug(f"movie next track failed: {exc}")
-    await _movie_cleanup(guild_id)
-
-async def movie_queue_add(guild: discord.Guild, channel: discord.VoiceChannel, url: str) -> Tuple[bool, str]:
-    state = movie_state(guild.id)
-    voice_client = discord.utils.get(bot.voice_clients, guild=guild)
-    playing = voice_client and (voice_client.is_playing() or voice_client.is_paused())
-    if playing or state.get("queue"):
-        if len(state["queue"]) >= MOVIE_QUEUE_LIMIT:
-            return False, "Queue is full."
-        state["queue"].append(url)
-        MOVIE_ACTIVE_GUILDS.add(guild.id)
-        return True, "Queued."
-    await movie_start_playback(guild, channel, url)
-    return True, "Playing now."
-
-async def movie_stop(guild_id: int) -> None:
-    cancel_movie_stay_task(guild_id)
-    state = MOVIE_STATES.get(guild_id)
-    if state:
-        state["queue"] = []
-        state["stay_until"] = 0
-        state["channel_id"] = 0
-        state["now_title"] = ""
-        state["now_url"] = ""
-    MOVIE_ACTIVE_GUILDS.discard(guild_id)
-    guild = bot.get_guild(guild_id)
-    voice_client = discord.utils.get(bot.voice_clients, guild=guild) if guild else None
-    if voice_client and voice_client.is_connected():
-        try:
-            if voice_client.is_playing() or voice_client.is_paused():
-                voice_client.stop()
-            await voice_client.disconnect()
-        except Exception:
-            pass
-
-async def movie_set_volume(guild_id: int, volume: float) -> None:
-    state = movie_state(guild_id)
-    state["volume"] = max(0.0, min(2.0, float(volume)))
-    guild = bot.get_guild(guild_id)
-    voice_client = discord.utils.get(bot.voice_clients, guild=guild) if guild else None
-    if voice_client and isinstance(voice_client.source, discord.PCMVolumeTransformer):
-        voice_client.source.volume = state["volume"]
-
-async def movie_pause(guild_id: int) -> bool:
-    guild = bot.get_guild(guild_id)
-    voice_client = discord.utils.get(bot.voice_clients, guild=guild) if guild else None
-    if voice_client and voice_client.is_playing():
-        voice_client.pause()
-        return True
-    return False
-
-async def movie_resume(guild_id: int) -> bool:
-    guild = bot.get_guild(guild_id)
-    voice_client = discord.utils.get(bot.voice_clients, guild=guild) if guild else None
-    if voice_client and voice_client.is_paused():
-        voice_client.resume()
-        return True
-    return False
-
-async def movie_skip(guild_id: int) -> bool:
-    guild = bot.get_guild(guild_id)
-    voice_client = discord.utils.get(bot.voice_clients, guild=guild) if guild else None
-    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
-        voice_client.stop()
-        return True
-    return False
-
-async def movie_find_voice_targets(user_id: int) -> List[Tuple[discord.Guild, discord.VoiceChannel]]:
-    targets: List[Tuple[discord.Guild, discord.VoiceChannel]] = []
-    for guild in bot.guilds:
-        member = guild.get_member(user_id)
-        if not member:
-            try:
-                member = await guild.fetch_member(user_id)
-            except Exception:
-                member = None
-        if member and member.voice and isinstance(member.voice.channel, discord.VoiceChannel):
-            targets.append((guild, member.voice.channel))
-    return targets
-
-async def movie_resolve_target(ctx: commands.Context) -> Tuple[Optional[discord.Guild], Optional[discord.VoiceChannel], Optional[str]]:
-    if ctx.guild and isinstance(ctx.author, discord.Member):
-        if ctx.author.voice and ctx.author.voice.channel:
-            return ctx.guild, ctx.author.voice.channel, None
-    targets = await movie_find_voice_targets(ctx.author.id)
-    if not targets:
-        return None, None, "Join a voice channel first."
-    if len(targets) > 1:
-        return None, None, "Multiple voice channels detected. Use the `!movie` menu to pick a target."
-    return targets[0][0], targets[0][1], None
-
-async def send_movie_menu(ctx: commands.Context) -> None:
-    targets = await movie_find_voice_targets(ctx.author.id)
-    if not targets:
-        await temp_reply(ctx, "Join a voice channel first.")
-        return
-    target_map: Dict[str, Tuple[int, int, str]] = {}
-    for guild, channel in targets:
-        key = f"{guild.id}:{channel.id}"
-        label = f"{guild.name} / {channel.name}"
-        target_map[key] = (guild.id, channel.id, label)
-    view = MovieControlView(ctx.author.id, target_map)
-    await ctx.send("Movie control panel:", view=view)
-
-class MovieTargetSelect(discord.ui.Select):
-    def __init__(self, options: List[discord.SelectOption]):
-        super().__init__(placeholder="Select voice target", options=options, min_values=1, max_values=1)
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.view
-        if isinstance(view, MovieControlView):
-            view.selected = self.values[0]
-            label = view.targets.get(self.values[0], ("", "", "target"))[2]
-            await interaction.response.send_message(f"Selected: {label}", ephemeral=True)
-
-class MovieLinkModal(discord.ui.Modal):
-    def __init__(self, guild_id: int, channel_id: int, mode: str):
-        title = "Play YouTube Link" if mode == "play" else "Queue YouTube Link"
-        super().__init__(title=title, timeout=300)
-        self.guild_id = guild_id
-        self.channel_id = channel_id
-        self.mode = mode
-        self.url = discord.ui.TextInput(
-            label="YouTube URL",
-            style=discord.TextStyle.short,
-            required=True,
-            max_length=200,
-            placeholder="https://youtu.be/..."
-        )
-        self.add_item(self.url)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        url = normalize_youtube_url(str(self.url.value))
-        if not is_youtube_url(url):
-            return await interaction.response.send_message("Only YouTube links are allowed.", ephemeral=True)
-        guild = bot.get_guild(self.guild_id)
-        channel = guild.get_channel(self.channel_id) if guild else None
-        if not guild or not isinstance(channel, discord.VoiceChannel):
-            return await interaction.response.send_message("Voice channel not found.", ephemeral=True)
-        try:
-            if self.mode == "queue":
-                ok, msg = await movie_queue_add(guild, channel, url)
-                return await interaction.response.send_message(msg, ephemeral=True)
-            await movie_start_playback(guild, channel, url, clear_queue=True)
-            return await interaction.response.send_message("Playing now.", ephemeral=True)
-        except Exception as exc:
-            await debug(f"movie modal failed: {exc}")
-            return await interaction.response.send_message("Failed to start playback.", ephemeral=True)
-
-class MovieVolumeModal(discord.ui.Modal):
-    def __init__(self, guild_id: int):
-        super().__init__(title="Set Volume (0-100)", timeout=300)
-        self.guild_id = guild_id
-        self.volume = discord.ui.TextInput(
-            label="Volume",
-            style=discord.TextStyle.short,
-            required=True,
-            max_length=4,
-            placeholder="50"
-        )
-        self.add_item(self.volume)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            value = int(str(self.volume.value).strip())
-        except Exception:
-            return await interaction.response.send_message("Volume must be a number.", ephemeral=True)
-        value = max(0, min(100, value))
-        await movie_set_volume(self.guild_id, value / 100.0)
-        return await interaction.response.send_message(f"Volume set to {value}%.", ephemeral=True)
-
-class MovieStayModal(discord.ui.Modal):
-    def __init__(self, guild_id: int):
-        super().__init__(title="Stay Time (minutes)", timeout=300)
-        self.guild_id = guild_id
-        self.minutes = discord.ui.TextInput(
-            label="Minutes (max 30)",
-            style=discord.TextStyle.short,
-            required=False,
-            max_length=4,
-            placeholder=str(MOVIE_STAY_DEFAULT_MINUTES)
-        )
-        self.add_item(self.minutes)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        raw = str(self.minutes.value).strip()
-        if raw:
-            try:
-                minutes = int(raw)
-            except Exception:
-                return await interaction.response.send_message("Minutes must be a number.", ephemeral=True)
-        else:
-            minutes = MOVIE_STAY_DEFAULT_MINUTES
-        minutes = max(1, min(MOVIE_STAY_MAX_MINUTES, minutes))
-        state = movie_state(self.guild_id)
-        state["stay_until"] = now_ts() + minutes * 60
-        schedule_movie_stay_task(self.guild_id)
-        return await interaction.response.send_message(f"Stay set for {minutes} minutes.", ephemeral=True)
-
-class MovieControlView(discord.ui.View):
-    def __init__(self, user_id: int, targets: Dict[str, Tuple[int, int, str]]):
-        super().__init__(timeout=600)
-        self.user_id = user_id
-        self.targets = targets
-        self.selected = next(iter(targets.keys())) if targets else ""
-        if len(targets) > 1:
-            options = [
-                discord.SelectOption(label=label, value=key)
-                for key, (_, _, label) in targets.items()
-            ]
-            self.add_item(MovieTargetSelect(options))
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Not for you.", ephemeral=True)
-            return False
-        return True
-
-    def get_selected_target(self) -> Optional[Tuple[int, int, str]]:
-        return self.targets.get(self.selected)
-
-    @discord.ui.button(label="Play", style=discord.ButtonStyle.green, row=0)
-    async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target = self.get_selected_target()
-        if not target:
-            return await interaction.response.send_message("Select a target first.", ephemeral=True)
-        guild_id, channel_id, _ = target
-        await interaction.response.send_modal(MovieLinkModal(guild_id, channel_id, "play"))
-
-    @discord.ui.button(label="Queue", style=discord.ButtonStyle.blurple, row=0)
-    async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target = self.get_selected_target()
-        if not target:
-            return await interaction.response.send_message("Select a target first.", ephemeral=True)
-        guild_id, channel_id, _ = target
-        await interaction.response.send_modal(MovieLinkModal(guild_id, channel_id, "queue"))
-
-    @discord.ui.button(label="Skip", style=discord.ButtonStyle.gray, row=0)
-    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target = self.get_selected_target()
-        if not target:
-            return await interaction.response.send_message("Select a target first.", ephemeral=True)
-        guild_id, _, _ = target
-        skipped = await movie_skip(guild_id)
-        msg = "Skipped." if skipped else "Nothing to skip."
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @discord.ui.button(label="Volume", style=discord.ButtonStyle.blurple, row=1)
-    async def volume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target = self.get_selected_target()
-        if not target:
-            return await interaction.response.send_message("Select a target first.", ephemeral=True)
-        guild_id, _, _ = target
-        await interaction.response.send_modal(MovieVolumeModal(guild_id))
-
-    @discord.ui.button(label="Stay", style=discord.ButtonStyle.gray, row=1)
-    async def stay_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target = self.get_selected_target()
-        if not target:
-            return await interaction.response.send_message("Select a target first.", ephemeral=True)
-        guild_id, _, _ = target
-        await interaction.response.send_modal(MovieStayModal(guild_id))
-
-    @discord.ui.button(label="Leave", style=discord.ButtonStyle.red, row=1)
-    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target = self.get_selected_target()
-        if not target:
-            return await interaction.response.send_message("Select a target first.", ephemeral=True)
-        guild_id, _, _ = target
-        await movie_stop(guild_id)
-        await interaction.response.send_message("Disconnected.", ephemeral=True)
-
-    @discord.ui.button(label="Pause", style=discord.ButtonStyle.gray, row=2)
-    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target = self.get_selected_target()
-        if not target:
-            return await interaction.response.send_message("Select a target first.", ephemeral=True)
-        guild_id, _, _ = target
-        paused = await movie_pause(guild_id)
-        msg = "Paused." if paused else "Nothing playing."
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @discord.ui.button(label="Resume", style=discord.ButtonStyle.gray, row=2)
-    async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        target = self.get_selected_target()
-        if not target:
-            return await interaction.response.send_message("Select a target first.", ephemeral=True)
-        guild_id, _, _ = target
-        resumed = await movie_resume(guild_id)
-        msg = "Resumed." if resumed else "Nothing paused."
-        await interaction.response.send_message(msg, ephemeral=True)
-
 # -----------------------------
 # Bot
 # -----------------------------
@@ -1158,456 +176,7 @@ intents.guilds = True
 intents.dm_messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-INTEGRITY_CURSOR = 0
-GLOBAL_USER_RESOLVER = GuildIndexCache(ttl_seconds=120)
-AUTO_SETUP_LOCK = asyncio.Lock()
-TYPING_RATE_SECONDS = 6.0
-TYPING_INDICATORS: Dict[int, float] = {}
-BRIDGE_TYPING_INDICATORS: Dict[int, float] = {}
-LIVE_STATS_TASKS: Dict[int, asyncio.Task] = {}
-ACTIVE_TASKS: Dict[str, Set[asyncio.Task]] = {}
-MANDY_EXTENSION = "cogs.mandy_ai"
-MANDY_LOADED = False
-
-SETUP_ADAPTIVE_ACTIVE = False
-SETUP_DELAY_OVERRIDE: Optional[float] = None
-SETUP_DELAY_MIN = 0.4
-SETUP_DELAY_MAX = 4.0
-SETUP_DELAY_STEP = 0.05
-
-def track_task(task: asyncio.Task, label: str) -> asyncio.Task:
-    bucket = ACTIVE_TASKS.setdefault(label, set())
-    bucket.add(task)
-    def _cleanup(done_task: asyncio.Task) -> None:
-        bucket.discard(done_task)
-        if not bucket:
-            ACTIVE_TASKS.pop(label, None)
-    task.add_done_callback(_cleanup)
-    return task
-
-def spawn_task(coro: Any, label: str) -> asyncio.Task:
-    return track_task(asyncio.create_task(coro), label)
-
-# -----------------------------
-# Optional MySQL
-# -----------------------------
-POOL: Optional[aiomysql.Pool] = None
-
-async def db_init():
-    global POOL
-    if not MYSQL_ENABLED:
-        return
-    POOL = await aiomysql.create_pool(
-        host=MYSQL_HOST,
-        user=MYSQL_USER,
-        password=MYSQL_PASS or "",
-        db=MYSQL_DB,
-        autocommit=True,
-        minsize=1,
-        maxsize=10,
-        charset="utf8mb4",
-    )
-
-async def db_exec(sql: str, args: tuple = ()):
-    if not POOL:
-        return
-    async with POOL.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, args)
-
-async def db_one(sql: str, args: tuple = ()):
-    if not POOL:
-        return None
-    async with POOL.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(sql, args)
-            return await cur.fetchone()
-
-async def db_all(sql: str, args: tuple = ()):
-    if not POOL:
-        return []
-    async with POOL.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(sql, args)
-            return await cur.fetchall()
-
-async def ensure_table_columns(table: str, cols: Dict[str, str]):
-    if not POOL:
-        return
-    for col, col_type in cols.items():
-        try:
-            if not await db_column_exists(table, col):
-                await db_exec(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-        except Exception:
-            pass
-
-async def db_column_exists(table: str, column: str) -> bool:
-    if not POOL:
-        return False
-    row = await db_one(
-        "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_NAME=%s",
-        (table, column),
-    )
-    return bool(row)
-
-async def ensure_mirror_rules_columns():
-    await ensure_table_columns("mirror_rules", {
-        "enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
-        "fail_count": "INT NOT NULL DEFAULT 0",
-        "last_error": "TEXT",
-        "last_mirror_ts": "BIGINT",
-        "last_mirror_msg": "TEXT",
-        "last_disabled_at": "BIGINT NOT NULL DEFAULT 0",
-    })
-
-async def ensure_watchers_columns():
-    await ensure_table_columns("watchers", {
-        "threshold": "INT NOT NULL DEFAULT 0",
-        "current": "INT NOT NULL DEFAULT 0",
-        "text": "TEXT",
-        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
-    })
-
-async def ensure_users_permissions_columns():
-    await ensure_table_columns("users_permissions", {
-        "note": "TEXT",
-        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
-    })
-
-async def ensure_mirrors_columns():
-    await ensure_table_columns("mirrors", {
-        "enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
-        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
-    })
-
-async def ensure_mirror_messages_columns():
-    await ensure_table_columns("mirror_messages", {
-        "mirror_id": "VARCHAR(96) NOT NULL",
-        "src_guild": "BIGINT NOT NULL",
-        "src_channel": "BIGINT NOT NULL",
-        "src_msg": "BIGINT NOT NULL",
-        "dst_msg": "BIGINT NOT NULL",
-        "author_id": "BIGINT NOT NULL",
-        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-    })
-
-async def ensure_dm_bridges_columns():
-    await ensure_table_columns("dm_bridges", {
-        "channel_id": "BIGINT NOT NULL",
-        "active": "BOOLEAN NOT NULL DEFAULT TRUE",
-        "last_activity": "BIGINT",
-        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
-    })
-
-async def ensure_audit_logs_columns():
-    await ensure_table_columns("audit_logs", {
-        "action": "TEXT",
-        "meta": "JSON",
-        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-    })
-
-async def db_calibrate():
-    if not POOL:
-        return
-    await ensure_users_permissions_columns()
-    await ensure_mirrors_columns()
-    await ensure_mirror_rules_columns()
-    await ensure_mirror_messages_columns()
-    await ensure_watchers_columns()
-    await ensure_dm_bridges_columns()
-    await ensure_audit_logs_columns()
-
-async def db_purge_all(keep_watchers: bool = False):
-    if not POOL:
-        return False
-    tables = [
-        "mirror_messages",
-        "mirror_rules",
-        "mirrors",
-        "dm_bridges",
-        "audit_logs",
-        "users_permissions",
-    ]
-    if not keep_watchers:
-        tables.append("watchers")
-    for table in tables:
-        try:
-            await db_exec(f"TRUNCATE TABLE {table}")
-        except Exception:
-            try:
-                await db_exec(f"DELETE FROM {table}")
-            except Exception as e:
-                await setup_log(f"MySQL purge failed for {table}: {e}")
-    await db_bootstrap()
-    return True
-
-async def db_bootstrap():
-    if not POOL:
-        return
-
-    await db_exec("""
-    CREATE TABLE IF NOT EXISTS users_permissions (
-      user_id BIGINT PRIMARY KEY,
-      level INT NOT NULL,
-      note TEXT,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
-
-    await db_exec("""
-    CREATE TABLE IF NOT EXISTS mirrors (
-      mirror_id VARCHAR(64) PRIMARY KEY,
-      source_guild BIGINT NOT NULL,
-      source_channel BIGINT NOT NULL,
-      target_channel BIGINT NOT NULL,
-      enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
-
-    await db_exec("""
-    CREATE TABLE IF NOT EXISTS mirror_rules (
-      rule_id VARCHAR(96) PRIMARY KEY,
-      scope VARCHAR(16) NOT NULL,
-      source_guild BIGINT NOT NULL,
-      source_id BIGINT NOT NULL,
-      target_channel BIGINT NOT NULL,
-      enabled BOOLEAN NOT NULL DEFAULT TRUE,
-      fail_count INT NOT NULL DEFAULT 0,
-      last_error TEXT,
-      last_mirror_ts BIGINT,
-      last_mirror_msg TEXT,
-      last_disabled_at BIGINT NOT NULL DEFAULT 0,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
-
-    await db_exec("""
-    CREATE TABLE IF NOT EXISTS mirror_messages (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      mirror_id VARCHAR(96) NOT NULL,
-      src_guild BIGINT NOT NULL,
-      src_channel BIGINT NOT NULL,
-      src_msg BIGINT NOT NULL,
-      dst_msg BIGINT NOT NULL,
-      author_id BIGINT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX (mirror_id),
-      INDEX (dst_msg),
-      INDEX (src_msg)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
-
-    await db_exec("""
-    CREATE TABLE IF NOT EXISTS watchers (
-      user_id BIGINT PRIMARY KEY,
-      threshold INT NOT NULL,
-      current INT NOT NULL DEFAULT 0,
-      text TEXT NOT NULL,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
-
-    await db_exec("""
-    CREATE TABLE IF NOT EXISTS dm_bridges (
-      user_id BIGINT PRIMARY KEY,
-      channel_id BIGINT NOT NULL,
-      active BOOLEAN NOT NULL DEFAULT TRUE,
-      last_activity BIGINT,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
-
-    await db_exec("""
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      actor_id BIGINT NOT NULL,
-      action TEXT NOT NULL,
-      meta JSON,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
-    await db_calibrate()
-
-    # seed SUPERUSER + AUTO_GOD safely
-    await db_exec("""
-    INSERT INTO users_permissions (user_id, level, note)
-    VALUES (%s, %s, %s)
-    ON DUPLICATE KEY UPDATE level=GREATEST(level, VALUES(level));
-    """, (SUPER_USER_ID, 100, "Immutable SUPERUSER"))
-
-    row = await db_one("SELECT user_id FROM users_permissions WHERE user_id=%s", (AUTO_GOD_ID,))
-    if not row:
-        await db_exec("""
-        INSERT INTO users_permissions (user_id, level, note)
-        VALUES (%s,%s,%s)
-        """, (AUTO_GOD_ID, 90, "Auto-added GOD"))
-
-# -----------------------------
-# Logging
-# -----------------------------
-LOG_SUBSYSTEMS = {
-    "system": "SYNAPTIC",
-    "audit": "IMMUNE",
-    "mirror": "SENSORY",
-    "ai": "AI",
-    "voice": "VOICE",
-    "debug": "SYNAPTIC",
-}
-LOG_SEVERITY_DEFAULTS = {
-    "system": "INFO",
-    "audit": "INFO",
-    "mirror": "INFO",
-    "ai": "INFO",
-    "voice": "INFO",
-    "debug": "DEBUG",
-}
-LOG_DEDUP_WINDOW = 60
-_LOG_DEDUP: Dict[str, float] = {}
-
-
-def _log_now() -> str:
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-
-def _clean_log_message(text: str) -> str:
-    cleaned = " ".join(str(text or "").replace("**", "").replace("`", "").split())
-    return cleaned
-
-
-def _truncate_text(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 3)] + "..."
-
-
-def _format_log_line(
-    which: str,
-    text: str,
-    subsystem: Optional[str] = None,
-    severity: Optional[str] = None,
-    details: Optional[dict] = None,
-) -> str:
-    msg = _clean_log_message(text)
-    sub = subsystem or LOG_SUBSYSTEMS.get(which, "SYSTEM")
-    sev = severity or LOG_SEVERITY_DEFAULTS.get(which, "INFO")
-    detail_text = ""
-    if details:
-        try:
-            detail_text = " | " + _truncate_text(json.dumps(details, ensure_ascii=True), 240)
-        except Exception:
-            detail_text = ""
-    return f"{_log_now()} | {sub} | {sev} | {_truncate_text(msg, 460)}{detail_text}"
-
-
-def _should_emit_log(key: str, now_ts: int) -> bool:
-    last = _LOG_DEDUP.get(key)
-    if last and now_ts - last < LOG_DEDUP_WINDOW:
-        return False
-    _LOG_DEDUP[key] = now_ts
-    return True
-
-
-async def _resolve_log_channel(which: str) -> Optional[discord.TextChannel]:
-    logs = cfg().get("logs", {})
-    ch_id = logs.get(which)
-    fallback_id = logs.get("system") or logs.get("debug")
-    try_ids = [ch_id, fallback_id] if ch_id else [fallback_id]
-    for target_id in try_ids:
-        if not target_id:
-            continue
-        ch = bot.get_channel(int(target_id))
-        if ch:
-            return ch
-        try:
-            ch = await bot.fetch_channel(int(target_id))
-            if ch:
-                return ch
-        except Exception:
-            continue
-    return None
-
-
-async def log_to(
-    which: str,
-    text: str,
-    subsystem: Optional[str] = None,
-    severity: Optional[str] = None,
-    details: Optional[dict] = None,
-):
-    line = _format_log_line(which, text, subsystem=subsystem, severity=severity, details=details)
-    key_parts = [
-        which,
-        subsystem or LOG_SUBSYSTEMS.get(which, "SYSTEM"),
-        severity or LOG_SEVERITY_DEFAULTS.get(which, "INFO"),
-        _clean_log_message(text),
-        json.dumps(details, ensure_ascii=True) if details else "",
-    ]
-    dedup_key = "|".join(key_parts)
-    if not _should_emit_log(dedup_key, now_ts()):
-        return
-    ch = await _resolve_log_channel(which)
-    if not ch:
-        print(line)
-        return
-    try:
-        await ch.send(line[:1900])
-    except Exception:
-        print(line)
-
-
-async def audit(actor_id: int, action: str, meta: Optional[dict] = None):
-    if POOL:
-        try:
-            await db_exec(
-                "INSERT INTO audit_logs (actor_id, action, meta) VALUES (%s,%s,%s)",
-                (actor_id, action, json.dumps(meta or {}, ensure_ascii=False))
-            )
-        except Exception:
-            pass
-    await log_to("audit", action, subsystem="IMMUNE", severity="INFO", details=meta)
-
-
-async def debug(text: str):
-    await log_to("debug", text, subsystem="SYNAPTIC", severity="DEBUG")
-
-
-async def ensure_debug_channel() -> Optional[discord.TextChannel]:
-    admin = bot.get_guild(ADMIN_GUILD_ID)
-    if not admin:
-        return None
-    ch = discord.utils.get(admin.text_channels, name="debug-logs")
-    if ch:
-        return ch
-    ch = discord.utils.get(admin.text_channels, name="debug")
-    if ch:
-        return ch
-    try:
-        cat = discord.utils.get(admin.categories, name="Engineering Core")
-        if not cat:
-            cat = await admin.create_category("Engineering Core")
-            await setup_pause()
-        ch = await admin.create_text_channel("debug-logs", category=cat)
-        await setup_pause()
-        return ch
-    except Exception:
-        try:
-            ch = await admin.create_text_channel("debug-logs")
-            await setup_pause()
-            return ch
-        except Exception:
-            return None
-
-async def setup_log(text: str):
-    await log_to("system", text, subsystem="SYNAPTIC", severity="INFO")
-    await log_to("debug", text, subsystem="SYNAPTIC", severity="DEBUG")
-    ch = await ensure_debug_channel()
-    if ch:
-        try:
-            await ch.send(text[:1900])
-        except Exception:
-            pass
+state.bot = bot
 
 # -----------------------------
 # RBAC
@@ -1622,7 +191,7 @@ async def get_user_level(uid: int) -> int:
         return 90
 
     # Prefer MySQL if enabled
-    if POOL:
+    if state.POOL:
         row = await db_one("SELECT level FROM users_permissions WHERE user_id=%s", (uid,))
         if row:
             return int(row["level"])
@@ -2160,40 +729,17 @@ def attach_mandy_context():
     bot.mandy_require_level_ctx = require_level_ctx
 
 async def maybe_load_mandy_extension():
-    global MANDY_LOADED
-    if MANDY_LOADED:
+    if state.MANDY_LOADED:
         return
     try:
-        await bot.load_extension(MANDY_EXTENSION)
-        MANDY_LOADED = True
+        await bot.load_extension(state.MANDY_EXTENSION)
+        state.MANDY_LOADED = True
     except Exception as e:
         await debug(f"Mandy AI extension failed to load: {e}")
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def now_ts() -> int:
-    return int(time.time())
-
-def fmt_ts(ts: int) -> str:
-    if not ts:
-        return "never"
-    return f"<t:{int(ts)}:R>"
-
-def truncate(text: str, limit: int = 180) -> str:
-    if text is None:
-        return ""
-    text = str(text)
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 3)] + "..."
-
-def get_role(guild: discord.Guild, name: str) -> Optional[discord.Role]:
-    return discord.utils.get(guild.roles, name=name)
-
-def admin_category_name(guild: discord.Guild) -> str:
-    return f"04-servers / {guild.name}"
-
 def mirror_rules_dict() -> Dict[str, Any]:
     return cfg().setdefault("mirror_rules", {})
 
@@ -2244,36 +790,6 @@ def mirror_rules_for_message(message: discord.Message) -> List[Dict[str, Any]]:
     candidates.extend(MIRROR_RULE_INDEX["server"].get(message.guild.id, []))
     return candidates
 
-async def watchers_report(limit: int = 50) -> List[str]:
-    def fmt(uid, count, current, text):
-        return f"{uid} (<@{uid}>) | count={count} current={current} text={truncate(text, 120)}"
-
-    lim = max(1, min(200, int(limit)))
-    chunks: List[str] = []
-
-    json_lines: List[str] = []
-    targets = cfg().get("targets", {})
-    for uid, data in targets.items():
-        json_lines.append(fmt(uid, data.get("count", 0), data.get("current", 0), data.get("text", "")))
-    header = f"JSON watchers ({len(json_lines)})"
-    chunks.extend(chunk_lines((json_lines[:lim] if json_lines else ["None"]), header))
-
-    if POOL:
-        mysql_lines: List[str] = []
-        try:
-            rows = await db_all(
-                "SELECT user_id, threshold, current, text FROM watchers ORDER BY updated_at DESC LIMIT %s",
-                (lim,),
-            )
-            for row in rows:
-                mysql_lines.append(fmt(row["user_id"], row["threshold"], row.get("current", 0), row.get("text", "")))
-        except Exception:
-            mysql_lines.append("(failed to read MySQL watchers)")
-        header_mysql = f"MySQL watchers ({len(mysql_lines)})"
-        chunks.extend(chunk_lines(mysql_lines or ["None"], header_mysql))
-    return chunks
-
-
 async def _resolve_user_reference(ctx: commands.Context, text: str) -> Tuple[Optional[int], List[Tuple[int, str]]]:
     uid = parse_user_id(text)
     if uid:
@@ -2285,7 +801,7 @@ async def _resolve_user_reference(ctx: commands.Context, text: str) -> Tuple[Opt
         bot,
         token,
         prefer_guild_id=getattr(ctx.guild, "id", None),
-        cache=GLOBAL_USER_RESOLVER,
+        cache=state.GLOBAL_USER_RESOLVER,
         limit=6,
     )
     if not candidates:
@@ -2642,7 +1158,7 @@ def _diagnostic_status_lines(dm_bridge_count: int) -> List[str]:
     mirror_enabled = len([r for r in rules if r.get("enabled", True)])
     mirror_disabled = len(rules) - mirror_enabled
 
-    lines.append(f"Core: guilds={len(bot.guilds)} voice_clients={len(bot.voice_clients)} mysql={'on' if POOL else 'off'}")
+    lines.append(f"Core: guilds={len(bot.guilds)} voice_clients={len(bot.voice_clients)} mysql={'on' if state.POOL else 'off'}")
     lines.append(f"Sentience: {'on' if sentience_enabled() else 'off'} dialect={sentience_dialect()}")
     lines.append(f"Presence: {'auto' if autopresence_enabled() else 'manual'} state={getattr(bot, 'status', 'unknown')}")
     ambient = ambient_engine.ambient_status()
@@ -3021,7 +1537,7 @@ async def chat_stats_build_live_embed(guild: discord.Guild, window: str) -> Tupl
     return emb, changed
 
 async def stop_live_stats_panel(guild_id: int, delete_message: bool = True):
-    task = LIVE_STATS_TASKS.pop(guild_id, None)
+    task = state.LIVE_STATS_TASKS.pop(guild_id, None)
     if task:
         task.cancel()
     info = chat_stats_live_message().get(str(guild_id))
@@ -3085,7 +1601,7 @@ async def live_stats_loop(guild_id: int, channel_id: int, message_id: int, windo
         if chat_stats_live_message().get(str(guild_id), {}).get("message_id") == message_id:
             chat_stats_live_message().pop(str(guild_id), None)
             await STORE.mark_dirty()
-        LIVE_STATS_TASKS.pop(guild_id, None)
+        state.LIVE_STATS_TASKS.pop(guild_id, None)
 
 async def resume_live_stats_panels():
     for gid_str, info in list(chat_stats_live_message().items()):
@@ -3098,9 +1614,9 @@ async def resume_live_stats_panels():
         msg_id = int(info.get("message_id", 0))
         if not ch_id or not msg_id:
             continue
-        if gid in LIVE_STATS_TASKS:
+        if gid in state.LIVE_STATS_TASKS:
             continue
-        LIVE_STATS_TASKS[gid] = spawn_task(live_stats_loop(gid, ch_id, msg_id, window), "stats")
+        state.LIVE_STATS_TASKS[gid] = spawn_task(live_stats_loop(gid, ch_id, msg_id, window), "stats")
 
 def global_user_label(user_id: int) -> str:
     user = bot.get_user(user_id)
@@ -3193,7 +1709,7 @@ async def chat_stats_build_global_embed(window: str) -> Tuple[discord.Embed, boo
     return emb, changed
 
 async def stop_global_live_panel(delete_message: bool = True):
-    task = LIVE_STATS_TASKS.pop("GLOBAL", None)
+    task = state.LIVE_STATS_TASKS.pop("GLOBAL", None)
     if task:
         task.cancel()
     info = chat_stats_global_live_message()
@@ -3255,7 +1771,7 @@ async def global_live_stats_loop(channel_id: int, message_id: int, window: str):
         if info.get("message_id") == message_id:
             info.clear()
             await STORE.mark_dirty()
-        LIVE_STATS_TASKS.pop("GLOBAL", None)
+        state.LIVE_STATS_TASKS.pop("GLOBAL", None)
 
 async def resume_global_live_panel():
     info = chat_stats_global_live_message()
@@ -3266,147 +1782,12 @@ async def resume_global_live_panel():
     if not ch_id or not msg_id:
         return
     window = normalize_stats_window(info.get("window"), "rolling24")
-    if "GLOBAL" in LIVE_STATS_TASKS:
+    if "GLOBAL" in state.LIVE_STATS_TASKS:
         return
-    LIVE_STATS_TASKS["GLOBAL"] = spawn_task(
+    state.LIVE_STATS_TASKS["GLOBAL"] = spawn_task(
         global_live_stats_loop(ch_id, msg_id, window),
         "stats",
     )
-
-def setup_delay_base() -> float:
-    try:
-        return max(0.0, float(cfg().get("tuning", {}).get("setup_delay", 1.0)))
-    except Exception:
-        return 1.0
-
-def setup_delay() -> float:
-    override = SETUP_DELAY_OVERRIDE
-    if override is not None:
-        try:
-            return max(0.0, float(override))
-        except Exception:
-            return setup_delay_base()
-    return setup_delay_base()
-
-def _rate_limit_info(exc: Exception) -> Tuple[bool, Optional[float]]:
-    status = getattr(exc, "status", None)
-    retry_after = getattr(exc, "retry_after", None)
-    if status == 429 or retry_after is not None:
-        try:
-            retry_val = float(retry_after) if retry_after is not None else None
-        except Exception:
-            retry_val = None
-        return True, retry_val
-    return False, None
-
-def _setup_adjust_delay(success: bool, retry_after: Optional[float] = None) -> None:
-    global SETUP_DELAY_OVERRIDE
-    if not SETUP_ADAPTIVE_ACTIVE:
-        return
-    current = SETUP_DELAY_OVERRIDE if SETUP_DELAY_OVERRIDE is not None else setup_delay_base()
-    if success:
-        new_delay = max(SETUP_DELAY_MIN, current - SETUP_DELAY_STEP)
-    else:
-        bump = (retry_after + 0.25) if retry_after else (current * 1.4 + 0.25)
-        new_delay = min(SETUP_DELAY_MAX, max(current, bump))
-    SETUP_DELAY_OVERRIDE = new_delay
-
-async def setup_pause(success: bool = True, retry_after: Optional[float] = None):
-    _setup_adjust_delay(success, retry_after)
-    delay = setup_delay()
-    if delay > 0:
-        await asyncio.sleep(delay)
-
-async def _setup_pause_on_rate_limit(exc: Exception) -> None:
-    is_rate, retry_after = _rate_limit_info(exc)
-    if is_rate:
-        await setup_pause(success=False, retry_after=retry_after)
-
-# -----------------------------
-# Watchers (your JSON targets) + optional MySQL sync
-# -----------------------------
-MYSQL_WATCHER_CACHE = {"ids": set(), "last_sync": 0}
-MYSQL_WATCHER_CACHE_DIRTY = True
-MYSQL_WATCHER_CACHE_TTL = 30
-MYSQL_WATCHER_CACHE_LOCK: Optional[asyncio.Lock] = None
-
-def mark_mysql_watcher_cache_dirty() -> None:
-    global MYSQL_WATCHER_CACHE_DIRTY
-    MYSQL_WATCHER_CACHE_DIRTY = True
-
-async def mysql_watchers_refresh(force: bool = False) -> None:
-    global MYSQL_WATCHER_CACHE_DIRTY, MYSQL_WATCHER_CACHE_LOCK
-    if not POOL:
-        return
-    now = now_ts()
-    if not force and not MYSQL_WATCHER_CACHE_DIRTY:
-        last_sync = int(MYSQL_WATCHER_CACHE.get("last_sync", 0))
-        if now - last_sync < MYSQL_WATCHER_CACHE_TTL:
-            return
-    if MYSQL_WATCHER_CACHE_LOCK is None:
-        MYSQL_WATCHER_CACHE_LOCK = asyncio.Lock()
-    async with MYSQL_WATCHER_CACHE_LOCK:
-        now = now_ts()
-        if not force and not MYSQL_WATCHER_CACHE_DIRTY:
-            last_sync = int(MYSQL_WATCHER_CACHE.get("last_sync", 0))
-            if now - last_sync < MYSQL_WATCHER_CACHE_TTL:
-                return
-        rows = await db_all("SELECT user_id FROM watchers")
-        MYSQL_WATCHER_CACHE["ids"] = {
-            int(row["user_id"]) for row in rows if row and row.get("user_id") is not None
-        }
-        MYSQL_WATCHER_CACHE["last_sync"] = now
-        MYSQL_WATCHER_CACHE_DIRTY = False
-
-def mysql_watcher_id_set() -> Set[int]:
-    ids = MYSQL_WATCHER_CACHE.get("ids")
-    return ids if isinstance(ids, set) else set()
-
-async def watcher_tick(message: discord.Message):
-    if message.author.bot:
-        return
-
-    uid = str(message.author.id)
-
-    # 1) JSON targets (your format)
-    targets = cfg().get("targets", {})
-    if uid in targets:
-        t = targets[uid]
-        t["current"] = int(t.get("current", 0)) + 1
-
-        if t["current"] >= int(t.get("count", 0)):
-            t["current"] = 0
-            replies = [x.strip() for x in str(t.get("text", "")).split("|") if x.strip()]
-            if replies:
-                try:
-                    await message.reply(random.choice(replies))
-                except Exception:
-                    pass
-        await STORE.mark_dirty()
-
-    # 2) Optional MySQL watcher mirror (safe): if a user has a row in watchers table
-    if POOL:
-        should_check = True
-        try:
-            await mysql_watchers_refresh()
-            should_check = message.author.id in mysql_watcher_id_set()
-        except Exception:
-            should_check = True
-        if should_check:
-            row = await db_one("SELECT threshold, current, text FROM watchers WHERE user_id=%s", (message.author.id,))
-            if row:
-                cur = int(row["current"]) + 1
-                thr = int(row["threshold"])
-                text = str(row["text"] or "")
-                if cur >= thr:
-                    cur = 0
-                    replies = [x.strip() for x in text.split("|") if x.strip()]
-                    if replies:
-                        try:
-                            await message.reply(random.choice(replies))
-                        except Exception:
-                            pass
-                await db_exec("UPDATE watchers SET current=%s WHERE user_id=%s", (cur, message.author.id))
 
 # -----------------------------
 # Mirror: unified rules + Buttons (Reply/Post/DM)
@@ -3461,7 +1842,7 @@ def rule_summary(rule: Dict[str, Any]) -> str:
     return f"{scope} {src_label} -> {tgt_label}"
 
 async def mirror_rule_save_db(rule: Dict[str, Any]):
-    if not POOL:
+    if not state.POOL:
         return
     await db_exec("""
     INSERT INTO mirror_rules
@@ -3499,7 +1880,7 @@ async def mirror_rule_save(rule: Dict[str, Any]):
     rules[rule["rule_id"]] = rule
     mark_mirror_rule_index_dirty()
     await STORE.mark_dirty()
-    if POOL:
+    if state.POOL:
         await mirror_rule_save_db(rule)
 
 async def mirror_rule_update(rule: Dict[str, Any], **fields):
@@ -3540,7 +1921,7 @@ async def mirror_rule_delete(rule: Dict[str, Any], reason: str):
     rules.pop(rid, None)
     mark_mirror_rule_index_dirty()
     await STORE.mark_dirty()
-    if POOL:
+    if state.POOL:
         try:
             await db_exec("DELETE FROM mirror_rules WHERE rule_id=%s", (rid,))
         except Exception:
@@ -3559,7 +1940,7 @@ async def mirror_rule_mark_success(rule: Dict[str, Any], last_msg: str):
         await mirror_rule_update(rule, enabled=True, last_disabled_at=0)
 
 async def mirror_rules_sync():
-    if not POOL:
+    if not state.POOL:
         return
     rules = mirror_rules_dict()
     db_rules = await db_all("SELECT * FROM mirror_rules")
@@ -3822,7 +2203,7 @@ async def migrate_legacy_json_mirrors():
     await STORE.mark_dirty()
 
 async def migrate_legacy_mysql_mirrors():
-    if not POOL:
+    if not state.POOL:
         return
     rows = await db_all("SELECT mirror_id, source_guild, source_channel, target_channel, enabled FROM mirrors")
     if not rows:
@@ -3848,7 +2229,7 @@ def mirror_message_map() -> Dict[str, List[Dict[str, Any]]]:
     return cfg().setdefault("mirror_message_map", {})
 
 async def mirror_store_map(rule_id: str, src_guild: int, src_channel: int, src_msg: int, dst_msg: int, author_id: int):
-    if POOL:
+    if state.POOL:
         await db_exec("""
         INSERT INTO mirror_messages (mirror_id, src_guild, src_channel, src_msg, dst_msg, author_id)
         VALUES (%s,%s,%s,%s,%s,%s)
@@ -3875,7 +2256,7 @@ async def mirror_store_map(rule_id: str, src_guild: int, src_channel: int, src_m
     await STORE.mark_dirty()
 
 async def mirror_fetch_src_by_dst(dst_msg_id: int) -> Optional[dict]:
-    if POOL:
+    if state.POOL:
         row = await db_one("SELECT * FROM mirror_messages WHERE dst_msg=%s ORDER BY id DESC LIMIT 1", (dst_msg_id,))
         if row:
             return row
@@ -4174,7 +2555,7 @@ def normalize_dm_bridge_entry(entry: Any) -> Optional[Dict[str, Any]]:
         return None
 
 async def dm_bridge_get(user_id: int) -> Optional[Dict[str, Any]]:
-    if POOL:
+    if state.POOL:
         row = await db_one("SELECT channel_id, active, last_activity FROM dm_bridges WHERE user_id=%s", (user_id,))
         if row:
             return {
@@ -4192,7 +2573,7 @@ async def dm_bridge_channel_for_user(user_id: int) -> Optional[int]:
     return None
 
 async def dm_bridge_user_for_channel(channel_id: int) -> Optional[int]:
-    if POOL:
+    if state.POOL:
         row = await db_one(
             "SELECT user_id FROM dm_bridges WHERE channel_id=%s AND active=TRUE",
             (channel_id,)
@@ -4208,7 +2589,7 @@ async def dm_bridge_user_for_channel(channel_id: int) -> Optional[int]:
 
 async def dm_bridge_set(user_id: int, channel_id: int, active: bool = True, last_activity: Optional[int] = None):
     ts = int(last_activity or now_ts())
-    if POOL:
+    if state.POOL:
         await db_exec("""
         INSERT INTO dm_bridges (user_id, channel_id, active, last_activity)
         VALUES (%s,%s,%s,%s)
@@ -4399,7 +2780,7 @@ async def ensure_dm_bridge_controls(user_id: int, ch: discord.TextChannel):
 
 async def dm_bridge_list_active() -> List[Dict[str, Any]]:
     bridges: List[Dict[str, Any]] = []
-    if POOL:
+    if state.POOL:
         rows = await db_all("SELECT user_id, channel_id, last_activity FROM dm_bridges WHERE active=TRUE")
         for row in rows:
             bridges.append({
@@ -4429,16 +2810,16 @@ async def archive_inactive_dm_bridges():
 
 async def send_dm_typing_indicator(user_id: int, ch: discord.TextChannel):
     now = time.time()
-    last = TYPING_INDICATORS.get(user_id, 0.0)
-    if now - last < TYPING_RATE_SECONDS:
+    last = state.TYPING_INDICATORS.get(user_id, 0.0)
+    if now - last < state.TYPING_RATE_SECONDS:
         return
-    TYPING_INDICATORS[user_id] = now
+    state.TYPING_INDICATORS[user_id] = now
     try:
         msg = await ch.send("✏️ User is typing...")
     except Exception:
         return
     async def _cleanup(m: discord.Message):
-        await asyncio.sleep(TYPING_RATE_SECONDS)
+        await asyncio.sleep(state.TYPING_RATE_SECONDS)
         try:
             await m.delete()
         except Exception:
@@ -4447,10 +2828,10 @@ async def send_dm_typing_indicator(user_id: int, ch: discord.TextChannel):
 
 async def relay_staff_typing(channel_id: int, user_id: int):
     now = time.time()
-    last = BRIDGE_TYPING_INDICATORS.get(channel_id, 0.0)
-    if now - last < TYPING_RATE_SECONDS:
+    last = state.BRIDGE_TYPING_INDICATORS.get(channel_id, 0.0)
+    if now - last < state.TYPING_RATE_SECONDS:
         return
-    BRIDGE_TYPING_INDICATORS[channel_id] = now
+    state.BRIDGE_TYPING_INDICATORS[channel_id] = now
     try:
         user = await bot.fetch_user(user_id)
         async with user.typing():
@@ -5057,7 +3438,7 @@ async def _generate_setup_ai_brief(guild: discord.Guild) -> str:
         "- Include 2 bullet metrics.\n"
         "- Include 1 observation and 1 operator recommendation.\n"
         "- Include 2 suggested enhancements for channel topics or pinned text (operator review only).\n\n"
-        f"Context: roles={roles}, channels={channels}, categories={categories}, mysql={'on' if POOL else 'off'}."
+        f"Context: roles={roles}, channels={channels}, categories={categories}, mysql={'on' if state.POOL else 'off'}."
     )
     try:
         text = await client.generate(system_prompt, user_prompt, model=model, response_format=None, timeout=60.0)
@@ -5198,7 +3579,7 @@ async def auto_setup_all_guilds(
     force_backfill: bool = False,
     include_admin: bool = True,
 ):
-    async with AUTO_SETUP_LOCK:
+    async with state.AUTO_SETUP_LOCK:
         await _auto_setup_all_guilds_nolock(
             do_backfill=do_backfill,
             force_backfill=force_backfill,
@@ -5210,7 +3591,7 @@ async def run_full_setup(guild: discord.Guild, mode: str, actor_id: int = 0):
         return
     await setup_log(f"Full setup requested: {mode} by {actor_id}")
     try:
-        async with AUTO_SETUP_LOCK:
+        async with state.AUTO_SETUP_LOCK:
             if mode in ("destructive", "destructive_ai", "fullsync"):
                 if mode == "destructive_ai":
                     ai_ok = True
@@ -5663,11 +4044,11 @@ async def _pause_background_tasks_for_setup() -> Dict[str, Any]:
     state: Dict[str, Any] = {"loops": {}, "ambient_enabled": False}
     current = asyncio.current_task()
     tasks_to_cancel: Set[asyncio.Task] = set()
-    for bucket in ACTIVE_TASKS.values():
+    for bucket in state.ACTIVE_TASKS.values():
         tasks_to_cancel.update(bucket)
     tasks_to_cancel.update(SPECIAL_VOICE_LEAVE_TASKS.values())
     tasks_to_cancel.update(MOVIE_STAY_TASKS.values())
-    tasks_to_cancel.update(LIVE_STATS_TASKS.values())
+    tasks_to_cancel.update(state.LIVE_STATS_TASKS.values())
     if current in tasks_to_cancel:
         tasks_to_cancel.discard(current)
 
@@ -5679,7 +4060,7 @@ async def _pause_background_tasks_for_setup() -> Dict[str, Any]:
 
     SPECIAL_VOICE_LEAVE_TASKS.clear()
     MOVIE_STAY_TASKS.clear()
-    LIVE_STATS_TASKS.clear()
+    state.LIVE_STATS_TASKS.clear()
 
     ai_cancelled = 0
     mandy = bot.get_cog("MandyAI")
@@ -5773,18 +4154,17 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
     if guild.id != ADMIN_GUILD_ID:
         return
     await setup_log(f"BIO-GENESIS :: REQUESTED by {actor_id}")
-    global SETUP_ADAPTIVE_ACTIVE, SETUP_DELAY_OVERRIDE
-    prev_adaptive = SETUP_ADAPTIVE_ACTIVE
-    prev_override = SETUP_DELAY_OVERRIDE
+    prev_adaptive = state.SETUP_ADAPTIVE_ACTIVE
+    prev_override = state.SETUP_DELAY_OVERRIDE
     paused_state: Optional[Dict[str, Any]] = None
     bio_setup_cfg = sentience_cfg(cfg()).setdefault("bio_setup", {})
     pause_background = bool(bio_setup_cfg.get("pause_background", True))
     resume_background = bool(bio_setup_cfg.get("resume_background", False))
     try:
-        async with AUTO_SETUP_LOCK:
-            SETUP_ADAPTIVE_ACTIVE = True
-            if SETUP_DELAY_OVERRIDE is None:
-                SETUP_DELAY_OVERRIDE = setup_delay_base()
+        async with state.AUTO_SETUP_LOCK:
+            state.SETUP_ADAPTIVE_ACTIVE = True
+            if state.SETUP_DELAY_OVERRIDE is None:
+                state.SETUP_DELAY_OVERRIDE = setup_delay_base()
             if pause_background:
                 paused_state = await _pause_background_tasks_for_setup()
             system_log = await _setup_bio_preflight(guild)
@@ -5807,7 +4187,7 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
                     await system_log.send("MEMORY_BANKS :: PURGED // WATCHERS PRESERVED")
                 except Exception:
                     pass
-            if POOL:
+            if state.POOL:
                 await db_purge_all(keep_watchers=True)
             await setup_log("BIO_PHASE_1 :: CONTROLLED_WIPE")
             wiped = await _setup_bio_wipe(guild, recovery.id)
@@ -5894,8 +4274,8 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
     finally:
         if paused_state is not None and resume_background:
             await _resume_background_tasks_after_setup(paused_state)
-        SETUP_ADAPTIVE_ACTIVE = prev_adaptive
-        SETUP_DELAY_OVERRIDE = prev_override
+        state.SETUP_ADAPTIVE_ACTIVE = prev_adaptive
+        state.SETUP_DELAY_OVERRIDE = prev_override
 
 async def bot_permissions_text(guild: discord.Guild) -> str:
     m = guild.me
@@ -6017,7 +4397,7 @@ async def send_setup_debrief(trigger: str = "fullsync"):
         return
 
     mysql_watchers = None
-    if POOL:
+    if state.POOL:
         try:
             await ensure_watchers_columns()
             row = await db_one("SELECT COUNT(*) AS c FROM watchers")
@@ -6076,7 +4456,7 @@ async def send_setup_debrief(trigger: str = "fullsync"):
         )
 
     mysql_lines: List[str] = []
-    if POOL:
+    if state.POOL:
         try:
             has_current = await db_column_exists("watchers", "current")
             has_updated = await db_column_exists("watchers", "updated_at")
@@ -6104,7 +4484,7 @@ async def send_setup_debrief(trigger: str = "fullsync"):
         f"Setup debrief ({trigger})",
         f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Guilds: {len(bot.guilds)}",
-        f"MySQL: {'on' if POOL else 'off'}",
+        f"MySQL: {'on' if state.POOL else 'off'}",
         f"Mirror rules: total={len(mirror_rules)} server={len(server_rules)} other={len(other_rules)} issues={issues}",
         f"Watchers: json={len(json_targets)} mysql={(mysql_watchers if mysql_watchers is not None else 'n/a')}",
     ]
@@ -6115,7 +4495,7 @@ async def send_setup_debrief(trigger: str = "fullsync"):
 
     await dm_send_lines(user, "Mirrors + invites:", mirror_lines)
     await dm_send_lines(user, "Watchers (JSON):", json_lines)
-    if POOL:
+    if state.POOL:
         await dm_send_lines(user, "Watchers (MySQL):", mysql_lines)
     await dm_send_lines(user, "Mirror rules (category/channel):", other_rule_lines)
 
@@ -6338,7 +4718,7 @@ class PermissionMenuView(BaseView):
         if self.level >= 90 and not is_super(interaction.user.id):
             return await interaction.response.send_message("Only SUPERUSER can assign 90+.", ephemeral=True)
 
-        if POOL:
+        if state.POOL:
             await db_exec("""
             INSERT INTO users_permissions (user_id, level, note)
             VALUES (%s,%s,%s)
@@ -6815,7 +5195,7 @@ class WatcherConfigModal(discord.ui.Modal):
             await audit(interaction.user.id, "Watcher set (json)", {"user_id": self.user_id, "count": count})
             return await interaction.response.send_message("JSON watcher saved.", ephemeral=True)
 
-        if not POOL:
+        if not state.POOL:
             return await interaction.response.send_message("MySQL not enabled.", ephemeral=True)
 
         await db_exec("""
@@ -6837,7 +5217,7 @@ async def remove_watcher(mode: str, user_id: int, actor_id: int) -> str:
         await audit(actor_id, "Watcher removed (json)", {"user_id": user_id})
         return "JSON watcher removed."
 
-    if not POOL:
+    if not state.POOL:
         return "MySQL not enabled."
     await db_exec("DELETE FROM watchers WHERE user_id=%s", (user_id,))
     mark_mysql_watcher_cache_dirty()
@@ -6854,7 +5234,7 @@ async def send_watcher_list(interaction: discord.Interaction, mode: str):
         for uid, data in targets.items():
             lines.append(fmt(uid, data.get("count", 0), data.get("current", 0), data.get("text", "")))
     else:
-        if not POOL:
+        if not state.POOL:
             return await interaction.response.send_message("MySQL not enabled.", ephemeral=True)
         rows = await db_all("SELECT user_id, threshold, current, text FROM watchers ORDER BY updated_at DESC LIMIT 25")
         for row in rows:
@@ -7321,7 +5701,7 @@ class SetupMenuView(BaseView):
             return await interaction.response.send_message("Admin server only.", ephemeral=True)
         if not is_super(interaction.user.id):
             return await interaction.response.send_message("SUPERUSER only.", ephemeral=True)
-        if not POOL:
+        if not state.POOL:
             return await interaction.response.send_message("MySQL not enabled.", ephemeral=True)
 
         async def do_purge(ix: discord.Interaction):
@@ -7495,11 +5875,11 @@ async def cmd_cancel(ctx: commands.Context):
         return
     await safe_delete(ctx.message)
     tasks_to_cancel: Set[asyncio.Task] = set()
-    for bucket in ACTIVE_TASKS.values():
+    for bucket in state.ACTIVE_TASKS.values():
         tasks_to_cancel.update(bucket)
     tasks_to_cancel.update(SPECIAL_VOICE_LEAVE_TASKS.values())
     tasks_to_cancel.update(MOVIE_STAY_TASKS.values())
-    tasks_to_cancel.update(LIVE_STATS_TASKS.values())
+    tasks_to_cancel.update(state.LIVE_STATS_TASKS.values())
 
     cancelled = 0
     for task in tasks_to_cancel:
@@ -7507,10 +5887,10 @@ async def cmd_cancel(ctx: commands.Context):
             task.cancel()
             cancelled += 1
 
-    ACTIVE_TASKS.clear()
+    state.ACTIVE_TASKS.clear()
     SPECIAL_VOICE_LEAVE_TASKS.clear()
     MOVIE_STAY_TASKS.clear()
-    LIVE_STATS_TASKS.clear()
+    state.LIVE_STATS_TASKS.clear()
 
     ai_cancelled = 0
     mandy = bot.get_cog("MandyAI")
@@ -8059,7 +6439,7 @@ async def cmd_remove_watcher(ctx: commands.Context, *, target: str):
             delete_after=10,
         )
     responses = [await remove_watcher("json", uid, ctx.author.id)]
-    if POOL:
+    if state.POOL:
         responses.append(await remove_watcher("mysql", uid, ctx.author.id))
     await ctx.send("\n".join(responses), delete_after=10)
 
@@ -8385,7 +6765,7 @@ async def cmd_livestats(ctx: commands.Context, window: str = None):
         "window": window
     }
     await STORE.mark_dirty()
-    LIVE_STATS_TASKS[guild_id] = spawn_task(
+    state.LIVE_STATS_TASKS[guild_id] = spawn_task(
         live_stats_loop(guild_id, msg.channel.id, msg.id, window),
         "stats",
     )
@@ -8423,7 +6803,7 @@ async def cmd_globallive(ctx: commands.Context, window: str = None):
     await STORE.mark_dirty()
     if changed:
         await STORE.mark_dirty()
-    LIVE_STATS_TASKS["GLOBAL"] = spawn_task(
+    state.LIVE_STATS_TASKS["GLOBAL"] = spawn_task(
         global_live_stats_loop(msg.channel.id, msg.id, window),
         "stats",
     )
@@ -8642,8 +7022,7 @@ async def on_ready():
     except Exception as e:
         # safe fallback
         await debug(f"MySQL disabled (init failed): {e}")
-        global POOL
-        POOL = None
+        state.POOL = None
 
     await migrate_legacy_json_mirrors()
     await migrate_legacy_mysql_mirrors()
@@ -8681,7 +7060,7 @@ async def on_ready():
     if auto_backfill_enabled():
         spawn_task(backfill_chat_stats_all_guilds(), "stats")
 
-    await audit(SUPER_USER_ID, "Mandy OS online", {"mysql": bool(POOL)})
+    await audit(SUPER_USER_ID, "Mandy OS online", {"mysql": bool(state.POOL)})
     config_reload.start()
     json_autosave.start()
     mirror_integrity_check.start()
@@ -8695,7 +7074,7 @@ async def on_ready():
     manual_upload_loop.start()
     await resume_live_stats_panels()
     await resume_global_live_panel()
-    print(f"Logged in as {bot.user} ({bot.user.id}) | mysql={bool(POOL)}")
+    print(f"Logged in as {bot.user} ({bot.user.id}) | mysql={bool(state.POOL)}")
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -8734,9 +7113,8 @@ async def mirror_integrity_check():
     rules = list(mirror_rules_dict().values())
     if not rules:
         return
-    global INTEGRITY_CURSOR
-    rule = rules[INTEGRITY_CURSOR % len(rules)]
-    INTEGRITY_CURSOR += 1
+    rule = rules[state.INTEGRITY_CURSOR % len(rules)]
+    state.INTEGRITY_CURSOR += 1
 
     # purge stale disabled rules
     purge_after = int(cfg().get("mirror_disable_ttl", 7 * 24 * 3600))

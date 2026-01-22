@@ -7,9 +7,9 @@ from typing import Any, Callable, Dict, List, Optional, Pattern, Tuple
 
 import discord
 
-from capability_registry import CapabilityRegistry
-from clarify_ui import ConfirmActionView, IntentChoiceView, QuickNumberView
-from resolver import (
+from .capability_registry import CapabilityRegistry
+from .clarify_ui import ConfirmActionView, IntentChoiceView, QuickNumberView
+from .resolver import (
     GuildIndexCache,
     ResolutionCandidate,
     parse_channel_id,

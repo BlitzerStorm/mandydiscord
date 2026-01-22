@@ -18,16 +18,16 @@ except Exception:
     genai = None
     genai_types = None
 
-from capability_registry import CapabilityRegistry
-from resolver import GuildIndexCache, pick_best, rank_members, rank_members_global, rank_channels_global
+from mandy.capability_registry import CapabilityRegistry
+from mandy.resolver import GuildIndexCache, pick_best, rank_members, rank_members_global, rank_channels_global
 from extensions.validator import validate_extension_path, validate_extension_source
 
 try:
-    from intelligent_command_processor import IntelligentCommandProcessor
+    from mandy.intelligent_command_processor import IntelligentCommandProcessor
     INTELLIGENT_PROCESSOR_AVAILABLE = True
 except ImportError:
     INTELLIGENT_PROCESSOR_AVAILABLE = False
-from intelligence_layer import UniversalIntelligenceLayer
+from mandy.intelligence_layer import UniversalIntelligenceLayer
 
 MAX_MESSAGE_LEN = 1900
 MANDY_MIN_LEVEL = 90
