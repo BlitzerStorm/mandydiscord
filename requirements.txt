@@ -9,6 +9,7 @@
 discord.py>=2.3.0
 aiofiles>=23.1.0
 aiomysql>=0.2.0
+rapidfuzz>=3.0.0
 
 # Gemini (optional but recommended for AI features)
 google-genai>=0.3.0

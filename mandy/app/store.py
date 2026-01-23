@@ -1,9 +1,13 @@
+import asyncio
+import datetime
 import json
 import os
+import time
 from typing import Any, Dict
 
 import aiofiles
-import asyncio
+import aiofiles.os
+import aiofiles.ospath
 
 from mandy.cooldown_store import CooldownStore
 
@@ -157,6 +161,7 @@ class JsonStore:
         self.data: Dict[str, Any] = {}
         self.dirty = False
         self.last_mtime = 0.0
+        self.backup_dir = os.path.join(os.path.dirname(path) or ".", "database_backups")
 
     def _deep_merge(self, base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
         for k, v in overlay.items():
@@ -168,12 +173,15 @@ class JsonStore:
 
     async def load(self) -> None:
         async with self.lock:
-            if not os.path.exists(self.path):
+            if not await aiofiles.ospath.exists(self.path):
                 self.data = json.loads(json.dumps(DEFAULT_JSON))
                 self.dirty = True
                 await self.flush_locked()
                 return
-            self.last_mtime = os.path.getmtime(self.path)
+            try:
+                self.last_mtime = await aiofiles.ospath.getmtime(self.path)
+            except (FileNotFoundError, OSError):
+                self.last_mtime = 0.0
             async with aiofiles.open(self.path, "r", encoding="utf-8") as f:
                 raw = await f.read()
             try:
@@ -185,9 +193,12 @@ class JsonStore:
 
     async def reload_if_changed(self) -> None:
         async with self.lock:
-            if not os.path.exists(self.path):
+            if not await aiofiles.ospath.exists(self.path):
                 return
-            mtime = os.path.getmtime(self.path)
+            try:
+                mtime = await aiofiles.ospath.getmtime(self.path)
+            except (FileNotFoundError, OSError):
+                return
             if mtime <= self.last_mtime:
                 return
             async with aiofiles.open(self.path, "r", encoding="utf-8") as f:
@@ -207,14 +218,37 @@ class JsonStore:
         if not self.dirty:
             return
         tmp_path = self.path + ".tmp"
+        await self._ensure_backup()
         async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
             await f.write(json.dumps(self.data, indent=2))
-        os.replace(tmp_path, self.path)
-        self.last_mtime = os.path.getmtime(self.path)
+        await aiofiles.os.replace(tmp_path, self.path)
+        try:
+            self.last_mtime = await aiofiles.ospath.getmtime(self.path)
+        except (FileNotFoundError, OSError):
+            self.last_mtime = time.time()
         self.dirty = False
 
     async def mark_dirty(self) -> None:
         self.dirty = True
+
+    async def _ensure_backup(self) -> None:
+        if not await aiofiles.ospath.exists(self.path):
+            return
+        try:
+            await aiofiles.os.makedirs(self.backup_dir)
+        except FileExistsError:
+            pass
+        except OSError:
+            pass
+        timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        base = os.path.basename(self.path)
+        backup_path = os.path.join(self.backup_dir, f"{base}.{timestamp}.bak")
+        try:
+            async with aiofiles.open(self.path, "rb") as src, aiofiles.open(backup_path, "wb") as dst:
+                data = await src.read()
+                await dst.write(data)
+        except FileNotFoundError:
+            return
 
 
 STORE = JsonStore(config.DB_JSON_PATH)

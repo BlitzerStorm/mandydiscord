@@ -1,10 +1,10 @@
 import re
 import time
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import discord
+from rapidfuzz import fuzz
 
 
 USER_MENTION_RE = re.compile(r"<@!?(\d+)>")
@@ -84,7 +84,7 @@ def _score_norm(query_norm: str, name_norm: str) -> Tuple[float, str]:
         return 0.92, "prefix"
     if query_norm in name_norm:
         return 0.86, "contains"
-    ratio = SequenceMatcher(None, query_norm, name_norm).ratio()
+    ratio = fuzz.ratio(query_norm, name_norm) / 100.0
     return 0.6 * ratio, "fuzzy"
 
 
