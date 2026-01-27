@@ -326,6 +326,12 @@ def typing_delay_seconds() -> float:
     except Exception:
         return 5.0
 
+def dm_bridge_history_limit() -> int:
+    try:
+        return max(5, min(200, int(cfg().get("dm_bridge_history_limit", 50))))
+    except Exception:
+        return 50
+
 async def typing_delay(channel: discord.abc.Messageable, seconds: Optional[float] = None) -> None:
     delay = typing_delay_seconds() if seconds is None else max(0.0, float(seconds))
     if delay <= 0:
@@ -2354,7 +2360,9 @@ async def ensure_dm_category(name: str) -> Optional[discord.CategoryChannel]:
     except Exception:
         return None
 
-async def dm_bridge_sync_history(user_id: int, ch: discord.TextChannel, limit: int = 25):
+async def dm_bridge_sync_history(user_id: int, ch: discord.TextChannel, limit: Optional[int] = None):
+    if limit is None:
+        limit = dm_bridge_history_limit()
     try:
         user = await bot.fetch_user(user_id)
         dm = user.dm_channel or await user.create_dm()
@@ -5344,6 +5352,13 @@ class DmBridgeControlView(BaseView):
         await dm_bridge_close(self.target_user_id)
         await audit(interaction.user.id, "DM bridge close", {"user_id": self.target_user_id})
         await self._update_message(interaction, note="Bridge archived.")
+
+    @discord.ui.button(label="Sync Transcript", style=discord.ButtonStyle.primary)
+    async def sync_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("Not a text channel.", ephemeral=True)
+        await dm_bridge_sync_history(self.target_user_id, interaction.channel)
+        await self._update_message(interaction, note="Transcript synced.")
 
     @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary)
     async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
