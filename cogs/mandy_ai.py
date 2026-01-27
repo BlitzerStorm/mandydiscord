@@ -18,6 +18,10 @@ except Exception:
     genai = None
     genai_types = None
 
+from .mandy_ai_gemini import GeminiClient, GeminiRateLimitError
+from .mandy_ai_views import ConfirmView, RateLimitView, UserPickView
+
+
 from mandy.capability_registry import CapabilityRegistry
 from mandy.resolver import GuildIndexCache, pick_best, rank_members, rank_members_global, rank_channels_global
 from extensions.validator import validate_extension_path, validate_extension_source
@@ -53,10 +57,6 @@ WINDOW_ALIASES = {
 ALLOWED_INTENTS = {"TALK", "ACTION", "NEEDS_CONFIRMATION", "DESIGN_TOOL", "BUILD_TOOL"}
 SCHEMA_KEYS = {"intent", "response", "actions", "tool_design", "build", "confirm"}
 
-class GeminiRateLimitError(Exception):
-    def __init__(self, message: str, retry_after: Optional[float] = None):
-        super().__init__(message)
-        self.retry_after = retry_after
 
 class LocalRateLimitError(Exception):
     def __init__(self, wait_seconds: float):
@@ -96,203 +96,9 @@ def _chunk_text(text: str, limit: int = MAX_MESSAGE_LEN) -> List[str]:
         chunks.append(cur)
     return chunks
 
-class GeminiClient:
-    def __init__(self, api_key: Optional[str]):
-        self.api_key = api_key or ""
-        self.available = bool(self.api_key and genai is not None)
-        self._client = genai.Client(api_key=self.api_key) if self.available else None
 
-    def _build_contents(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        audio_bytes: Optional[bytes] = None,
-        audio_mime: Optional[str] = None,
-    ):
-        prompt = (system_prompt or "").strip() + "\n\nUSER:\n" + (user_prompt or "").strip()
-        if audio_bytes and genai_types:
-            part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=audio_mime or "audio/wav")
-            return [part, prompt]
-        return prompt
 
-    def _extract_text(self, resp: Any) -> str:
-        if resp is None:
-            return ""
-        text = getattr(resp, "text", None)
-        if isinstance(text, str) and text.strip():
-            return text
-        try:
-            cands = resp.candidates or []
-            if not cands:
-                return ""
-            parts = cands[0].content.parts or []
-            out = []
-            for part in parts:
-                t = getattr(part, "text", None)
-                if isinstance(t, str):
-                    out.append(t)
-            return "".join(out).strip()
-        except Exception:
-            return ""
 
-    def _is_rate_limit_error(self, exc: Exception) -> Tuple[bool, Optional[float]]:
-        msg = str(exc).lower()
-        is_rate = "429" in msg or "rate limit" in msg or "quota" in msg or "resource exhausted" in msg
-        retry_after = self._extract_retry_after(exc, msg)
-        return is_rate, retry_after
-
-    def _extract_retry_after(self, exc: Exception, msg: str) -> Optional[float]:
-        retry_after = getattr(exc, "retry_after", None)
-        if isinstance(retry_after, (int, float)) and retry_after > 0:
-            return float(retry_after)
-        response = getattr(exc, "response", None)
-        headers = getattr(response, "headers", None) if response else None
-        if headers:
-            raw = headers.get("Retry-After") or headers.get("retry-after")
-            try:
-                return float(raw)
-            except Exception:
-                pass
-        match = re.search(r"retry-?after[:=]\s*(\d+)", msg)
-        if match:
-            try:
-                return float(match.group(1))
-            except Exception:
-                return None
-        return None
-
-    def _generate_sync(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        model: str,
-        response_format: Optional[str],
-        audio_bytes: Optional[bytes],
-        audio_mime: Optional[str],
-    ):
-        contents = self._build_contents(system_prompt, user_prompt, audio_bytes, audio_mime)
-        if genai_types:
-            mime = "application/json" if response_format == "json" else "text/plain"
-            config = genai_types.GenerateContentConfig(response_mime_type=mime, temperature=0.2)
-            return self._client.models.generate_content(model=model, contents=contents, config=config)
-        return self._client.models.generate_content(model=model, contents=contents)
-
-    async def generate(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        model: str,
-        response_format: Optional[str] = None,
-        audio_bytes: Optional[bytes] = None,
-        audio_mime: Optional[str] = None,
-        timeout: float = 60.0,
-        retries: int = 2,
-    ) -> str:
-        if not self.available:
-            raise RuntimeError("Gemini SDK not available or API key missing")
-        loop = asyncio.get_running_loop()
-        last_exc: Optional[Exception] = None
-        for attempt in range(retries + 1):
-            try:
-                resp = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None,
-                        self._generate_sync,
-                        system_prompt,
-                        user_prompt,
-                        model,
-                        response_format,
-                        audio_bytes,
-                        audio_mime,
-                    ),
-                    timeout=timeout,
-                )
-                text = self._extract_text(resp)
-                if not text:
-                    raise RuntimeError("Empty response from Gemini")
-                return text
-            except Exception as exc:
-                is_rate, retry_after = self._is_rate_limit_error(exc)
-                if is_rate:
-                    raise GeminiRateLimitError(str(exc), retry_after=retry_after)
-                last_exc = exc
-                if attempt < retries:
-                    await asyncio.sleep(0.4 * (attempt + 1))
-        raise last_exc or RuntimeError("Gemini request failed")
-
-class RateLimitView(discord.ui.View):
-    def __init__(self, cog, job_id: str, user_id: int):
-        super().__init__(timeout=120)
-        self.cog = cog
-        self.job_id = job_id
-        self.user_id = user_id
-
-    @discord.ui.button(label="WAIT", style=discord.ButtonStyle.primary)
-    async def wait_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Not authorized.", ephemeral=True)
-        await self.cog.accept_job(self.job_id)
-        await interaction.response.edit_message(content="Queued. Will retry automatically.", view=None)
-
-    @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.danger)
-    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Not authorized.", ephemeral=True)
-        await self.cog.cancel_job(self.job_id)
-        await interaction.response.edit_message(content="Cancelled.", view=None)
-
-class ConfirmView(discord.ui.View):
-    def __init__(self, cog, user_id: int, channel_id: int, query: str):
-        super().__init__(timeout=120)
-        self.cog = cog
-        self.user_id = user_id
-        self.channel_id = channel_id
-        self.query = query
-
-    @discord.ui.button(label="CONFIRM", style=discord.ButtonStyle.success)
-    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Not authorized.", ephemeral=True)
-        await interaction.response.edit_message(content="Confirmed. Processing...", view=None)
-        await self.cog.confirm_request(self.user_id, self.channel_id, self.query)
-
-    @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.danger)
-    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Not authorized.", ephemeral=True)
-        await interaction.response.edit_message(content="Cancelled.", view=None)
-
-    @discord.ui.button(label="WAIT", style=discord.ButtonStyle.secondary)
-    async def wait_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            return await interaction.response.send_message("Not authorized.", ephemeral=True)
-        await interaction.response.send_message("Waiting. Use CONFIRM when ready.", ephemeral=True)
-
-class UserPickView(discord.ui.View):
-    def __init__(self, cog, requester_id: int, action: Dict[str, Any], candidates: List[Tuple[int, str]]):
-        super().__init__(timeout=120)
-        self.cog = cog
-        self.requester_id = requester_id
-        self.action = action
-        for idx, (uid, label) in enumerate(candidates[:5], start=1):
-            btn = discord.ui.Button(label=f"{idx}. {label}", style=discord.ButtonStyle.secondary)
-            async def callback(interaction: discord.Interaction, picked_id: int = uid, picked_label: str = label):
-                if interaction.user.id != self.requester_id:
-                    return await interaction.response.send_message("Not authorized.", ephemeral=True)
-                await interaction.response.edit_message(
-                    content=f"Selected {picked_label}. Processing...",
-                    view=None,
-                )
-                await self.cog.handle_user_pick(self.action, picked_id, interaction.channel, interaction.guild, interaction.user)
-            btn.callback = callback
-            self.add_item(btn)
-        cancel = discord.ui.Button(label="CANCEL", style=discord.ButtonStyle.danger)
-        async def cancel_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.requester_id:
-                return await interaction.response.send_message("Not authorized.", ephemeral=True)
-            await interaction.response.edit_message(content="Cancelled.", view=None)
-        cancel.callback = cancel_callback
-        self.add_item(cancel)
 
 class _ManydAICommandExecutor:
     """Executor for intelligent command processor - bridges to MandyAI tools."""
@@ -754,7 +560,7 @@ class MandyAI(commands.Cog):
         if tpm and int(rolling.get("tokens", 0)) + tokens > tpm:
             wait = max(wait, 60 - (now - float(rolling.get("start", now))))
 
-        day_key = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        day_key = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         daily = self._usage["daily"].setdefault(model, {"date": day_key, "count": 0, "tokens": 0})
         if daily.get("date") != day_key:
             daily["date"] = day_key
@@ -778,7 +584,7 @@ class MandyAI(commands.Cog):
         rolling["count"] = int(rolling.get("count", 0)) + 1
         rolling["tokens"] = int(rolling.get("tokens", 0)) + int(tokens_in) + int(tokens_out)
 
-        day_key = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        day_key = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         daily = self._usage["daily"].setdefault(model, {"date": day_key, "count": 0, "tokens": 0})
         if daily.get("date") != day_key:
             daily["date"] = day_key
