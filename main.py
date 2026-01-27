@@ -22,6 +22,8 @@ import random
 import re
 import time
 from contextvars import ContextVar
+from dataclasses import dataclass
+from contextvars import ContextVar
 import datetime
 import hashlib
 from typing import Optional, Dict, Any, List, Tuple, Set
@@ -323,6 +325,8 @@ def update_super_interaction_ts(message_ts: int) -> None:
 
 COMMAND_CONTEXT = ContextVar("mandy_command_context", default=False)
 
+COMMAND_CONTEXT = ContextVar("mandy_command_context", default=False)
+
 def typing_delay_seconds() -> float:
     try:
         return max(0.0, float(cfg().get("typing_delay_seconds", 5.0)))
@@ -355,9 +359,7 @@ def _skip_typing_for_channel(channel: discord.abc.Messageable) -> bool:
     if COMMAND_CONTEXT.get():
         return True
     if isinstance(channel, discord.TextChannel):
-        channels_cfg = cfg().get("command_channels", {})
-        god_channel = str(channels_cfg.get("god", "admin-chat"))
-        if channel.guild and channel.guild.id == ADMIN_GUILD_ID and channel.name == god_channel:
+        if channel.guild and channel.guild.id == ADMIN_GUILD_ID:
             return True
         logs = cfg().get("logs", {}) if isinstance(cfg().get("logs", {}), dict) else {}
         log_ids = {int(v) for v in logs.values() if str(v).isdigit()}
@@ -718,6 +720,193 @@ async def _resolve_diagnostics_channel() -> Optional[discord.TextChannel]:
         await STORE.mark_dirty()
         return ch
     return None
+
+def _setup_status_cfg() -> Dict[str, Any]:
+    diag = diagnostics_cfg()
+    return diag.setdefault("setup_status", {})
+
+async def _resolve_setup_status_channel() -> Optional[discord.TextChannel]:
+    ch = await _resolve_diagnostics_channel()
+    if isinstance(ch, discord.TextChannel):
+        cfg_entry = _setup_status_cfg()
+        if cfg_entry.get("channel_id") != ch.id:
+            cfg_entry["channel_id"] = ch.id
+            await STORE.mark_dirty()
+        return ch
+    return None
+
+@dataclass
+class SetupPhaseResult:
+    name: str
+    status: str
+    details: str
+    duration_ms: int
+
+async def _update_setup_status_panel(results: List[SetupPhaseResult], note: str = "") -> None:
+    ch = await _resolve_setup_status_channel()
+    if not ch:
+        return
+    lines = ["**Mandy Setup Status**"]
+    now_text = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    lines.append(f"Updated: {now_text}")
+    for r in results:
+        icon = {
+            "OK": "✅",
+            "UPDATED": "✅",
+            "SKIPPED": "⏭️",
+            "QUEUED": "🕒",
+            "FAILED": "⚠️",
+            "FALLBACK": "⚠️",
+        }.get(r.status, "•")
+        detail = f" - {r.details}" if r.details else ""
+        lines.append(f"{icon} {r.name} ({r.duration_ms}ms){detail}")
+    if note:
+        lines.append(note)
+    payload = "\n".join(lines[:25])
+    state = _setup_status_cfg()
+    msg_id = int(state.get("message_id", 0) or 0)
+    try:
+        if msg_id:
+            msg = await ch.fetch_message(msg_id)
+            await msg.edit(content=payload)
+        else:
+            msg = await ch.send(payload)
+            state["message_id"] = msg.id
+            await STORE.mark_dirty()
+    except Exception:
+        return
+
+async def _start_task_if_needed(task: tasks.Loop):
+    try:
+        if not task.is_running():
+            task.start()
+    except Exception:
+        pass
+
+async def run_boot_orchestrator() -> List[SetupPhaseResult]:
+    results: List[SetupPhaseResult] = []
+
+    async def run_phase(name: str, fn):
+        start = time.time()
+        status = "OK"
+        details = ""
+        try:
+            status, details = await fn()
+        except Exception as exc:
+            status = "FAILED"
+            details = str(exc)[:160]
+        duration_ms = int((time.time() - start) * 1000)
+        results.append(SetupPhaseResult(name=name, status=status, details=details, duration_ms=duration_ms))
+        await _update_setup_status_panel(results)
+
+    async def phase_plugins():
+        if hasattr(bot, "mandy_plugin_manager"):
+            await bot.mandy_plugin_manager.load_all()
+            return "OK", "plugins loaded"
+        return "SKIPPED", "no plugin manager"
+
+    async def phase_db():
+        try:
+            await db_init()
+            await db_bootstrap()
+            return "OK", "mysql ready"
+        except Exception:
+            state.POOL = None
+            return "FALLBACK", "mysql disabled, using JSON"
+
+    async def phase_mirrors():
+        await migrate_legacy_json_mirrors()
+        await migrate_legacy_mysql_mirrors()
+        await mirror_rules_sync()
+        return "OK", "mirror rules synced"
+
+    async def phase_controls():
+        bot.add_view(MirrorControls())
+        return "OK", "controls registered"
+
+    async def phase_status():
+        try:
+            await apply_bot_status()
+            return "OK", "presence applied"
+        except Exception:
+            return "FAILED", "presence apply failed"
+
+    async def phase_ambient():
+        try:
+            await ambient_engine.start_ambient_engine(bot)
+            return "OK", "ambient engine online"
+        except Exception as exc:
+            return "FAILED", str(exc)[:120]
+
+    async def phase_admin_hub():
+        admin = bot.get_guild(ADMIN_GUILD_ID)
+        if not admin:
+            return "SKIPPED", "admin guild missing"
+        await ensure_roles(admin)
+        await apply_guest_permissions(admin)
+        await apply_quarantine_permissions(admin)
+        return "OK", "roles + perms verified"
+
+    async def phase_admin_channels():
+        admin = bot.get_guild(ADMIN_GUILD_ID)
+        if not admin:
+            return "SKIPPED", "admin guild missing"
+        if auto_setup_enabled():
+            return "SKIPPED", "auto setup enabled"
+        for g in bot.guilds:
+            if g.id == ADMIN_GUILD_ID:
+                continue
+            await ensure_admin_server_channels(g)
+            await ensure_server_mirror_rule(g)
+            await update_server_info_for_guild(g)
+        return "OK", "admin channels synced"
+
+    async def phase_auto_setup():
+        if auto_setup_enabled():
+            spawn_task(
+                auto_setup_all_guilds(do_backfill=auto_backfill_enabled(), force_backfill=False),
+                "setup",
+            )
+            return "QUEUED", "auto setup queued"
+        return "SKIPPED", "auto setup disabled"
+
+    async def phase_backfill():
+        if auto_backfill_enabled():
+            spawn_task(backfill_chat_stats_all_guilds(), "stats")
+            return "QUEUED", "backfill queued"
+        return "SKIPPED", "backfill disabled"
+
+    async def phase_loops():
+        await audit(SUPER_USER_ID, "Mandy OS online", {"mysql": bool(state.POOL)})
+        await _start_task_if_needed(config_reload)
+        await _start_task_if_needed(json_autosave)
+        await _start_task_if_needed(mirror_integrity_check)
+        await _start_task_if_needed(server_status_update)
+        await _start_task_if_needed(dm_bridge_archive)
+        await _start_task_if_needed(presence_controller)
+        await _start_task_if_needed(daily_reflection_loop)
+        await _start_task_if_needed(internal_monologue_loop)
+        await _start_task_if_needed(sentience_maintenance_loop)
+        await _start_task_if_needed(diagnostics_loop)
+        await _start_task_if_needed(manual_upload_loop)
+        await resume_live_stats_panels()
+        await resume_global_live_panel()
+        return "OK", "maintenance loops running"
+
+    await run_phase("Load Plugins", phase_plugins)
+    await run_phase("Database Init", phase_db)
+    await run_phase("Mirror Sync", phase_mirrors)
+    await run_phase("Register Controls", phase_controls)
+    await run_phase("Apply Status", phase_status)
+    await run_phase("Ambient Engine", phase_ambient)
+    await run_phase("Admin Roles", phase_admin_hub)
+    await run_phase("Admin Channels", phase_admin_channels)
+    await run_phase("Auto Setup", phase_auto_setup)
+    await run_phase("Backfill", phase_backfill)
+    await run_phase("Start Loops", phase_loops)
+
+    await _update_setup_status_panel(results, note="Setup complete.")
+    return results
 
 def _manual_path() -> str:
     return os.path.join("docs", "MANDY_MANUAL.md")
@@ -3078,6 +3267,58 @@ def find_category_by_name(guild: discord.Guild, name: str) -> Optional[discord.C
 
 def find_text_by_name(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
     return discord.utils.get(guild.text_channels, name=name)
+
+def check_layout_missing(guild: discord.Guild) -> List[str]:
+    layout = cfg().get("layout", {}).get("categories", {})
+    missing: List[str] = []
+    for cat_name, chans in layout.items():
+        cat = find_category_by_name(guild, cat_name)
+        if not cat:
+            missing.append(f"category:{cat_name}")
+        for ch_name in chans:
+            ch = find_text_by_name(guild, ch_name)
+            if not ch:
+                missing.append(f"channel:{cat_name}/{ch_name}")
+    return missing
+
+async def setup_audit_report() -> List[str]:
+    lines: List[str] = []
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if not admin:
+        return ["Setup Audit Report", "Admin guild missing."]
+
+    lines.append("Setup Audit Report")
+    lines.append(f"Admin guild: {admin.name} ({admin.id})")
+    lines.append(f"DB: {'MySQL' if state.POOL else 'JSON-only'}")
+
+    roles = [GUEST_ROLE_NAME, QUARANTINE_ROLE_NAME, STAFF_ROLE_NAME, ADMIN_ROLE_NAME, GOD_ROLE_NAME]
+    missing_roles = [r for r in roles if not get_role(admin, r)]
+    if missing_roles:
+        lines.append("Roles: MISSING -> " + ", ".join(missing_roles))
+    else:
+        lines.append("Roles: VERIFIED")
+
+    missing_layout = check_layout_missing(admin)
+    if missing_layout:
+        lines.append(f"Layout: MISSING {len(missing_layout)}")
+    else:
+        lines.append("Layout: VERIFIED")
+
+    menus = cfg().get("menu_messages", {})
+    if menus.get("user_menu") and menus.get("god_menu"):
+        lines.append("Menus: VERIFIED")
+    else:
+        lines.append("Menus: MISSING user_menu or god_menu")
+
+    mirrors = list(mirror_rules_dict().values())
+    enabled = len([r for r in mirrors if r.get("enabled", True)])
+    disabled = len(mirrors) - enabled
+    lines.append(f"Mirrors: total={len(mirrors)} enabled={enabled} disabled={disabled}")
+
+    dm_bridges = await dm_bridge_list_active()
+    lines.append(f"DM bridges active: {len(dm_bridges)}")
+
+    return lines
 
 async def verify_layout(guild: discord.Guild) -> List[str]:
     layout = cfg().get("layout", {}).get("categories", {})
@@ -5634,6 +5875,13 @@ class SetupMenuView(BaseView):
         await audit(interaction.user.id, "Auto setup start", {"guild_id": interaction.guild.id})
         spawn_task(run_auto_setup_with_debrief(actor_id=interaction.user.id), "setup")
 
+    @discord.ui.button(label="Setup Audit", style=discord.ButtonStyle.primary)
+    async def audit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or interaction.guild.id != ADMIN_GUILD_ID:
+            return await interaction.response.send_message("Admin server only.", ephemeral=True)
+        lines = await setup_audit_report()
+        await interaction.response.send_message("\n".join(lines[:20]), ephemeral=True)
+
     @discord.ui.button(label="Purge MySQL (Reset)", style=discord.ButtonStyle.danger)
     async def purge_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or interaction.guild.id != ADMIN_GUILD_ID:
@@ -6041,6 +6289,17 @@ async def setup(ctx: commands.Context, mode: str = ""):
     spawn_task(run_full_setup(ctx.guild, mode, actor_id=ctx.author.id), "setup")
     await audit(ctx.author.id, "Setup run", {"mode": mode})
     await safe_ctx_send(ctx, "Setup started. You'll get a DM when it's done.", delete_after=10)
+
+@bot.command(name="setup_audit")
+async def setup_audit(ctx: commands.Context):
+    if not ctx.guild or ctx.guild.id != ADMIN_GUILD_ID:
+        await safe_delete(ctx.message)
+        return
+    if not await require_level_ctx(ctx, 70):
+        return
+    await safe_delete(ctx.message)
+    lines = await setup_audit_report()
+    await ctx.send("\n".join(lines[:20]), delete_after=20)
 
 @bot.command(name="setup_bio")
 async def setup_bio(ctx: commands.Context):
@@ -7024,55 +7283,9 @@ async def on_ready():
     install_typing_delay_patch()
     await maybe_load_mandy_extension(bot)
     try:
-        if hasattr(bot, "mandy_plugin_manager"):
-            await bot.mandy_plugin_manager.load_all()
+        await run_boot_orchestrator()
     except Exception as e:
-        await debug(f"Tool plugins failed to load: {e}")
-
-    # optional mysql
-    try:
-        await db_init()
-        await db_bootstrap()
-    except Exception as e:
-        # safe fallback
-        await debug(f"MySQL disabled (init failed): {e}")
-        state.POOL = None
-
-    await migrate_legacy_json_mirrors()
-    await migrate_legacy_mysql_mirrors()
-    await mirror_rules_sync()
-
-    bot.add_view(MirrorControls())
-    try:
-        await apply_bot_status()
-    except Exception:
-        pass
-    try:
-        await ambient_engine.start_ambient_engine(bot)
-    except Exception as e:
-        await debug(f"Ambient engine start failed: {e}")
-    admin = bot.get_guild(ADMIN_GUILD_ID)
-    if admin:
-        try:
-            await ensure_roles(admin)
-            await apply_guest_permissions(admin)
-            await apply_quarantine_permissions(admin)
-        except Exception:
-            pass
-        if not auto_setup_enabled():
-            for g in bot.guilds:
-                if g.id != ADMIN_GUILD_ID:
-                    await ensure_admin_server_channels(g)
-                    await ensure_server_mirror_rule(g)
-                    await update_server_info_for_guild(g)
-
-    if auto_setup_enabled():
-        spawn_task(
-            auto_setup_all_guilds(do_backfill=auto_backfill_enabled(), force_backfill=False),
-            "setup",
-        )
-    if auto_backfill_enabled():
-        spawn_task(backfill_chat_stats_all_guilds(), "stats")
+        await debug(f"setup orchestrator failed: {e}")
 
 @bot.before_invoke
 async def _before_command_invoke(ctx: commands.Context):
@@ -7089,23 +7302,6 @@ async def _after_command_invoke(ctx: commands.Context):
             COMMAND_CONTEXT.reset(token)
     except Exception:
         pass
-
-
-    await audit(SUPER_USER_ID, "Mandy OS online", {"mysql": bool(state.POOL)})
-    config_reload.start()
-    json_autosave.start()
-    mirror_integrity_check.start()
-    server_status_update.start()
-    dm_bridge_archive.start()
-    presence_controller.start()
-    daily_reflection_loop.start()
-    internal_monologue_loop.start()
-    sentience_maintenance_loop.start()
-    diagnostics_loop.start()
-    manual_upload_loop.start()
-    await resume_live_stats_panels()
-    await resume_global_live_panel()
-    print(f"Logged in as {bot.user} ({bot.user.id}) | mysql={bool(state.POOL)}")
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
