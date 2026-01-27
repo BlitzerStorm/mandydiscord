@@ -403,7 +403,28 @@ def roast_intent(text: str) -> bool:
         return True
     if "diss" in t or "clown me" in t:
         return True
+    if "shut up" in t or "shutup" in t or "stfu" in t:
+        return True
     return False
+
+async def _roast_intent_gemini(text: str) -> bool:
+    client = _mandy_ai_client()
+    if not client or not getattr(client, "available", False):
+        return False
+    ai = ai_cfg()
+    model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
+    system_prompt = (
+        "You are a strict classifier. Return JSON only: {\"roast\": true|false}. "
+        "Decide true if the message is a direct insult or hostile intent toward Mandy, "
+        "or explicitly asks for a roast. Otherwise false."
+    )
+    user_prompt = f"Message: {text}"
+    try:
+        raw = await client.generate(system_prompt, user_prompt, model=model, response_format="json", timeout=8.0)
+        data = json.loads(raw or "{}")
+        return bool(data.get("roast", False))
+    except Exception:
+        return False
 
 def roast_opt_in_users() -> Set[str]:
     raw = roast_cfg().get("opt_in_users", []) or []
@@ -543,7 +564,8 @@ async def maybe_roast_message(message: discord.Message) -> bool:
     if not roast_trigger_regex().search(content):
         return False
     if not roast_intent(content):
-        return False
+        if not await _roast_intent_gemini(content):
+            return False
     if not roast_user_opted_in(message.author.id, message.guild.id):
         return False
     if not roast_channel_allowed(message.channel.id):
@@ -553,7 +575,8 @@ async def maybe_roast_message(message: discord.Message) -> bool:
         return False
     last = runtime.setdefault("roast_last", {})
     now = time.time()
-    cooldown = int(roast_cfg().get("cooldown_seconds", 20) or 20)
+    cooldown = int(roast_cfg().get("cooldown_seconds", 600) or 600)
+    cooldown = max(600, cooldown)
     last_ts = float(last.get(str(message.author.id), 0) or 0)
     if now - last_ts < max(5, cooldown):
         return False
@@ -568,7 +591,7 @@ async def maybe_roast_message(message: discord.Message) -> bool:
     if not roast_text:
         roast_text = generate_playful_roast(message.author, recent)
     try:
-        await message.channel.send(roast_text)
+        await message.reply(roast_text, mention_author=True)
     except Exception:
         return False
     last[str(message.author.id)] = now

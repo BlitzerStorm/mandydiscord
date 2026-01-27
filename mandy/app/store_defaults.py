@@ -52,7 +52,7 @@ DEFAULT_JSON: Dict[str, Any] = {
         "enabled": False,
         "trigger_word": "mandy",
         "max_history": 5,
-        "cooldown_seconds": 20,
+        "cooldown_seconds": 600,
         "opt_in_users": [],
         "allowed_guilds": [],
         "auto_opt_in_guilds": [],
