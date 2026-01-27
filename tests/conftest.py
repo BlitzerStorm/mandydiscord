@@ -43,6 +43,21 @@ def _install_discord_stubs():
         async def callback(self, interaction):
             return
 
+    class DummyTextInput:
+        def __init__(self, label=None, placeholder=None, required=False, max_length=None, default=None):
+            self.label = label
+            self.placeholder = placeholder
+            self.required = required
+            self.max_length = max_length
+            self.value = default or ""
+
+    class DummyModal:
+        def __init__(self, *args, **kwargs):
+            return
+
+        def __init_subclass__(cls, **kwargs):
+            return
+
     def button(*args, **kwargs):
         def decorator(func):
             return func
@@ -88,8 +103,24 @@ def _install_discord_stubs():
                 edit_message=lambda *args, **kwargs: None,
             )
 
-    discord.ui = types.SimpleNamespace(View=DummyView, button=button, Button=DummyButton, Select=DummySelect)
-    discord.ButtonStyle = types.SimpleNamespace(primary=1, danger=2, success=3, secondary=4)
+    discord.ui = types.SimpleNamespace(
+        View=DummyView,
+        button=button,
+        Button=DummyButton,
+        Select=DummySelect,
+        Modal=DummyModal,
+        TextInput=DummyTextInput,
+    )
+    discord.ButtonStyle = types.SimpleNamespace(
+        primary=1,
+        danger=2,
+        success=3,
+        secondary=4,
+        green=3,
+        red=2,
+        blurple=1,
+        gray=4,
+    )
     discord.SelectOption = DummySelectOption
     discord.TextChannel = DummyTextChannel
     discord.PCMVolumeTransformer = DummyPCMVolumeTransformer

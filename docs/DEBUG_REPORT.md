@@ -4,8 +4,9 @@
 Static audit and debug pass with local tooling. Runtime integration (Discord API, voice, MySQL, Gemini) cannot be fully exercised in this environment.
 
 ## Checks Run
-- `python -m pytest -q` → **7 passed**
-- `python -m compileall -q .` → **no errors**
+- `python -m pytest -q` -> **7 passed**
+- `python -m compileall -q .` -> **no errors**
+- Import audit across `mandy/`, `cogs/`, `extensions/` with Discord stubs -> **no errors**
 
 ## Imports & Module Wiring
 Reviewed and validated module export hubs:
@@ -20,7 +21,7 @@ All re-export targets resolve to tracked files and compile cleanly.
 
 ## Recent Hardening
 - YouTube-only guard enforced at YTDL layer (`mandy/app/media_ytdl.py`) with tests.
-- Discord stubs expanded for tests (`tests/conftest.py`).
+- Discord stubs expanded for tests/import audit (`tests/conftest.py`).
 - Deprecation warnings for `datetime.utcnow()` removed in `cogs/mandy_ai.py`.
 
 ## Known Limitations (cannot be fully validated locally)
