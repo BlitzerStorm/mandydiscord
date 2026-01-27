@@ -409,8 +409,26 @@ def roast_opt_in_users() -> Set[str]:
     raw = roast_cfg().get("opt_in_users", []) or []
     return {str(uid) for uid in raw}
 
-def roast_user_opted_in(user_id: int) -> bool:
-    return str(user_id) in roast_opt_in_users()
+def roast_allowed_guilds() -> Set[int]:
+    raw = roast_cfg().get("allowed_guilds", []) or []
+    return {int(gid) for gid in raw if str(gid).isdigit()}
+
+def roast_auto_opt_in_guilds() -> Set[int]:
+    raw = roast_cfg().get("auto_opt_in_guilds", []) or []
+    return {int(gid) for gid in raw if str(gid).isdigit()}
+
+def roast_guild_allowed(guild_id: int) -> bool:
+    allowed = roast_allowed_guilds()
+    if allowed and guild_id not in allowed:
+        return False
+    return True
+
+def roast_user_opted_in(user_id: int, guild_id: Optional[int] = None) -> bool:
+    if str(user_id) in roast_opt_in_users():
+        return True
+    if guild_id and guild_id in roast_auto_opt_in_guilds():
+        return True
+    return False
 
 def roast_channel_allowed(channel_id: int) -> bool:
     cfg_roast = roast_cfg()
@@ -519,12 +537,14 @@ async def maybe_roast_message(message: discord.Message) -> bool:
         return False
     if not roast_enabled():
         return False
+    if not roast_guild_allowed(message.guild.id):
+        return False
     content = message.content or ""
     if not roast_trigger_regex().search(content):
         return False
     if not roast_intent(content):
         return False
-    if not roast_user_opted_in(message.author.id):
+    if not roast_user_opted_in(message.author.id, message.guild.id):
         return False
     if not roast_channel_allowed(message.channel.id):
         return False
@@ -4501,10 +4521,14 @@ class RoastMenuView(BaseView):
             lines.append(label)
         status = "ON" if roast_enabled() else "OFF"
         trigger = roast_trigger_word() or "mandy"
+        auto_guilds = sorted(roast_auto_opt_in_guilds())
+        allowed_guilds = sorted(roast_allowed_guilds())
         msg = [
             f"Roast status: {status}",
             f"Trigger: {trigger}",
             f"Opt-in users: {len(users)}",
+            f"Auto opt-in guilds: {len(auto_guilds)}",
+            f"Allowed guilds: {len(allowed_guilds) if allowed_guilds else 'all'}",
             "Users:",
             *(lines if lines else ["(none)"]),
         ]
@@ -5959,6 +5983,68 @@ async def memory_cmd(ctx: commands.Context, limit: int = 8):
         ts = fmt_ts(e.get("ts", 0))
         lines.append(f"{ts} [{e.get('kind','note')}] {e.get('text','')}")
     await ctx.send("\n".join(lines[:15]), delete_after=20)
+
+def _resolve_guilds_from_ref(ctx: commands.Context, ref: str) -> Tuple[List[discord.Guild], str]:
+    token = (ref or "").strip().lower()
+    if not token or token in ("here", "this", "current"):
+        if not ctx.guild:
+            return [], "No guild context."
+        return [ctx.guild], ""
+    if token == "all":
+        return list(bot.guilds), ""
+    if token.isdigit():
+        gid = int(token)
+        g = bot.get_guild(gid)
+        if g:
+            return [g], ""
+        return [], "Guild not found."
+    return [], "Use: `here`, `all`, or a guild ID."
+
+async def _update_roast_guild_list(ctx: commands.Context, key: str, ref: str, mode: str) -> None:
+    mode = (mode or "add").strip().lower()
+    if mode not in ("add", "remove", "clear"):
+        await ctx.send("Mode must be `add`, `remove`, or `clear`.", delete_after=6)
+        return
+    roast = roast_cfg()
+    if mode == "clear":
+        roast[key] = []
+        await STORE.mark_dirty()
+        await audit(ctx.author.id, f"Roast {key} cleared", {})
+        await ctx.send(f"{key} cleared.", delete_after=6)
+        return
+    guilds, err = _resolve_guilds_from_ref(ctx, ref)
+    if err:
+        await ctx.send(err, delete_after=6)
+        return
+    ids = {g.id for g in guilds}
+    current = {int(x) for x in (roast.get(key, []) or []) if str(x).isdigit()}
+    if mode == "add":
+        current.update(ids)
+    else:
+        current.difference_update(ids)
+    roast[key] = sorted(current)
+    await STORE.mark_dirty()
+    await audit(ctx.author.id, f"Roast {key} updated", {"mode": mode, "guild_ids": sorted(ids)})
+    names = ", ".join(g.name for g in guilds) if guilds else "none"
+    await ctx.send(f"{key} {mode} for: {names}", delete_after=8)
+
+@bot.command(name="roast_whitelist_guild", aliases=["roast_whitelist_server", "roast_allow_guild", "roast_allow_server"])
+async def roast_whitelist_guild(ctx: commands.Context, ref: str = "here", mode: str = "add"):
+    if not await require_level_ctx(ctx, MANDY_GOD_LEVEL):
+        return
+    if ref in ("add", "remove", "clear") and mode == "add":
+        mode = ref
+        ref = "here"
+    await _update_roast_guild_list(ctx, "allowed_guilds", ref, mode)
+
+@bot.command(name="roast_whitelist_users", aliases=["roast_auto_opt_in", "roast_allow_users"])
+async def roast_whitelist_users(ctx: commands.Context, ref: str = "here", mode: str = "add"):
+    if not await require_level_ctx(ctx, MANDY_GOD_LEVEL):
+        return
+    if ref in ("add", "remove", "clear") and mode == "add":
+        mode = ref
+        ref = "here"
+    await _update_roast_guild_list(ctx, "auto_opt_in_guilds", ref, mode)
 
 
 def _generate_phoenix_key(snapshot_id: str) -> str:

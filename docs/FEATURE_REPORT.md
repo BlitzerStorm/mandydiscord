@@ -56,9 +56,10 @@ This report summarizes the bot's current capabilities and parity against archive
 
 ## Roast Mode (Opt-in)
 - Regex trigger for "mandy" variants + roast intent keywords.
-- Per-user opt-in list, channel allow/block, cooldown, history length.
+- Per-user opt-in list, guild allowlist + auto-opt-in by guild, channel allow/block, cooldown, history length.
 - Gemini-generated roast (toggle `roast.use_ai`) with fallback generator.
 - Menu controls + Gemini diagnostic + live JSON editor.
+- Commands: `!roast_whitelist_guild` and `!roast_whitelist_users` for mass enablement.
 
 ## Gate / Onboarding
 - Password gate with per-user private channel and 3 attempts; quarantine role handling.

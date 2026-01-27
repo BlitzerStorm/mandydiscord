@@ -54,6 +54,8 @@ DEFAULT_JSON: Dict[str, Any] = {
         "max_history": 5,
         "cooldown_seconds": 20,
         "opt_in_users": [],
+        "allowed_guilds": [],
+        "auto_opt_in_guilds": [],
         "allowed_channels": [],
         "blocked_channels": [],
         "style": "playful",
