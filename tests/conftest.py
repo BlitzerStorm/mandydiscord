@@ -51,6 +51,10 @@ def _install_discord_stubs():
     class DummyTextChannel:
         pass
 
+    class DummyPCMVolumeTransformer:
+        def __init__(self, source):
+            self.source = source
+
     class DummyUser:
         def __init__(self, user_id):
             self.id = user_id
@@ -88,6 +92,7 @@ def _install_discord_stubs():
     discord.ButtonStyle = types.SimpleNamespace(primary=1, danger=2, success=3, secondary=4)
     discord.SelectOption = DummySelectOption
     discord.TextChannel = DummyTextChannel
+    discord.PCMVolumeTransformer = DummyPCMVolumeTransformer
     discord.Client = object
     discord.abc = types.SimpleNamespace(Messageable=object)
     discord.User = DummyUser
