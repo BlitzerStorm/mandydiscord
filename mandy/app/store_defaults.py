@@ -29,6 +29,7 @@ DEFAULT_JSON: Dict[str, Any] = {
     "permissions": {},
     "gate": {},
     "mirror_fail_threshold": config.MIRROR_FAIL_THRESHOLD,
+    "mirror_disable_ttl": 7 * 24 * 3600,
     "logs": {"system": None, "audit": None, "debug": None, "mirror": None, "ai": None, "voice": None},
     "command_channels": {"user": "command-requests", "god": "admin-chat", "mode": "off"},
     "menu_messages": {},

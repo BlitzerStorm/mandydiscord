@@ -215,6 +215,8 @@ class MandyAITests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bot = DummyBot()
         self.mandy = MandyAI(self.bot)
+        self.mandy._intelligence = None
+        self.mandy._intelligent_processor = None
         self.channel = DummyChannel()
         self.guild = sys.modules["discord"].Guild(1, members=[])
         self.user = sys.modules["discord"].User(999)

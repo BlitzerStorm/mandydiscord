@@ -164,6 +164,7 @@ Quick reference lives in `COMMANDS.md`. The highlights:
 - `!setup_bio` also re-ensures roles, quarantine permissions, and guest permissions in the admin hub after rebuild.
 - Manual auto-upload: when enabled, Mandy posts the latest `docs/MANDY_MANUAL.md` to `#manual-for-living` (tracked by file hash).
 - `!leavevc`: emergency voice disconnect (SUPERUSER only)
+- `!cancel`: cancels running background tasks/loops (SUPERUSER only)
 - `!health`: health snapshot (level >= 70)
 - `#diagnostics`: auto-updated status board every 10 minutes
 
@@ -175,6 +176,7 @@ Quick reference lives in `COMMANDS.md`. The highlights:
 - `!mirroraddscope <server|category|channel> <source_id> <target_channel_id>` (level >= 70)
 - `!mirrorremove <source_channel_id> [simulate]` (level >= 70)
 - `!dmopen <user_id>` / `!dmclose <user_id>` (admin hub only, level >= 70)
+- `!dmai on|off|status|list <user_id|@user|#channel|this>`: per-user DM AI control (admin hub only, GOD)
 - `!setlogs <system|audit|debug|mirror|ai|voice> <channel_id>` (level >= 90)
 
 ### Roast Mode (opt-in only)
@@ -242,6 +244,8 @@ Commands:
 - `!mandy_cancel <job_id>`: cancel a job
 - `!mandy_limits`: show cooldown + usage counters
 - `!mandy_power on|off|status`: toggle power mode (removes local cooldown + confirmation prompts)
+- `!mandy extensions`: list installed tool extensions
+- `!mandy selftest`: run a quick AI/tool self-test
 
 ### Prompting tips
 Fast Path examples:
@@ -414,6 +418,7 @@ Top-level keys you will edit most often:
 - `targets`: watchers (JSON)
 - `mirror_rules`: mirrors (unified rules)
 - `mirrors.interactive_controls_enabled`: mirror buttons in admin hub
+- `mirror_disable_ttl`: seconds before a disabled mirror rule is auto-deleted
 - `dm_bridges`: DM bridge state
 - `ark_snapshots`, `phoenix_keys`, `memory`, `onboarding`
 - `layout`, `channel_topics`, `pinned_text`: what `!setup` creates and pins
