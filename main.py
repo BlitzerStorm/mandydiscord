@@ -21,6 +21,7 @@ import os
 import random
 import re
 import time
+from contextvars import ContextVar
 import datetime
 import hashlib
 from typing import Optional, Dict, Any, List, Tuple, Set
@@ -320,6 +321,8 @@ def update_presence_activity_ts(message_ts: int) -> None:
 def update_super_interaction_ts(message_ts: int) -> None:
     presence_config()["last_super_interaction_ts"] = message_ts
 
+COMMAND_CONTEXT = ContextVar("mandy_command_context", default=False)
+
 def typing_delay_seconds() -> float:
     try:
         return max(0.0, float(cfg().get("typing_delay_seconds", 5.0)))
@@ -348,6 +351,20 @@ async def typing_delay(channel: discord.abc.Messageable, seconds: Optional[float
 TYPING_DELAY_PATCHED = False
 _ORIG_MESSAGEABLE_SEND = None
 
+def _skip_typing_for_channel(channel: discord.abc.Messageable) -> bool:
+    if COMMAND_CONTEXT.get():
+        return True
+    if isinstance(channel, discord.TextChannel):
+        channels_cfg = cfg().get("command_channels", {})
+        god_channel = str(channels_cfg.get("god", "admin-chat"))
+        if channel.guild and channel.guild.id == ADMIN_GUILD_ID and channel.name == god_channel:
+            return True
+        logs = cfg().get("logs", {}) if isinstance(cfg().get("logs", {}), dict) else {}
+        log_ids = {int(v) for v in logs.values() if str(v).isdigit()}
+        if channel.id in log_ids:
+            return True
+    return False
+
 def install_typing_delay_patch() -> None:
     global TYPING_DELAY_PATCHED, _ORIG_MESSAGEABLE_SEND
     if TYPING_DELAY_PATCHED:
@@ -356,7 +373,8 @@ def install_typing_delay_patch() -> None:
 
     async def _patched_send(self, *args, **kwargs):
         try:
-            await typing_delay(self)
+            if not _skip_typing_for_channel(self):
+                await typing_delay(self)
         except Exception:
             pass
         return await _ORIG_MESSAGEABLE_SEND(self, *args, **kwargs)
@@ -7055,6 +7073,23 @@ async def on_ready():
         )
     if auto_backfill_enabled():
         spawn_task(backfill_chat_stats_all_guilds(), "stats")
+
+@bot.before_invoke
+async def _before_command_invoke(ctx: commands.Context):
+    try:
+        ctx._typing_delay_token = COMMAND_CONTEXT.set(True)
+    except Exception:
+        ctx._typing_delay_token = None
+
+@bot.after_invoke
+async def _after_command_invoke(ctx: commands.Context):
+    try:
+        token = getattr(ctx, "_typing_delay_token", None)
+        if token is not None:
+            COMMAND_CONTEXT.reset(token)
+    except Exception:
+        pass
+
 
     await audit(SUPER_USER_ID, "Mandy OS online", {"mysql": bool(state.POOL)})
     config_reload.start()
