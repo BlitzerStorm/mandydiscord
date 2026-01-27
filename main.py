@@ -320,6 +320,44 @@ def update_presence_activity_ts(message_ts: int) -> None:
 def update_super_interaction_ts(message_ts: int) -> None:
     presence_config()["last_super_interaction_ts"] = message_ts
 
+def typing_delay_seconds() -> float:
+    try:
+        return max(0.0, float(cfg().get("typing_delay_seconds", 5.0)))
+    except Exception:
+        return 5.0
+
+async def typing_delay(channel: discord.abc.Messageable, seconds: Optional[float] = None) -> None:
+    delay = typing_delay_seconds() if seconds is None else max(0.0, float(seconds))
+    if delay <= 0:
+        return
+    try:
+        if hasattr(channel, "typing"):
+            async with channel.typing():
+                await asyncio.sleep(delay)
+        else:
+            await asyncio.sleep(delay)
+    except Exception:
+        return
+
+TYPING_DELAY_PATCHED = False
+_ORIG_MESSAGEABLE_SEND = None
+
+def install_typing_delay_patch() -> None:
+    global TYPING_DELAY_PATCHED, _ORIG_MESSAGEABLE_SEND
+    if TYPING_DELAY_PATCHED:
+        return
+    _ORIG_MESSAGEABLE_SEND = discord.abc.Messageable.send
+
+    async def _patched_send(self, *args, **kwargs):
+        try:
+            await typing_delay(self)
+        except Exception:
+            pass
+        return await _ORIG_MESSAGEABLE_SEND(self, *args, **kwargs)
+
+    discord.abc.Messageable.send = _patched_send
+    TYPING_DELAY_PATCHED = True
+
 def _any_member_online() -> bool:
     if not bot or not bot.intents.presences:
         return False
@@ -338,13 +376,8 @@ def _any_member_online() -> bool:
 def _presence_target_state(now: int) -> str:
     presence = presence_config()
     last_msg = int(presence.get("last_message_ts", 0) or 0)
-    last_super = int(presence.get("last_super_interaction_ts", 0) or 0)
     if last_msg and now - last_msg <= 300:
-        return "online"
-    if _any_member_online():
         return "idle"
-    if last_super and now - last_super <= 120:
-        return "dnd"
     return "invisible"
 
 def daily_reflection_cfg() -> Dict[str, Any]:
@@ -530,6 +563,25 @@ async def generate_roast_with_gemini(user: discord.abc.User, messages: List[str]
     except Exception:
         return None
 
+async def _recent_channel_context(channel: discord.abc.Messageable, limit: int = 10) -> List[str]:
+    if not hasattr(channel, "history"):
+        return []
+    lines: List[str] = []
+    try:
+        async for msg in channel.history(limit=max(1, min(20, int(limit)))):
+            if getattr(msg.author, "bot", False):
+                continue
+            content = (msg.content or "").strip()
+            if not content and getattr(msg, "attachments", None):
+                content = "[attachment]"
+            if not content:
+                continue
+            author = getattr(msg.author, "display_name", "user")
+            lines.append(f"{author}: {content[:200]}")
+    except Exception:
+        return []
+    return list(reversed(lines))
+
 def _json_preview(value: Any, max_len: int = 1800) -> str:
     try:
         text = json.dumps(value, indent=2, ensure_ascii=False)
@@ -561,7 +613,8 @@ async def maybe_roast_message(message: discord.Message) -> bool:
     if not roast_guild_allowed(message.guild.id):
         return False
     content = message.content or ""
-    if not roast_trigger_regex().search(content):
+    bot_mentioned = bool(bot.user and bot.user in getattr(message, "mentions", []))
+    if not bot_mentioned and not roast_trigger_regex().search(content):
         return False
     if not roast_intent(content):
         if not await _roast_intent_gemini(content):
@@ -587,7 +640,8 @@ async def maybe_roast_message(message: discord.Message) -> bool:
     max_history = int(roast_cfg().get("max_history", 5) or 5)
     max_history = max(1, min(20, max_history))
     recent = recent[-max_history:]
-    roast_text = await generate_roast_with_gemini(message.author, recent)
+    channel_context = await _recent_channel_context(message.channel, limit=10)
+    roast_text = await generate_roast_with_gemini(message.author, channel_context or recent)
     if not roast_text:
         roast_text = generate_playful_roast(message.author, recent)
     try:
@@ -4313,7 +4367,8 @@ class UserMenuView(BaseView):
     @discord.ui.button(label="Help", style=discord.ButtonStyle.primary)
     async def help_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "Use `!menu` for user tools and `!godmenu` for admin tools.",
+            "Use `!menu` for user tools and `!godmenu` for admin tools. "
+            "Roast: opt-in, then tag Mandy. Replies show a short typing delay.",
             ephemeral=True
         )
 
@@ -6919,6 +6974,7 @@ async def nuke(ctx: commands.Context, limit: int = 300, mode: str = "run"):
 @bot.event
 async def on_ready():
     await STORE.load()
+    install_typing_delay_patch()
     await maybe_load_mandy_extension(bot)
     try:
         if hasattr(bot, "mandy_plugin_manager"):
@@ -7038,6 +7094,8 @@ async def mirror_integrity_check():
         if disabled_at and age > purge_after:
             await mirror_rule_delete(rule, f"disabled > {purge_after}s")
             return
+    if not rule.get("enabled", True):
+        return
 
     # source guild missing
     src_gid = int(rule.get("source_guild", 0))

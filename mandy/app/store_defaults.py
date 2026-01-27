@@ -32,6 +32,7 @@ DEFAULT_JSON: Dict[str, Any] = {
     "mirror_disable_ttl": 7 * 24 * 3600,
     "logs": {"system": None, "audit": None, "debug": None, "mirror": None, "ai": None, "voice": None},
     "command_channels": {"user": "command-requests", "god": "admin-chat", "mode": "off"},
+    "typing_delay_seconds": 5.0,
     "menu_messages": {},
     "rbac": {"role_levels": config.ROLE_LEVEL_DEFAULTS.copy()},
     "auto": {"setup": True, "backfill": True, "backfill_limit": 50, "backfill_per_channel": 20, "backfill_delay": 0.2},
