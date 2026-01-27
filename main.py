@@ -2855,9 +2855,20 @@ async def apply_guest_permissions(guild: discord.Guild):
     guest = get_role(guild, GUEST_ROLE_NAME)
     if not guest:
         return
+    gate_cfg = cfg().get("gate_layout", {})
+    guest_category_name = str(gate_cfg.get("category") or "Guest Access")
+    guest_briefing_name = str(gate_cfg.get("guest_briefing") or "guest-briefing")
+    guest_chat_name = str(gate_cfg.get("guest_chat") or "guest-chat")
+    allow_channel_names = {guest_briefing_name, guest_chat_name}
     for cat in guild.categories:
         try:
-            if cat.name in ("Guest Access", "Welcome & Information"):
+            allow = cat.name == guest_category_name
+            if not allow:
+                for ch in cat.text_channels:
+                    if ch.name in allow_channel_names:
+                        allow = True
+                        break
+            if allow:
                 await cat.set_permissions(guest, view_channel=True, send_messages=True, read_message_history=True)
             else:
                 await cat.set_permissions(guest, view_channel=False)
@@ -2869,7 +2880,9 @@ async def apply_quarantine_permissions(guild: discord.Guild):
     quarantine = get_role(guild, QUARANTINE_ROLE_NAME)
     if not quarantine:
         return
-    ch = discord.utils.get(guild.text_channels, name="quarantine")
+    gate_cfg = cfg().get("gate_layout", {})
+    quarantine_name = str(gate_cfg.get("quarantine") or "quarantine")
+    ch = discord.utils.get(guild.text_channels, name=quarantine_name)
     if not ch:
         return
     try:
@@ -2940,7 +2953,9 @@ async def gate_quarantine_user(member: discord.Member, reason: str = ""):
                     await ch.delete()
                 except Exception:
                     pass
-    qch = discord.utils.get(member.guild.text_channels, name="quarantine")
+    gate_cfg = cfg().get("gate_layout", {})
+    quarantine_name = str(gate_cfg.get("quarantine") or "quarantine")
+    qch = discord.utils.get(member.guild.text_channels, name=quarantine_name)
     if qch:
         try:
             await qch.send(f"Quarantine: <@{member.id}> {reason}".strip())
@@ -2962,9 +2977,11 @@ async def start_gate(member: discord.Member):
             pass
 
     # Create a private gate channel
-    cat = discord.utils.get(member.guild.categories, name="Guest Access")
+    gate_cfg = cfg().get("gate_layout", {})
+    guest_category_name = str(gate_cfg.get("category") or "Guest Access")
+    cat = discord.utils.get(member.guild.categories, name=guest_category_name)
     if not cat:
-        cat = await member.guild.create_category("Guest Access")
+        cat = await member.guild.create_category(guest_category_name)
 
     overwrites = {
         member.guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -3193,6 +3210,18 @@ async def ensure_menu_panels(guild: discord.Guild):
 
 async def ensure_log_channels(guild: discord.Guild):
     logs = cfg().setdefault("logs", {})
+    ai_layout = cfg().get("ai_layout", {})
+    ai_logs = ai_layout.get("log_channels") if isinstance(ai_layout, dict) else {}
+    if ai_layout.get("enabled") and isinstance(ai_logs, dict) and ai_logs:
+        for key, name in ai_logs.items():
+            if not name:
+                continue
+            ch = find_text_by_name(guild, name)
+            if ch:
+                logs[key] = ch.id
+        await STORE.mark_dirty()
+        return
+
     system = find_text_by_name(guild, "system-logs")
     audit_ch = find_text_by_name(guild, "audit-logs") or system
     debug_ch = find_text_by_name(guild, "debug-logs") or system
@@ -3370,8 +3399,292 @@ async def ensure_layout_defaults() -> Dict[str, List[str]]:
         await STORE.mark_dirty()
     return cats
 
+def _ai_layout_enabled() -> bool:
+    return bool(cfg().get("ai_layout", {}).get("enabled"))
+
+def _sanitize_channel_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9\\- ]+", "", str(name or "").lower())
+    cleaned = cleaned.replace(" ", "-")
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+    if not cleaned:
+        cleaned = "channel"
+    return cleaned[:90]
+
+def _normalize_ai_layout(payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    categories = payload.get("categories")
+    if not isinstance(categories, list) or not categories:
+        return None
+    layout: Dict[str, List[str]] = {}
+    used: Set[str] = set()
+    purpose_map: Dict[str, str] = {}
+    for cat in categories:
+        cat_name = str(cat.get("name") or "").strip()
+        if not cat_name:
+            continue
+        channels = cat.get("channels") or []
+        if not isinstance(channels, list):
+            continue
+        cleaned_channels: List[str] = []
+        for ch in channels:
+            purpose = ""
+            if isinstance(ch, str):
+                ch_name_raw = ch
+            elif isinstance(ch, dict):
+                ch_name_raw = ch.get("name")
+                purpose = str(ch.get("purpose") or "").strip().lower()
+            else:
+                continue
+            ch_name = _sanitize_channel_name(str(ch_name_raw or ""))
+            if ch_name in used:
+                continue
+            used.add(ch_name)
+            cleaned_channels.append(ch_name)
+            if purpose:
+                purpose_map[purpose] = ch_name
+        if cleaned_channels:
+            layout[cat_name] = cleaned_channels
+    if not layout:
+        return None
+
+    log_map = payload.get("log_channels") if isinstance(payload.get("log_channels"), dict) else {}
+    cmd_map = payload.get("command_channels") if isinstance(payload.get("command_channels"), dict) else {}
+    gate_map = payload.get("gate") if isinstance(payload.get("gate"), dict) else {}
+    topics = payload.get("topics") if isinstance(payload.get("topics"), dict) else {}
+    pins = payload.get("pins") if isinstance(payload.get("pins"), dict) else {}
+
+    def purpose_fallback(key: str, *aliases: str) -> Optional[str]:
+        if key in purpose_map:
+            return purpose_map[key]
+        for alias in aliases:
+            if alias in purpose_map:
+                return purpose_map[alias]
+        return None
+
+    required_cmd = {
+        "user": ["command_user", "cmd_user", "menu_user"],
+        "god": ["command_god", "cmd_god", "menu_god", "admin_command"],
+    }
+    required_logs = {
+        "system": ["log_system", "system_log", "logs_system"],
+        "audit": ["log_audit", "audit_log"],
+        "debug": ["log_debug", "debug_log"],
+        "mirror": ["log_mirror", "mirror_log"],
+        "ai": ["log_ai", "ai_log"],
+        "voice": ["log_voice", "voice_log"],
+    }
+    required_gate = {
+        "category": ["gate_category", "guest_category"],
+        "guest_chat": ["guest_chat", "gate_chat"],
+        "guest_briefing": ["guest_briefing", "guest_info", "guest_rules"],
+        "quarantine": ["quarantine", "gate_quarantine"],
+    }
+
+    cmd: Dict[str, str] = {}
+    for key, aliases in required_cmd.items():
+        val = cmd_map.get(key) if cmd_map else None
+        if not val:
+            val = purpose_fallback(aliases[0], *aliases[1:])
+        if val:
+            cmd[key] = _sanitize_channel_name(val)
+
+    logs: Dict[str, str] = {}
+    for key, aliases in required_logs.items():
+        val = log_map.get(key) if log_map else None
+        if not val:
+            val = purpose_fallback(aliases[0], *aliases[1:])
+        if val:
+            logs[key] = _sanitize_channel_name(val)
+
+    gate: Dict[str, str] = {}
+    for key, aliases in required_gate.items():
+        val = gate_map.get(key) if gate_map else None
+        if not val:
+            val = purpose_fallback(aliases[0], *aliases[1:])
+        if val:
+            gate[key] = val if key == "category" else _sanitize_channel_name(val)
+
+    required_channels = set(cmd.values()) | set(logs.values())
+    for key in ("guest_chat", "guest_briefing", "quarantine"):
+        if gate.get(key):
+            required_channels.add(gate[key])
+    required_channels.discard("")
+    missing = [ch for ch in required_channels if ch not in used]
+    if missing:
+        fallback_cat = next(iter(layout.keys()))
+        layout[fallback_cat].extend([ch for ch in missing if ch not in layout[fallback_cat]])
+        used.update(missing)
+
+    out_topics: Dict[str, str] = {}
+    for name, text in topics.items():
+        ch_name = _sanitize_channel_name(str(name))
+        if ch_name in used and isinstance(text, str) and text.strip():
+            out_topics[ch_name] = _sanitize_topic(text)
+    out_pins: Dict[str, str] = {}
+    for name, text in pins.items():
+        ch_name = _sanitize_channel_name(str(name))
+        if ch_name in used and isinstance(text, str) and text.strip():
+            out_pins[ch_name] = _sanitize_pin(text)
+
+    return {
+        "layout": layout,
+        "channels": sorted(used),
+        "command_channels": cmd,
+        "log_channels": logs,
+        "gate": gate,
+        "topics": out_topics,
+        "pins": out_pins,
+    }
+
+async def _generate_setup_ai_layout(guild: discord.Guild) -> Optional[Dict[str, Any]]:
+    client = _mandy_ai_client()
+    if not client or not getattr(client, "available", False):
+        return None
+    ai = ai_cfg()
+    model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
+    system_prompt = (
+        "You are Mandy's sentient core. Output JSON only. "
+        "Design a Discord server layout with AI-generated category/channel names. "
+        "Names must be lowercase-with-hyphens. No emojis."
+    )
+    user_prompt = (
+        "Return JSON with keys:\n"
+        "- categories: list of {name, channels:[{name, purpose}]}.\n"
+        "- command_channels: {user, god} channel names.\n"
+        "- log_channels: {system, audit, debug, mirror, ai, voice} channel names.\n"
+        "- gate: {category, guest_chat, guest_briefing, quarantine}.\n"
+        "- topics: map channel name -> topic string (<=300 chars).\n"
+        "- pins: map channel name -> pinned text (<=1800 chars).\n"
+        "Constraints:\n"
+        "- 5 to 9 categories.\n"
+        "- 3 to 7 channels per category.\n"
+        "- Every required command/log/gate channel must exist in categories.\n"
+        "- All channel names unique.\n"
+        "- Use professional, coherent theme.\n"
+        "Output JSON only."
+    )
+    try:
+        text = await client.generate(system_prompt, user_prompt, model=model, response_format="json", timeout=80.0)
+        payload = json.loads(text or "{}")
+    except Exception as exc:
+        is_rate, retry_after = _is_ai_rate_limit(client, exc)
+        if is_rate:
+            raise SetupAiRateLimitError(retry_after=retry_after)
+        return None
+    return _normalize_ai_layout(payload)
+
+async def _resolve_setup_layout() -> Dict[str, List[str]]:
+    ai_layout = cfg().get("ai_layout", {})
+    layout = ai_layout.get("layout") if isinstance(ai_layout, dict) else None
+    if ai_layout.get("enabled") and isinstance(layout, dict) and layout:
+        return layout
+    return await ensure_layout_defaults()
+
+async def _setup_snapshot_inventory(guild: discord.Guild, reason: str = "") -> None:
+    if not guild:
+        return
+    snapshot = {
+        "ts": now_ts(),
+        "reason": reason,
+        "guild_id": guild.id,
+        "guild_name": guild.name,
+        "roles": [
+            {"id": r.id, "name": r.name, "position": r.position, "members": len(r.members)}
+            for r in sorted(guild.roles, key=lambda r: r.position, reverse=True)
+        ],
+        "members": [
+            {"id": m.id, "name": m.name, "bot": m.bot, "roles": [r.id for r in m.roles]}
+            for m in guild.members
+        ],
+        "categories": [
+            {"id": c.id, "name": c.name, "channels": [ch.name for ch in c.channels]}
+            for c in guild.categories
+        ],
+        "channels": [ch.name for ch in guild.channels if isinstance(ch, discord.TextChannel)],
+    }
+    inv = cfg().setdefault("setup_inventory", [])
+    if isinstance(inv, list):
+        inv.append(snapshot)
+        if len(inv) > 3:
+            del inv[:-3]
+    await STORE.mark_dirty()
+    await setup_log(
+        f"Setup inventory snapshot saved ({reason}): roles={len(snapshot['roles'])} members={len(snapshot['members'])} channels={len(snapshot['channels'])}"
+    )
+
+async def _purge_setup_dms(user_id: int) -> None:
+    if not user_id:
+        return
+    try:
+        await dm_ai_disable(user_id, reason="setup_purge", actor_id=SUPER_USER_ID)
+    except Exception:
+        pass
+    try:
+        info = await dm_bridge_get(user_id)
+        ch_ids = set()
+        if info and int(info.get("channel_id", 0)):
+            ch_ids.add(int(info.get("channel_id", 0)))
+        admin = bot.get_guild(ADMIN_GUILD_ID)
+        if admin:
+            archived = discord.utils.get(admin.text_channels, name=f"archived-dm-{user_id}")
+            if archived:
+                ch_ids.add(archived.id)
+        for ch_id in ch_ids:
+            ch = bot.get_channel(ch_id)
+            if not ch:
+                try:
+                    ch = await bot.fetch_channel(ch_id)
+                except Exception:
+                    ch = None
+            if ch:
+                try:
+                    await ch.delete()
+                except Exception:
+                    pass
+        if state.POOL:
+            try:
+                await db_exec("DELETE FROM dm_bridges WHERE user_id=%s", (user_id,))
+            except Exception:
+                pass
+        cfg().setdefault("dm_bridges", {}).pop(str(user_id), None)
+        await STORE.mark_dirty()
+    except Exception:
+        pass
+    try:
+        user = bot.get_user(user_id)
+        if not user:
+            user = await bot.fetch_user(user_id)
+        dm = user.dm_channel or await user.create_dm()
+        async for msg in dm.history(limit=100):
+            if msg.author and bot.user and msg.author.id == bot.user.id:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+async def _setup_lockdown_all_except(guild: discord.Guild, allow_user_id: int) -> None:
+    if not guild or guild.id != ADMIN_GUILD_ID:
+        return
+    await ensure_roles(guild)
+    await apply_guest_permissions(guild)
+    await apply_quarantine_permissions(guild)
+    gate_state = cfg().get("gate", {}) or {}
+    for member in guild.members:
+        if member.bot or member.id == allow_user_id:
+            continue
+        if str(member.id) in gate_state:
+            continue
+        try:
+            await start_gate(member)
+            await setup_pause()
+        except Exception:
+            continue
+
 async def setup_fullsync(guild: discord.Guild):
-    layout = await ensure_layout_defaults()
+    layout = await _resolve_setup_layout()
     pins = cfg().get("pinned_text", {})
     topics = cfg().get("channel_topics", {})
 
@@ -3603,6 +3916,8 @@ async def run_full_setup(guild: discord.Guild, mode: str, actor_id: int = 0):
         return
     await setup_log(f"Full setup requested: {mode} by {actor_id}")
     try:
+        await _purge_setup_dms(SUPER_USER_ID)
+        await _setup_snapshot_inventory(guild, reason=f"setup_start:{mode}")
         async with state.AUTO_SETUP_LOCK:
             if mode in ("destructive", "destructive_ai", "fullsync"):
                 if mode == "destructive_ai":
@@ -3620,7 +3935,15 @@ async def run_full_setup(guild: discord.Guild, mode: str, actor_id: int = 0):
                                 ai_ok = False
                     if not ai_ok:
                         await setup_log("AI rebuild unavailable; defaulting to standard destructive setup.")
-                ok = await setup_destructive(guild)
+                        mode = "destructive"
+                if mode == "destructive_ai":
+                    ok = await setup_destructive_ai(guild, actor_id=actor_id)
+                    if not ok:
+                        await setup_log("AI destructive setup failed; falling back to standard destructive setup.")
+                        mode = "destructive"
+                        ok = await setup_destructive(guild)
+                else:
+                    ok = await setup_destructive(guild)
                 if not ok:
                     await setup_log("Full setup aborted due to incomplete cleanup.")
                     return
@@ -3636,6 +3959,7 @@ async def run_full_setup(guild: discord.Guild, mode: str, actor_id: int = 0):
                 await mirror_rules_sync()
             except Exception as e:
                 await setup_log(f"Mirror rule sync failed: {e}")
+            await _setup_lockdown_all_except(guild, SUPER_USER_ID)
         try:
             await send_setup_debrief(trigger=mode)
         except Exception as e:
@@ -3658,6 +3982,101 @@ async def run_auto_setup_with_debrief(actor_id: int = 0):
         await setup_log("Auto setup completed")
     except Exception as e:
         await setup_log(f"Auto setup failed: {e}")
+
+async def _purge_all_channels(guild: discord.Guild) -> bool:
+    passes = 3
+    for attempt in range(passes):
+        deleted = 0
+        for ch in list(guild.channels):
+            try:
+                await ch.delete()
+                deleted += 1
+                await setup_pause()
+            except Exception as exc:
+                await _setup_pause_on_rate_limit(exc)
+                continue
+        remaining = len(list(guild.channels))
+        await setup_log(f"AI cleanup pass {attempt + 1}/{passes}: removed={deleted} remaining={remaining}")
+        if remaining == 0:
+            return True
+        await asyncio.sleep(1)
+    return False
+
+async def _apply_ai_layout(guild: discord.Guild, layout_payload: Dict[str, Any]) -> None:
+    layout = layout_payload.get("layout") or {}
+    topics = layout_payload.get("topics") or {}
+    pins = layout_payload.get("pins") or {}
+    cmd = layout_payload.get("command_channels") or {}
+    logs = layout_payload.get("log_channels") or {}
+    gate = layout_payload.get("gate") or {}
+
+    for cat_name, chans in layout.items():
+        cat = await ensure_category(guild, cat_name)
+        for ch_name in chans:
+            await ensure_text_channel(guild, ch_name, cat, topic=topics.get(ch_name))
+
+    cfg().setdefault("layout", {})["categories"] = layout
+    cfg()["channel_topics"] = dict(topics)
+    cfg()["pinned_text"] = dict(pins)
+
+    channels_cfg = cfg().setdefault("command_channels", {})
+    if cmd.get("user"):
+        channels_cfg["user"] = cmd["user"]
+    if cmd.get("god"):
+        channels_cfg["god"] = cmd["god"]
+
+    gate_cfg = cfg().setdefault("gate_layout", {})
+    for key in ("category", "guest_chat", "guest_briefing", "quarantine"):
+        if gate.get(key):
+            gate_cfg[key] = gate[key]
+
+    ai_cfg_state = cfg().setdefault("ai_layout", {})
+    ai_cfg_state["enabled"] = True
+    ai_cfg_state["layout"] = layout
+    ai_cfg_state["log_channels"] = logs
+    ai_cfg_state["command_channels"] = cmd
+    ai_cfg_state["gate"] = gate_cfg
+    ai_cfg_state["updated_at"] = now_ts()
+
+    await STORE.mark_dirty()
+
+    await ensure_menu_panels(guild)
+    await ensure_log_channels(guild)
+    for ch_name, content in pins.items():
+        ch = find_text_by_name(guild, ch_name)
+        if ch:
+            await ensure_pinned(ch, content)
+
+async def setup_destructive_ai(guild: discord.Guild, actor_id: int = 0) -> bool:
+    if guild.id != ADMIN_GUILD_ID:
+        return False
+    await setup_log("Phase 0/4: AI destructive cleanup starting")
+    try:
+        layout_payload = await _generate_setup_ai_layout(guild)
+    except SetupAiRateLimitError:
+        layout_payload = None
+    if not layout_payload:
+        await setup_log("AI layout generation failed.")
+        return False
+
+    cfg().setdefault("ai_layout", {})["enabled"] = True
+    await STORE.mark_dirty()
+
+    ok = await _purge_all_channels(guild)
+    if not ok:
+        await setup_log("AI cleanup incomplete; aborting rebuild.")
+        return False
+    await setup_log("Phase 0/4: AI destructive cleanup done")
+
+    await _apply_ai_layout(guild, layout_payload)
+
+    if guild.id == ADMIN_GUILD_ID:
+        await ensure_roles(guild)
+        await apply_guest_permissions(guild)
+        await apply_quarantine_permissions(guild)
+
+    await setup_log("Phase 3/4: AI setup complete for this server")
+    return True
 
 def _managed_setup_categories(guild: discord.Guild) -> Set[str]:
     managed = set(cfg().get("layout", {}).get("categories", {}).keys())
@@ -4166,6 +4585,8 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
     if guild.id != ADMIN_GUILD_ID:
         return
     await setup_log(f"BIO-GENESIS :: REQUESTED by {actor_id}")
+    await _purge_setup_dms(SUPER_USER_ID)
+    await _setup_snapshot_inventory(guild, reason="setup_bio_start")
     prev_adaptive = state.SETUP_ADAPTIVE_ACTIVE
     prev_override = state.SETUP_DELAY_OVERRIDE
     paused_state: Optional[Dict[str, Any]] = None
@@ -4281,6 +4702,7 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
                 await send_setup_debrief(trigger="bio")
             except Exception:
                 pass
+            await _setup_lockdown_all_except(guild, SUPER_USER_ID)
     except Exception as exc:
         await setup_log(f"BIO-GENESIS failed: {exc}")
     finally:

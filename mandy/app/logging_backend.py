@@ -146,6 +146,27 @@ async def ensure_debug_channel() -> Optional[discord.TextChannel]:
     admin = state.bot.get_guild(config.ADMIN_GUILD_ID)
     if not admin:
         return None
+    ai_layout = cfg().get("ai_layout", {})
+    if isinstance(ai_layout, dict) and ai_layout.get("enabled"):
+        logs = cfg().get("logs", {})
+        ch_id = logs.get("debug")
+        if ch_id:
+            ch = admin.get_channel(int(ch_id))
+            if ch:
+                return ch
+            try:
+                ch = await state.bot.fetch_channel(int(ch_id))
+                if ch:
+                    return ch
+            except Exception:
+                pass
+        ai_logs = ai_layout.get("log_channels") if isinstance(ai_layout.get("log_channels"), dict) else {}
+        name = ai_logs.get("debug") if ai_logs else None
+        if name:
+            ch = discord.utils.get(admin.text_channels, name=name)
+            if ch:
+                return ch
+        return None
     ch = discord.utils.get(admin.text_channels, name="debug-logs")
     if ch:
         return ch
@@ -184,4 +205,3 @@ async def setup_log(text: str):
             await ch.send(text[:1900])
         except Exception:
             pass
-

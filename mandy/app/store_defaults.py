@@ -28,6 +28,12 @@ DEFAULT_JSON: Dict[str, Any] = {
     "ambient_engine": {"enabled": True, "last_typing": 0, "last_presence": 0},
     "permissions": {},
     "gate": {},
+    "gate_layout": {
+        "category": "Guest Access",
+        "guest_chat": "guest-chat",
+        "guest_briefing": "guest-briefing",
+        "quarantine": "quarantine",
+    },
     "mirror_fail_threshold": config.MIRROR_FAIL_THRESHOLD,
     "mirror_disable_ttl": 7 * 24 * 3600,
     "logs": {"system": None, "audit": None, "debug": None, "mirror": None, "ai": None, "voice": None},
@@ -50,6 +56,7 @@ DEFAULT_JSON: Dict[str, Any] = {
         "installed_extensions": [],
     },
     "mandy": {"mention_dm_cooldowns": {}, "power_mode": True},
+    "ai_layout": {"enabled": False, "layout": {}, "log_channels": {}, "command_channels": {}, "gate": {}, "updated_at": 0},
     "roast": {
         "enabled": False,
         "trigger_word": "mandy",
