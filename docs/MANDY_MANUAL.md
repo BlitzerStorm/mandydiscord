@@ -150,6 +150,9 @@ Quick reference lives in `COMMANDS.md`. The highlights:
 ### Menus
 - `!menu`: user menu panel (level >= 10)
 - `!godmenu`: admin panel (level >= 90)
+- `!menu` -> Roast Opt-In: users can enable/disable playful roast mode for themselves.
+- `!godmenu` -> Roast Settings: manage roast allowlist, enable/disable roast mode, toggle Gemini, and run Gemini diagnostic.
+- `!godmenu` -> Live JSON Editor: edit any `database.json` path with JSON input.
 
 ### Setup / Ops (admin hub only)
 - `!setup`: opens a menu explaining Bootstrap vs Fullsync vs Destructive and starts the selected flow.
@@ -173,6 +176,12 @@ Quick reference lives in `COMMANDS.md`. The highlights:
 - `!mirrorremove <source_channel_id> [simulate]` (level >= 70)
 - `!dmopen <user_id>` / `!dmclose <user_id>` (admin hub only, level >= 70)
 - `!setlogs <system|audit|debug|mirror|ai|voice> <channel_id>` (level >= 90)
+
+### Roast Mode (opt-in only)
+- Trigger: any message that matches a regex variant of “mandy” and includes roast intent (e.g., “roast me”, “insult”, “make fun”, “diss”).
+- Only users in the opt-in list can be roasted.
+- Cooldown and channel allow/block lists apply.
+- Gemini roast generation is optional and can be toggled in Roast Settings.
 
 ### Stats
 - `!mystats [daily|weekly|monthly|yearly|rolling24]`

@@ -179,563 +179,18 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 state.bot = bot
 
 # -----------------------------
-# RBAC
-# -----------------------------
-def is_super(uid: int) -> bool:
-    return uid == SUPER_USER_ID
 
-async def get_user_level(uid: int) -> int:
-    if uid == SUPER_USER_ID:
-        return 100
-    if uid == AUTO_GOD_ID:
-        return 90
+from mandy.app.main_rbac import (
+    effective_level,
+    get_user_level,
+    is_super,
+    mandy_power_mode_enabled,
+    require_level_ctx,
+    role_level_map,
+)
+from mandy.app.main_tools import ToolRegistry, attach_mandy_context, maybe_load_mandy_extension
+from mandy.app.main_ux import safe_ctx_send, safe_delete, say_clean, temp_reply
 
-    # Prefer MySQL if enabled
-    if state.POOL:
-        row = await db_one("SELECT level FROM users_permissions WHERE user_id=%s", (uid,))
-        if row:
-            return int(row["level"])
-
-    # fallback json
-    return int(cfg().get("permissions", {}).get(str(uid), 0))
-
-def role_level_map() -> Dict[str, int]:
-    return cfg().get("rbac", {}).get("role_levels", {}) or {}
-
-async def effective_level(member: discord.abc.User) -> int:
-    lvl = await get_user_level(member.id)
-    if isinstance(member, discord.Member):
-        mp = role_level_map()
-        max_role = 0
-        for r in member.roles:
-            max_role = max(max_role, int(mp.get(r.name, 0)))
-        lvl = max(lvl, max_role)
-    return lvl
-
-def mandy_power_mode_enabled(_: Optional[discord.abc.User] = None) -> bool:
-    mandy = cfg().get("mandy", {}) or {}
-    return bool(mandy.get("power_mode", False))
-
-async def require_level_ctx(ctx: commands.Context, min_level: int) -> bool:
-    lvl = await effective_level(ctx.author)
-    if lvl >= min_level:
-        return True
-    try:
-        await ctx.message.delete()
-    except Exception:
-        pass
-    return False
-
-# -----------------------------
-# Clean UX helpers
-# -----------------------------
-async def safe_delete(msg: discord.Message):
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-
-async def say_clean(ctx: commands.Context, content: str):
-    # delete command message then post
-    await safe_delete(ctx.message)
-    return await ctx.send(content)
-
-async def safe_ctx_send(ctx: commands.Context, content: str, delete_after: Optional[float] = None):
-    try:
-        return await ctx.send(content, delete_after=delete_after)
-    except discord.NotFound:
-        try:
-            return await ctx.author.send(content)
-        except Exception:
-            return None
-    except Exception:
-        return None
-
-
-async def temp_reply(ctx: commands.Context, content: str, ttl: Optional[int] = CLEANUP_RESPONSE_TTL):
-    """Send a short-lived reply to keep channels cleaner."""
-    return await safe_ctx_send(ctx, content, delete_after=ttl)
-
-# -----------------------------
-# Mandy AI tools
-# -----------------------------
-class ToolRegistry:
-    def __init__(self, bot_ref: commands.Bot):
-        self.bot = bot_ref
-        self.dynamic_tools: Dict[str, Dict[str, Any]] = {}
-
-    def register_dynamic_tool(self, name: str, meta: Dict[str, Any]) -> None:
-        self.dynamic_tools[name] = meta
-
-    def unregister_dynamic_tool(self, name: str) -> None:
-        self.dynamic_tools.pop(name, None)
-
-    def get_dynamic_tool(self, name: str) -> Optional[Dict[str, Any]]:
-        return self.dynamic_tools.get(name)
-
-    def list_dynamic_tools(self) -> List[str]:
-        return sorted(self.dynamic_tools.keys())
-
-    def _as_int(self, value: Any, name: str) -> int:
-        if isinstance(value, bool):
-            raise ValueError(f"{name} must be int")
-        try:
-            return int(value)
-        except Exception as exc:
-            raise ValueError(f"{name} must be int") from exc
-
-    def _as_text(self, value: Any, name: str, max_len: int) -> str:
-        if value is None:
-            raise ValueError(f"{name} must be str")
-        text = str(value)
-        if len(text) > max_len:
-            text = text[:max_len]
-        return text
-
-    async def send_message(self, channel_id: int, text: str):
-        ch_id = self._as_int(channel_id, "channel_id")
-        content = self._as_text(text, "text", 1900).strip()
-        if not content:
-            raise ValueError("text cannot be empty")
-        ch = self.bot.get_channel(ch_id)
-        if not ch:
-            try:
-                ch = await self.bot.fetch_channel(ch_id)
-            except Exception as exc:
-                raise ValueError("channel not found") from exc
-        if isinstance(ch, discord.TextChannel):
-            perms = ch.permissions_for(ch.guild.me)
-            if not perms.send_messages:
-                raise ValueError("missing send_messages permission")
-        try:
-            msg = await ch.send(content)
-            return {"message_id": msg.id}
-        except Exception as exc:
-            if "Forbidden" in str(exc) or "permission" in str(exc).lower():
-                await request_elevation("send_message", f"missing permission for channel {ch_id}", {"channel_id": ch_id})
-            raise ValueError(f"send failed: {exc}") from exc
-
-    async def reply_to_message(self, channel_id: int, message_id: int, text: str):
-        ch_id = self._as_int(channel_id, "channel_id")
-        msg_id = self._as_int(message_id, "message_id")
-        content = self._as_text(text, "text", 1900).strip()
-        if not content:
-            raise ValueError("text cannot be empty")
-        ch = self.bot.get_channel(ch_id)
-        if not ch:
-            try:
-                ch = await self.bot.fetch_channel(ch_id)
-            except Exception as exc:
-                raise ValueError("channel not found") from exc
-        try:
-            msg = await ch.fetch_message(msg_id)
-        except Exception as exc:
-            raise ValueError("message not found") from exc
-        try:
-            sent = await msg.reply(content)
-            return {"message_id": sent.id}
-        except Exception as exc:
-            raise ValueError(f"reply failed: {exc}") from exc
-
-    async def send_dm(self, user_id: int, text: str):
-        uid = self._as_int(user_id, "user_id")
-        content = self._as_text(text, "text", 1900).strip()
-        if not content:
-            raise ValueError("text cannot be empty")
-        user = self.bot.get_user(uid)
-        if not user:
-            try:
-                user = await self.bot.fetch_user(uid)
-            except Exception as exc:
-                raise ValueError("user not found") from exc
-        try:
-            msg = await user.send(content)
-            return {"message_id": msg.id}
-        except discord.Forbidden as exc:
-            raise ValueError("user blocked DMs") from exc
-        except Exception as exc:
-            raise ValueError(f"dm failed: {exc}") from exc
-
-    async def broadcast_message(self, channel: str, text: str, actor_id: int = 0):
-        channel_token = self._as_text(channel, "channel", 100).strip()
-        content = self._as_text(text, "text", 1900).strip()
-        if not channel_token:
-            raise ValueError("channel required")
-        if not content:
-            raise ValueError("text cannot be empty")
-
-        channel_id = parse_channel_id(channel_token)
-        sent = 0
-        failed = 0
-        targets = 0
-
-        if channel_id:
-            ch = self.bot.get_channel(channel_id)
-            if not ch:
-                try:
-                    ch = await self.bot.fetch_channel(channel_id)
-                except Exception as exc:
-                    raise ValueError("channel not found") from exc
-            if not isinstance(ch, discord.TextChannel):
-                raise ValueError("channel must be a text channel")
-            targets = 1
-            perms = ch.permissions_for(ch.guild.me)
-            if not perms.send_messages:
-                raise ValueError("missing send_messages permission")
-            try:
-                await ch.send(content)
-                sent = 1
-            except Exception as exc:
-                raise ValueError(f"send failed: {exc}") from exc
-            if actor_id:
-                await audit(actor_id, "Broadcast message", {"channel_id": channel_id, "sent": sent})
-            return {"sent": sent, "targets": targets, "failed": failed}
-
-        name = channel_token.lstrip("#").strip().lower()
-        if not name:
-            raise ValueError("channel required")
-        for guild in self.bot.guilds:
-            ch = None
-            for cand in guild.text_channels:
-                if cand.name.lower() == name:
-                    ch = cand
-                    break
-            if not ch:
-                continue
-            targets += 1
-            perms = ch.permissions_for(ch.guild.me)
-            if not perms.send_messages:
-                failed += 1
-                continue
-            try:
-                await ch.send(content)
-                sent += 1
-            except Exception:
-                failed += 1
-        if actor_id:
-            await audit(
-                actor_id,
-                "Broadcast message",
-                {"channel": name, "sent": sent, "targets": targets, "failed": failed},
-            )
-        return {"sent": sent, "targets": targets, "failed": failed}
-
-    async def broadcast_dm(self, text: str, guild: str = "", limit: int = 0, actor_id: int = 0):
-        content = self._as_text(text, "text", 1900).strip()
-        if not content:
-            raise ValueError("text cannot be empty")
-        guild_token = self._as_text(guild or "", "guild", 100).strip()
-        max_users = self._as_int(limit or 0, "limit") if limit else 0
-
-        def _norm(s: str) -> str:
-            return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
-
-        guilds = list(self.bot.guilds)
-        if guild_token:
-            gid = None
-            if guild_token.isdigit():
-                gid = int(guild_token)
-            if gid:
-                guilds = [g for g in guilds if g.id == gid]
-            else:
-                token_norm = _norm(guild_token)
-                exact = [g for g in guilds if _norm(g.name) == token_norm]
-                if exact:
-                    guilds = exact
-                else:
-                    contains = [g for g in guilds if token_norm and token_norm in _norm(g.name)]
-                    if len(contains) == 1:
-                        guilds = contains
-                    else:
-                        raise ValueError("guild not found (use exact name or guild id)")
-        if not guilds:
-            raise ValueError("guild not found")
-
-        sent = 0
-        failed = 0
-        targets = 0
-        seen: Set[int] = set()
-        for g in guilds:
-            for member in g.members:
-                if member.bot:
-                    continue
-                if member.id in seen:
-                    continue
-                seen.add(member.id)
-                targets += 1
-                try:
-                    await member.send(content)
-                    sent += 1
-                except Exception:
-                    failed += 1
-                if max_users and targets >= max_users:
-                    break
-            if max_users and targets >= max_users:
-                break
-        if actor_id:
-            await audit(
-                actor_id,
-                "Broadcast DM",
-                {
-                    "guild": guild_token or "all",
-                    "sent": sent,
-                    "targets": targets,
-                    "failed": failed,
-                    "limit": max_users,
-                },
-            )
-        return {"sent": sent, "targets": targets, "failed": failed}
-
-    async def close_dm_bridge(self, user_id: int, actor_id: int = 0):
-        uid = self._as_int(user_id, "user_id")
-        info = await dm_bridge_get(uid)
-        if not info:
-            alt_uid = await dm_bridge_user_for_channel(uid)
-            if alt_uid:
-                uid = int(alt_uid)
-                info = await dm_bridge_get(uid)
-        if not info:
-            raise ValueError("dm bridge not found")
-        await dm_bridge_close(uid)
-        if actor_id:
-            await audit(actor_id, "DM bridge close", {"user_id": uid})
-        return {"user_id": uid, "status": "closed"}
-
-    async def set_bot_status(self, state: str, text: str):
-        st = self._as_text(state, "state", 16)
-        msg = self._as_text(text, "text", 120)
-        await set_bot_status(st, msg)
-        return {"status": st, "text": msg}
-
-    async def get_recent_transcript(self, channel_id: int, limit: int = 50) -> List[Dict[str, Any]]:
-        ch_id = self._as_int(channel_id, "channel_id")
-        lim = max(1, min(80, self._as_int(limit, "limit")))
-        ch = self.bot.get_channel(ch_id)
-        if not ch:
-            try:
-                ch = await self.bot.fetch_channel(ch_id)
-            except Exception as exc:
-                raise ValueError("channel not found") from exc
-        if isinstance(ch, discord.TextChannel):
-            perms = ch.permissions_for(ch.guild.me)
-            if not perms.view_channel or not perms.read_message_history:
-                raise ValueError("missing read_message_history permission")
-        messages: List[Dict[str, Any]] = []
-        async for m in ch.history(limit=lim, oldest_first=False):
-            if not m:
-                continue
-            content = (m.content or "").strip()
-            messages.append({
-                "id": m.id,
-                "author_id": m.author.id,
-                "author": str(m.author),
-                "content": content,
-                "created_at": m.created_at.isoformat() if m.created_at else ""
-            })
-        messages.reverse()
-        return messages
-
-    async def add_watcher(self, target_user_id: int, count: int, text: str, actor_id: int = 0):
-        uid = self._as_int(target_user_id, "target_user_id")
-        threshold = self._as_int(count, "count")
-        msg = self._as_text(text or "", "text", 500)
-        if threshold < 1:
-            raise ValueError("count must be >= 1")
-        cfg().setdefault("targets", {})[str(uid)] = {"count": threshold, "current": 0, "text": msg}
-        await STORE.mark_dirty()
-        if actor_id:
-            await audit(actor_id, "Watcher set (json)", {"user_id": uid, "count": threshold})
-        return "JSON watcher saved."
-
-    async def remove_watcher(self, target_user_id: int, actor_id: int = 0):
-        uid = self._as_int(target_user_id, "target_user_id")
-        return await remove_watcher("json", uid, actor_id or 0)
-
-    async def list_watchers(self) -> str:
-        def fmt(uid, count, current, text):
-            return f"{uid} (<@{uid}>) | count={count} current={current} text={truncate(text, 120)}"
-
-        lines: List[str] = []
-        targets = cfg().get("targets", {})
-        for uid, data in targets.items():
-            lines.append(fmt(uid, data.get("count", 0), data.get("current", 0), data.get("text", "")))
-
-        if not lines:
-            return "No JSON watchers found."
-
-        header = f"JSON watchers ({len(lines)}):"
-        return header + "\n" + "\n".join(lines[:50])
-    async def list_mirror_rules(self) -> str:
-        rules = list(mirror_rules_dict().values())
-        if not rules:
-            return "No mirror rules."
-        lines: List[str] = []
-        for r in rules[:50]:
-            lines.append(f"{rule_summary(r)} ({'on' if r.get('enabled', True) else 'off'})")
-        header = f"Mirror rules ({len(rules)}):"
-        return header + "\n" + "\n".join(lines)
-
-    async def create_mirror(self, source_channel_id: int, target_channel_id: int, actor_id: int = 0):
-        src_id = self._as_int(source_channel_id, "source_channel_id")
-        dst_id = self._as_int(target_channel_id, "target_channel_id")
-        try:
-            src_ch = self.bot.get_channel(src_id) or await self.bot.fetch_channel(src_id)
-        except Exception as exc:
-            raise ValueError("source channel not found") from exc
-        if not isinstance(src_ch, discord.TextChannel):
-            raise ValueError("source channel must be a text channel")
-        try:
-            dst_ch = self.bot.get_channel(dst_id) or await self.bot.fetch_channel(dst_id)
-        except Exception as exc:
-            raise ValueError("target channel not found") from exc
-        if not isinstance(dst_ch, discord.TextChannel):
-            raise ValueError("target channel must be a text channel")
-
-        rule_id = make_rule_id("channel", src_id, dst_id)
-        rule = {
-            "rule_id": rule_id,
-            "scope": "channel",
-            "source_guild": src_ch.guild.id,
-            "source_id": src_id,
-            "target_channel": dst_id,
-            "enabled": True,
-            "fail_count": 0
-        }
-        await mirror_rule_save(rule)
-        if actor_id:
-            await audit(actor_id, "Mirror rule add (tool)", rule)
-        return "Mirror rule added."
-
-    async def disable_mirror_rule(self, rule_id: str, actor_id: int = 0):
-        rid = self._as_text(rule_id, "rule_id", 96).strip()
-        if not rid:
-            raise ValueError("rule_id required")
-        rule = mirror_rules_dict().get(rid)
-        if not rule:
-            raise ValueError("rule not found")
-        await mirror_rule_disable(rule, "disabled via mandy")
-        if actor_id:
-            await audit(actor_id, "Mirror rule disabled", {"rule_id": rid})
-        return "Mirror rule disabled."
-
-    async def show_stats(self, scope: str, user_id: Optional[int] = None, guild_id: Optional[int] = None) -> str:
-        window = normalize_stats_window(scope, "daily")
-        if window not in ("daily", "weekly", "monthly", "yearly", "rolling24"):
-            window = "daily"
-        now_dt = datetime.datetime.utcnow()
-
-        if user_id:
-            uid = self._as_int(user_id, "user_id")
-            if guild_id:
-                gid = self._as_int(guild_id, "guild_id")
-                guild = self.bot.get_guild(gid)
-                if not guild:
-                    raise ValueError("guild not found")
-                entry, changed = chat_stats_get_user_entry(guild, window, uid, now_dt)
-                if changed:
-                    await STORE.mark_dirty()
-                return (
-                    f"User stats ({window}) for {uid} in {guild.name}: "
-                    f"messages={int(entry.get('messages', 0))} words={int(entry.get('words', 0))} "
-                    f"sentences={int(entry.get('sentences', 0))} top_words={format_top_words(entry)}"
-                )
-
-            total = default_user_stats(int(now_dt.timestamp()))
-            for g in self.bot.guilds:
-                entry, changed = chat_stats_get_user_entry(g, window, uid, now_dt)
-                total["messages"] += int(entry.get("messages", 0))
-                total["words"] += int(entry.get("words", 0))
-                total["sentences"] += int(entry.get("sentences", 0))
-                for w, c in (entry.get("word_freq", {}) or {}).items():
-                    total["word_freq"][w] = int(total["word_freq"].get(w, 0)) + int(c)
-                if changed:
-                    await STORE.mark_dirty()
-            return (
-                f"User stats ({window}) for {uid}: "
-                f"messages={total['messages']} words={total['words']} sentences={total['sentences']} "
-                f"top_words={format_top_words(total)}"
-            )
-
-        totals, users, changed = aggregate_global_stats(window)
-        if changed:
-            await STORE.mark_dirty()
-        top_users = sorted(
-            ((int(uid), int(entry.get("messages", 0))) for uid, entry in users.items()),
-            key=lambda row: row[1],
-            reverse=True
-        )[:5]
-        top_lines = [f"{global_user_label(uid)} ({count})" for uid, count in top_users if count > 0]
-        top_text = ", ".join(top_lines) if top_lines else "None"
-        return (
-            f"Global stats ({window}): messages={totals.get('messages', 0)} "
-            f"words={totals.get('words', 0)} sentences={totals.get('sentences', 0)} "
-            f"active_users={totals.get('active_users', 0)} top_users={top_text}"
-        )
-
-    async def list_capabilities(self) -> str:
-        registry = getattr(self.bot, "mandy_registry", None) or CapabilityRegistry(self)
-        ai = ai_cfg()
-        installed = list(ai.get("installed_extensions", []) or [])
-        loaded = sorted(self.bot.extensions.keys())
-        for mod in loaded:
-            if mod not in installed:
-                installed.append(mod)
-        queue = ai.get("queue", {}) or {}
-        queue_counts = {"pending": 0, "waiting": 0, "running": 0}
-        for job in queue.values():
-            status = str(job.get("status", "pending"))
-            if status in queue_counts:
-                queue_counts[status] += 1
-        runtime = getattr(self.bot, "mandy_runtime", {}) or {}
-        counters = runtime.get("counters", {}) or {}
-
-        lines: List[str] = []
-        lines.append("Tools:")
-        lines.append(registry.format_tools_summary(include_args=False))
-        dynamic = registry._tool_registry.list_dynamic_tools() if registry else []
-        lines.append(f"Plugin tools: {', '.join(dynamic) if dynamic else 'none'}")
-        lines.append(f"Extensions: {', '.join(installed) if installed else 'none'}")
-        lines.append(
-            "Models: "
-            f"default={ai.get('default_model')} "
-            f"router={ai.get('router_model')} "
-            f"tts={ai.get('tts_model') or 'none'}"
-        )
-        lines.append(
-            "Queue: "
-            f"total={len(queue)} pending={queue_counts['pending']} "
-            f"waiting={queue_counts['waiting']} running={queue_counts['running']}"
-        )
-        if counters:
-            counter_text = " ".join(f"{k}={v}" for k, v in sorted(counters.items()))
-            lines.append(f"Counters: {counter_text}")
-        return "\n".join(lines)
-
-def attach_mandy_context():
-    bot.mandy_tools = ToolRegistry(bot)
-    bot.mandy_registry = CapabilityRegistry(bot.mandy_tools)
-    bot.mandy_runtime = {"counters": {}, "last_actions": [], "last_rate_limit": None}
-    bot.mandy_plugin_manager = ToolPluginManager(bot, bot.mandy_tools, log_to)
-    bot.mandy_cfg = cfg
-    bot.mandy_get_ai_config = ai_cfg
-    bot.mandy_api_key = GEMINI_API_KEY
-    bot.mandy_store = STORE
-    bot.mandy_audit = audit
-    bot.mandy_log_to = log_to
-    bot.mandy_dm_ai_is_enabled = dm_ai_is_enabled
-    bot.mandy_dm_bridge_user_for_channel = dm_bridge_user_for_channel
-    bot.mandy_power_mode_enabled = mandy_power_mode_enabled
-    bot.mandy_effective_level = effective_level
-    bot.mandy_require_level_ctx = require_level_ctx
-
-async def maybe_load_mandy_extension():
-    if state.MANDY_LOADED:
-        return
-    try:
-        await bot.load_extension(state.MANDY_EXTENSION)
-        state.MANDY_LOADED = True
-    except Exception as e:
-        await debug(f"Mandy AI extension failed to load: {e}")
 
 # -----------------------------
 # Helpers
@@ -919,6 +374,185 @@ def diagnostics_cfg() -> Dict[str, Any]:
 
 def manual_cfg() -> Dict[str, Any]:
     return cfg().setdefault("manual", {})
+
+def roast_cfg() -> Dict[str, Any]:
+    return cfg().setdefault("roast", {})
+
+def roast_enabled() -> bool:
+    return bool(roast_cfg().get("enabled", False))
+
+def roast_trigger_word() -> str:
+    return str(roast_cfg().get("trigger_word", "mandy") or "mandy").strip().lower()
+
+def roast_use_ai() -> bool:
+    return bool(roast_cfg().get("use_ai", True))
+
+def roast_trigger_regex() -> re.Pattern:
+    word = roast_trigger_word() or "mandy"
+    letters = [re.escape(ch) for ch in word if ch.strip()]
+    if not letters:
+        letters = list("mandy")
+    pattern = r"(?i)" + r"[\W_]*".join(letters)
+    return re.compile(pattern)
+
+def roast_intent(text: str) -> bool:
+    t = (text or "").lower()
+    if "roast me" in t or "roast" in t:
+        return True
+    if "insult" in t or "make fun" in t or "mock" in t or "trash me" in t:
+        return True
+    if "diss" in t or "clown me" in t:
+        return True
+    return False
+
+def roast_opt_in_users() -> Set[str]:
+    raw = roast_cfg().get("opt_in_users", []) or []
+    return {str(uid) for uid in raw}
+
+def roast_user_opted_in(user_id: int) -> bool:
+    return str(user_id) in roast_opt_in_users()
+
+def roast_channel_allowed(channel_id: int) -> bool:
+    cfg_roast = roast_cfg()
+    allowed = {int(x) for x in (cfg_roast.get("allowed_channels", []) or []) if str(x).isdigit()}
+    blocked = {int(x) for x in (cfg_roast.get("blocked_channels", []) or []) if str(x).isdigit()}
+    if channel_id in blocked:
+        return False
+    if allowed and channel_id not in allowed:
+        return False
+    return True
+
+def _roast_history_key(guild_id: int, user_id: int) -> str:
+    return f"{guild_id}:{user_id}"
+
+def record_roast_history(message: discord.Message) -> None:
+    if not message.guild:
+        return
+    content = (message.content or "").strip()
+    if not content:
+        return
+    runtime = getattr(bot, "mandy_runtime", None)
+    if not isinstance(runtime, dict):
+        return
+    history = runtime.setdefault("roast_history", {})
+    key = _roast_history_key(message.guild.id, message.author.id)
+    lst = history.get(key, [])
+    lst.append(content)
+    max_history = int(roast_cfg().get("max_history", 5) or 5)
+    max_history = max(1, min(20, max_history))
+    history[key] = lst[-max_history:]
+
+def _roast_traits(messages: List[str]) -> List[str]:
+    traits: List[str] = []
+    joined = " ".join(messages)
+    if not messages:
+        return traits
+    if any(len(m) > 120 for m in messages):
+        traits.append("writes essays like it's a final exam")
+    if sum(m.count("?") for m in messages) >= 3:
+        traits.append("collects question marks like they're rare items")
+    if any(m.isupper() and len(m) > 5 for m in messages):
+        traits.append("has a caps-lock addiction")
+    if "..." in joined:
+        traits.append("loves dramatic pauses")
+    if len(joined.split()) < 10:
+        traits.append("keeps it short because why type more")
+    if not traits:
+        traits.append("posts with mysterious energy and no context")
+    return traits[:2]
+
+def generate_playful_roast(user: discord.abc.User, messages: List[str]) -> str:
+    traits = _roast_traits(messages)
+    line = " and ".join(traits)
+    return f"🪞 Roast mode (playful): {user.mention}, you {line}. Respectfully."
+
+async def generate_roast_with_gemini(user: discord.abc.User, messages: List[str]) -> Optional[str]:
+    if not roast_use_ai():
+        return None
+    client = _mandy_ai_client()
+    if not client or not getattr(client, "available", False):
+        return None
+    ai = ai_cfg()
+    model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
+    system_prompt = (
+        "You write playful, light roasts. Keep it safe and non-abusive. "
+        "No slurs, hate, threats, sexual content, or protected-class remarks. "
+        "Keep to 1-2 short sentences. Avoid doxxing or personal data."
+    )
+    recent = [m[:200] for m in messages][-5:]
+    user_prompt = (
+        "Create a playful roast for the user. "
+        f"User: {getattr(user, 'display_name', 'user')}. "
+        f"Recent messages: {json.dumps(recent, ensure_ascii=True)}"
+    )
+    try:
+        text = await client.generate(system_prompt, user_prompt, model=model, response_format=None, timeout=20.0)
+        return (text or "").strip()
+    except Exception:
+        return None
+
+def _json_preview(value: Any, max_len: int = 1800) -> str:
+    try:
+        text = json.dumps(value, indent=2, ensure_ascii=False)
+    except Exception:
+        text = str(value)
+    if len(text) > max_len:
+        return ""
+    return text
+
+def _set_json_path(root: Dict[str, Any], path: str, value: Any) -> Tuple[bool, str]:
+    parts = [p.strip() for p in str(path).split(".") if p.strip()]
+    if not parts:
+        return False, "Path cannot be empty."
+    cur: Any = root
+    for key in parts[:-1]:
+        if not isinstance(cur, dict):
+            return False, f"Path segment '{key}' is not a dict."
+        cur = cur.setdefault(key, {})
+    if not isinstance(cur, dict):
+        return False, "Target container is not a dict."
+    cur[parts[-1]] = value
+    return True, ""
+
+async def maybe_roast_message(message: discord.Message) -> bool:
+    if not message.guild or not message.content:
+        return False
+    if not roast_enabled():
+        return False
+    content = message.content or ""
+    if not roast_trigger_regex().search(content):
+        return False
+    if not roast_intent(content):
+        return False
+    if not roast_user_opted_in(message.author.id):
+        return False
+    if not roast_channel_allowed(message.channel.id):
+        return False
+    runtime = getattr(bot, "mandy_runtime", None)
+    if not isinstance(runtime, dict):
+        return False
+    last = runtime.setdefault("roast_last", {})
+    now = time.time()
+    cooldown = int(roast_cfg().get("cooldown_seconds", 20) or 20)
+    last_ts = float(last.get(str(message.author.id), 0) or 0)
+    if now - last_ts < max(5, cooldown):
+        return False
+    history = runtime.setdefault("roast_history", {})
+    key = _roast_history_key(message.guild.id, message.author.id)
+    recent = list(history.get(key, []))
+    recent.append(message.content.strip())
+    max_history = int(roast_cfg().get("max_history", 5) or 5)
+    max_history = max(1, min(20, max_history))
+    recent = recent[-max_history:]
+    roast_text = await generate_roast_with_gemini(message.author, recent)
+    if not roast_text:
+        roast_text = generate_playful_roast(message.author, recent)
+    try:
+        await message.channel.send(roast_text)
+    except Exception:
+        return False
+    last[str(message.author.id)] = now
+    return True
 
 async def _resolve_thoughts_channel() -> Optional[discord.TextChannel]:
     channels = sentience_channels_cfg()
@@ -4653,6 +4287,23 @@ class UserMenuView(BaseView):
         else:
             await interaction.response.send_message("No DM bridge is active for you.", ephemeral=True)
 
+    @discord.ui.button(label="Roast Opt-In", style=discord.ButtonStyle.secondary)
+    async def roast_opt_in_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        roast = roast_cfg()
+        users = roast_opt_in_users()
+        uid = str(interaction.user.id)
+        if uid in users:
+            users.remove(uid)
+            roast["opt_in_users"] = sorted(users)
+            await STORE.mark_dirty()
+            await audit(interaction.user.id, "Roast opt-out", {})
+            return await interaction.response.send_message("Roast mode disabled for you.", ephemeral=True)
+        users.add(uid)
+        roast["opt_in_users"] = sorted(users)
+        await STORE.mark_dirty()
+        await audit(interaction.user.id, "Roast opt-in", {})
+        await interaction.response.send_message("Roast mode enabled for you (playful only).", ephemeral=True)
+
 class BotStatusTextModal(discord.ui.Modal):
     def __init__(self, state: str):
         super().__init__(title="Bot Status Text")
@@ -4685,6 +4336,45 @@ class BotStatusView(BaseView):
     async def status_selected(self, interaction: discord.Interaction):
         state = interaction.data["values"][0]
         await interaction.response.send_modal(BotStatusTextModal(state))
+
+class JsonSettingsModal(discord.ui.Modal):
+    def __init__(self, author_id: int, title: str = "Live JSON Editor", default_path: str = "", default_value: str = ""):
+        super().__init__(title=title, timeout=300)
+        self.author_id = author_id
+        self.path = discord.ui.TextInput(
+            label="JSON path (dot notation)",
+            placeholder="roast.enabled",
+            max_length=120,
+            required=True,
+            default=default_path
+        )
+        self.value = discord.ui.TextInput(
+            label="JSON value",
+            style=discord.TextStyle.paragraph,
+            max_length=1800,
+            required=True,
+            default=default_value,
+            placeholder='Example: true, 5, "text", {"a":1}'
+        )
+        self.add_item(self.path)
+        self.add_item(self.value)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        lvl = await effective_level(interaction.user)
+        if lvl < 90 and not is_super(interaction.user.id):
+            return await interaction.response.send_message("GOD only.", ephemeral=True)
+        path = str(self.path.value or "").strip()
+        raw = str(self.value.value or "").strip()
+        try:
+            value = json.loads(raw)
+        except Exception as e:
+            return await interaction.response.send_message(f"Invalid JSON: {e}", ephemeral=True)
+        ok, err = _set_json_path(cfg(), path, value)
+        if not ok:
+            return await interaction.response.send_message(err, ephemeral=True)
+        await STORE.mark_dirty()
+        await audit(interaction.user.id, "JSON setting updated", {"path": path})
+        await interaction.response.send_message("Updated.", ephemeral=True)
 
 class PermissionMenuView(BaseView):
     def __init__(self, author_id: int):
@@ -4730,6 +4420,106 @@ class PermissionMenuView(BaseView):
 
         await audit(interaction.user.id, "Perm set", {"user_id": self.target.id, "level": self.level})
         await interaction.response.send_message(f"Set {self.target} -> {self.level}", ephemeral=True)
+
+class RoastMenuView(BaseView):
+    def __init__(self, author_id: int):
+        super().__init__(author_id)
+        self.target: Optional[discord.User] = None
+        self.user_select = discord.ui.UserSelect(placeholder="Select user")
+        self.user_select.callback = self.user_selected
+        self.add_item(self.user_select)
+
+    async def user_selected(self, interaction: discord.Interaction):
+        self.target = self.user_select.values[0]
+        await interaction.response.edit_message(content=f"Selected: {self.target}", view=self)
+
+    @discord.ui.button(label="Toggle Enabled", style=discord.ButtonStyle.primary)
+    async def toggle_enabled_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        roast = roast_cfg()
+        roast["enabled"] = not bool(roast.get("enabled", False))
+        await STORE.mark_dirty()
+        await audit(interaction.user.id, "Roast enabled toggled", {"enabled": roast["enabled"]})
+        await interaction.response.send_message(f"Roast enabled: {roast['enabled']}", ephemeral=True)
+
+    @discord.ui.button(label="Toggle Gemini", style=discord.ButtonStyle.primary)
+    async def toggle_gemini_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        roast = roast_cfg()
+        roast["use_ai"] = not bool(roast.get("use_ai", True))
+        await STORE.mark_dirty()
+        await audit(interaction.user.id, "Roast gemini toggled", {"use_ai": roast["use_ai"]})
+        await interaction.response.send_message(f"Roast Gemini: {roast['use_ai']}", ephemeral=True)
+
+    @discord.ui.button(label="Gemini Diagnostic", style=discord.ButtonStyle.secondary)
+    async def gemini_diag_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        client = _mandy_ai_client()
+        if not client or not getattr(client, "available", False):
+            return await interaction.response.send_message("Gemini unavailable (missing client or API key).", ephemeral=True)
+        ai = ai_cfg()
+        model = str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
+        try:
+            text = await client.generate(
+                "You are a health-check responder. Reply with 'pong' and the word OK.",
+                "ping",
+                model=model,
+                response_format=None,
+                timeout=10.0,
+            )
+            ok = (text or "").strip()
+            await interaction.response.send_message(f"Gemini OK: {ok[:200]}", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"Gemini error: {e}", ephemeral=True)
+
+    @discord.ui.button(label="Add User", style=discord.ButtonStyle.success)
+    async def add_user_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.target:
+            return await interaction.response.send_message("Select a user.", ephemeral=True)
+        users = roast_opt_in_users()
+        users.add(str(self.target.id))
+        roast_cfg()["opt_in_users"] = sorted(users)
+        await STORE.mark_dirty()
+        await audit(interaction.user.id, "Roast opt-in added", {"user_id": self.target.id})
+        await interaction.response.send_message(f"Added {self.target} to roast list.", ephemeral=True)
+
+    @discord.ui.button(label="Remove User", style=discord.ButtonStyle.danger)
+    async def remove_user_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.target:
+            return await interaction.response.send_message("Select a user.", ephemeral=True)
+        users = roast_opt_in_users()
+        users.discard(str(self.target.id))
+        roast_cfg()["opt_in_users"] = sorted(users)
+        await STORE.mark_dirty()
+        await audit(interaction.user.id, "Roast opt-in removed", {"user_id": self.target.id})
+        await interaction.response.send_message(f"Removed {self.target} from roast list.", ephemeral=True)
+
+    @discord.ui.button(label="List Users", style=discord.ButtonStyle.secondary)
+    async def list_users_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        users = [int(u) for u in roast_opt_in_users() if str(u).isdigit()]
+        lines = []
+        for uid in users[:50]:
+            user = bot.get_user(uid)
+            label = f"{user} ({uid})" if user else str(uid)
+            lines.append(label)
+        status = "ON" if roast_enabled() else "OFF"
+        trigger = roast_trigger_word() or "mandy"
+        msg = [
+            f"Roast status: {status}",
+            f"Trigger: {trigger}",
+            f"Opt-in users: {len(users)}",
+            "Users:",
+            *(lines if lines else ["(none)"]),
+        ]
+        await interaction.response.send_message("\n".join(msg[:55]), ephemeral=True)
+
+    @discord.ui.button(label="Edit Roast JSON", style=discord.ButtonStyle.secondary)
+    async def edit_roast_json_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        default_value = _json_preview(roast_cfg())
+        modal = JsonSettingsModal(
+            interaction.user.id,
+            title="Edit Roast JSON",
+            default_path="roast",
+            default_value=default_value
+        )
+        await interaction.response.send_modal(modal)
 
 class MirrorServerToggleView(BaseView):
     def __init__(self, author_id: int, page: int = 0):
@@ -5818,6 +5608,18 @@ class GodMenuView(BaseView):
         if not await self._require_god(interaction):
             return
         await interaction.response.send_message("Logging panel.", view=LoggingMenuView(interaction.user.id), ephemeral=True)
+
+    @discord.ui.button(label="Roast Settings", style=discord.ButtonStyle.secondary)
+    async def roast_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        await interaction.response.send_message("Roast settings panel.", view=RoastMenuView(interaction.user.id), ephemeral=True)
+
+    @discord.ui.button(label="Live JSON Editor", style=discord.ButtonStyle.secondary)
+    async def json_editor_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        await interaction.response.send_modal(JsonSettingsModal(interaction.user.id))
 
     @discord.ui.button(label="Command Routing", style=discord.ButtonStyle.primary)
     async def command_routes_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -7008,7 +6810,7 @@ async def nuke(ctx: commands.Context, limit: int = 300, mode: str = "run"):
 @bot.event
 async def on_ready():
     await STORE.load()
-    await maybe_load_mandy_extension()
+    await maybe_load_mandy_extension(bot)
     try:
         if hasattr(bot, "mandy_plugin_manager"):
             await bot.mandy_plugin_manager.load_all()
@@ -7434,7 +7236,7 @@ async def on_message(message: discord.Message):
             mandy = bot.get_cog("MandyAI")
             if not mandy:
                 try:
-                    await maybe_load_mandy_extension()
+                    await maybe_load_mandy_extension(bot)
                 except Exception:
                     mandy = None
                 mandy = bot.get_cog("MandyAI")
@@ -7457,6 +7259,11 @@ async def on_message(message: discord.Message):
             return
     except Exception as e:
         await debug(f"command channel enforcement error: {e}")
+
+    try:
+        record_roast_history(message)
+    except Exception:
+        pass
 
     # GOD-only mention entrypoint
     if bot.user:
@@ -7491,6 +7298,13 @@ async def on_message(message: discord.Message):
             return
     except Exception as e:
         await debug(f"gate attempt error: {e}")
+
+    # Playful roast (opt-in only)
+    try:
+        if await maybe_roast_message(message):
+            return
+    except Exception as e:
+        await debug(f"roast error: {e}")
 
     # DM bridge channel -> staff sends -> DM user
     try:
@@ -7647,5 +7461,12 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # -----------------------------
 # Run
 # -----------------------------
-attach_mandy_context()
+attach_mandy_context(
+    bot,
+    dm_ai_is_enabled=dm_ai_is_enabled,
+    dm_bridge_user_for_channel=dm_bridge_user_for_channel,
+    mandy_power_mode_enabled=mandy_power_mode_enabled,
+    effective_level=effective_level,
+    require_level_ctx=require_level_ctx,
+)
 bot.run(DISCORD_TOKEN)
