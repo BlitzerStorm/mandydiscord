@@ -6462,6 +6462,623 @@ class GodMenuView(BaseView):
             return
         await interaction.response.send_message("Gate tools panel.", view=GateToolsView(interaction.user.id), ephemeral=True)
 
+def bot_interop_cfg() -> Dict[str, Any]:
+    # Stores per-guild test channel + last observed results for manual interop tests.
+    return cfg().setdefault("bot_interop", {"test_channels": {}, "results": {}, "macros": {}})
+
+def _bot_interop_test_channel_id(guild_id: int) -> int:
+    ch_map = bot_interop_cfg().setdefault("test_channels", {})
+    try:
+        return int(ch_map.get(str(guild_id), 0) or 0)
+    except Exception:
+        return 0
+
+def _set_bot_interop_test_channel_id(guild_id: int, channel_id: int) -> None:
+    bot_interop_cfg().setdefault("test_channels", {})[str(guild_id)] = int(channel_id)
+
+def _bot_interop_results_for_guild(guild_id: int) -> Dict[str, Any]:
+    results = bot_interop_cfg().setdefault("results", {})
+    entry = results.get(str(guild_id))
+    if not isinstance(entry, dict):
+        entry = {}
+        results[str(guild_id)] = entry
+    return entry
+
+def _bot_interop_macros_for_guild(guild_id: int) -> Dict[str, Any]:
+    macros = bot_interop_cfg().setdefault("macros", {})
+    entry = macros.get(str(guild_id))
+    if not isinstance(entry, dict):
+        entry = {}
+        macros[str(guild_id)] = entry
+    return entry
+
+def _bot_interop_macros_for_bot(guild_id: int, bot_id: int) -> List[Dict[str, str]]:
+    g = _bot_interop_macros_for_guild(guild_id)
+    raw = g.get(str(bot_id), [])
+    if not isinstance(raw, list):
+        raw = []
+        g[str(bot_id)] = raw
+    cleaned: List[Dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if not name or not text:
+            continue
+        cleaned.append({"name": name[:40], "text": text[:250]})
+    if cleaned != raw:
+        g[str(bot_id)] = cleaned
+    return cleaned
+
+class BotInteropCommandModal(discord.ui.Modal):
+    def __init__(self, parent: "BotInteropMenuView"):
+        super().__init__(title="Bot Interop Test (Manual)")
+        self._parent = parent
+        self.command_text = discord.ui.TextInput(
+            label="Message to send in the test channel",
+            placeholder="Example: !help",
+            required=True,
+            max_length=250,
+        )
+        self.add_item(self.command_text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Use the interop view's selected guild (can differ from the guild where the menu was opened).
+        guild = bot.get_guild(int(getattr(self._parent, "guild_id", 0) or 0)) or interaction.guild
+        if not guild:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+
+        target_id = int(getattr(self._parent, "selected_bot_id", 0) or 0)
+        if not target_id:
+            return await interaction.response.send_message("Select a target bot first.", ephemeral=True)
+
+        test_ch_id = _bot_interop_test_channel_id(guild.id)
+        if not test_ch_id:
+            return await interaction.response.send_message(
+                "No test channel set. Use **Set Test Channel** first.",
+                ephemeral=True,
+            )
+
+        test_ch = guild.get_channel(test_ch_id) or bot.get_channel(test_ch_id)
+        if not isinstance(test_ch, discord.TextChannel):
+            return await interaction.response.send_message("Test channel not found.", ephemeral=True)
+
+        me = guild.me or (guild.get_member(bot.user.id) if bot.user else None)
+        if not me:
+            return await interaction.response.send_message("Bot member not available.", ephemeral=True)
+
+        perms = test_ch.permissions_for(me)
+        if not perms.view_channel or not perms.send_messages:
+            return await interaction.response.send_message(
+                "I don't have permission to view/send in the test channel.",
+                ephemeral=True,
+            )
+
+        # Transparent, manual test: we send a message and observe if the target bot responds.
+        # Many bots ignore other bots by design; this test cannot bypass that.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        payload = (str(self.command_text.value or "")).strip()
+        start_mon = time.monotonic()
+        try:
+            sent = await test_ch.send(payload)
+        except Exception as exc:
+            return await interaction.followup.send(f"Send failed: {exc}", ephemeral=True)
+
+        async def _wait_for_reply() -> Optional[discord.Message]:
+            def check(m: discord.Message) -> bool:
+                if m.channel.id != test_ch.id:
+                    return False
+                if m.author.id != target_id:
+                    return False
+                # Best-effort: any message from the bot after we send counts as a reply signal.
+                try:
+                    return m.created_at and sent.created_at and m.created_at >= sent.created_at
+                except Exception:
+                    return True
+
+            try:
+                return await bot.wait_for("message", timeout=8.0, check=check)
+            except Exception:
+                return None
+
+        reply = await _wait_for_reply()
+        latency = time.monotonic() - start_mon
+
+        # Record result.
+        entry = {
+            "tested_at": int(time.time()),
+            "test_channel_id": int(test_ch.id),
+            "sent": payload[:250],
+            "responded": bool(reply),
+            "latency_s": round(latency, 3),
+            "reply_preview": truncate((reply.content or "").strip(), 300) if reply else "",
+        }
+        _bot_interop_results_for_guild(guild.id)[str(target_id)] = entry
+        await STORE.mark_dirty()
+
+        bot_member = guild.get_member(target_id)
+        bot_name = getattr(bot_member, "display_name", None) or f"bot:{target_id}"
+        if reply:
+            msg = f"Observed a response from **{bot_name}** in {latency:.2f}s.\nPreview: `{entry['reply_preview']}`"
+        else:
+            msg = (
+                f"No response observed from **{bot_name}** (waited 8s).\n"
+                "Note: many bots ignore other bots; this test can't bypass that."
+            )
+        await interaction.followup.send(msg, ephemeral=True)
+
+class AddMacroModal(discord.ui.Modal):
+    def __init__(self, parent: "BotInteropMacrosView"):
+        super().__init__(title="Add Bot Command Macro")
+        self._parent = parent
+        self.macro_name = discord.ui.TextInput(
+            label="Macro name",
+            placeholder="Example: Help / Commands",
+            required=True,
+            max_length=40,
+        )
+        self.macro_text = discord.ui.TextInput(
+            label="Message to send",
+            placeholder="Example: !help",
+            required=True,
+            max_length=250,
+        )
+        self.add_item(self.macro_name)
+        self.add_item(self.macro_text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = bot.get_guild(self._parent.guild_id)
+        if not guild:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+
+        bot_id = int(self._parent.bot_id or 0)
+        if not bot_id:
+            return await interaction.response.send_message("Select a bot first.", ephemeral=True)
+
+        name = str(self.macro_name.value or "").strip()
+        text = str(self.macro_text.value or "").strip()
+        if not name or not text:
+            return await interaction.response.send_message("Name and message are required.", ephemeral=True)
+
+        macros = _bot_interop_macros_for_bot(guild.id, bot_id)
+        macros.append({"name": name[:40], "text": text[:250]})
+        _bot_interop_macros_for_guild(guild.id)[str(bot_id)] = macros
+        await STORE.mark_dirty()
+        await interaction.response.send_message("Macro saved.", ephemeral=True)
+
+class ChannelSearchModal(discord.ui.Modal):
+    def __init__(self, parent: "BotInteropMenuView"):
+        super().__init__(title="Find Test Channel")
+        self._parent = parent
+        self.query = discord.ui.TextInput(
+            label="Search (channel name contains)",
+            placeholder="Example: bot-lab",
+            required=True,
+            max_length=64,
+        )
+        self.add_item(self.query)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        q = (str(self.query.value or "")).strip().lower()
+        if not q:
+            return await interaction.response.send_message("Search cannot be empty.", ephemeral=True)
+
+        # Gather top matches across all guilds the bot is in (text channels only).
+        matches: List[discord.TextChannel] = []
+        for g in bot.guilds:
+            for ch in getattr(g, "text_channels", []) or []:
+                name = (getattr(ch, "name", "") or "").lower()
+                if q in name:
+                    matches.append(ch)
+                    if len(matches) >= 25:
+                        break
+            if len(matches) >= 25:
+                break
+
+        if not matches:
+            return await interaction.response.send_message("No matching channels found.", ephemeral=True)
+
+        view = ChannelPickView(self._parent.author_id, matches, self._parent)
+        await interaction.response.send_message("Pick a test channel:", view=view, ephemeral=True)
+
+class ChannelPickSelect(discord.ui.Select):
+    def __init__(self, matches: List[discord.TextChannel], parent: "BotInteropMenuView"):
+        self._parent = parent
+        opts: List[discord.SelectOption] = []
+        for ch in matches[:25]:
+            gname = (getattr(getattr(ch, "guild", None), "name", "") or "")[:40]
+            label = f"{gname} #{ch.name}"[:100]
+            opts.append(discord.SelectOption(label=label, value=str(ch.id)))
+        super().__init__(placeholder="Select a channel…", min_values=1, max_values=1, options=opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        ch_id = int(self.values[0]) if self.values and str(self.values[0]).isdigit() else 0
+        ch = bot.get_channel(ch_id)
+        if not isinstance(ch, discord.TextChannel):
+            return await interaction.response.send_message("Channel not found.", ephemeral=True)
+
+        # Switch the interop view to target the picked channel's guild and store the test channel mapping.
+        _set_bot_interop_test_channel_id(ch.guild.id, ch.id)
+        await STORE.mark_dirty()
+
+        # Update the parent view's guild context so bot selection matches the server you picked.
+        self._parent.guild_id = int(ch.guild.id)
+        self._parent.selected_bot_id = 0
+        await self._parent._refresh_select(ch.guild)
+
+        await interaction.response.send_message(
+            f"Test channel set to `{ch.guild.name}` #{ch.name} (id {ch.id}).",
+            ephemeral=True,
+        )
+
+class ChannelPickView(BaseView):
+    def __init__(self, author_id: int, matches: List[discord.TextChannel], parent: "BotInteropMenuView"):
+        super().__init__(author_id, timeout=90)
+        self.add_item(ChannelPickSelect(matches, parent))
+
+class BotSelect(discord.ui.Select):
+    def __init__(self, author_id: int, guild: discord.Guild):
+        self._author_id = author_id
+        bots = [m for m in (guild.members or []) if getattr(m, "bot", False)]
+        bots = sorted(bots, key=lambda m: (m.display_name or m.name or "").lower())
+        opts: List[discord.SelectOption] = []
+        for m in bots[:25]:
+            label = (m.display_name or m.name or str(m.id))[:100]
+            opts.append(discord.SelectOption(label=label, value=str(m.id)))
+        if not opts:
+            opts = [discord.SelectOption(label="(no bots found in cache)", value="0", default=True)]
+        super().__init__(placeholder="Select a bot…", min_values=1, max_values=1, options=opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, BotInteropMenuView):
+            return
+        picked = int(self.values[0]) if self.values and str(self.values[0]).isdigit() else 0
+        view.selected_bot_id = picked
+        await interaction.response.send_message(view.status_text(interaction.guild), ephemeral=True)
+
+class BotInteropMenuView(BaseView):
+    def __init__(self, author_id: int, guild_id: int):
+        super().__init__(author_id, timeout=180)
+        self.guild_id = int(guild_id)
+        self.selected_bot_id: int = 0
+
+    async def _require_god(self, interaction: discord.Interaction) -> bool:
+        lvl = await effective_level(interaction.user)
+        if lvl < 90 and not is_super(interaction.user.id):
+            await interaction.response.send_message("GOD only.", ephemeral=True)
+            return False
+        return True
+
+    def status_text(self, guild: Optional[discord.Guild]) -> str:
+        # Prefer the selected guild context; the interaction guild can differ.
+        g = bot.get_guild(self.guild_id) or guild
+        gid = int(getattr(g, "id", self.guild_id) or self.guild_id)
+        test_ch_id = _bot_interop_test_channel_id(gid)
+        test_ch = g.get_channel(test_ch_id) if g and test_ch_id else None
+        bot_id = int(self.selected_bot_id or 0)
+        bot_name = ""
+        if g and bot_id:
+            m = g.get_member(bot_id)
+            bot_name = f"{getattr(m, 'display_name', '')} ({bot_id})" if m else str(bot_id)
+        lines = ["**Bot Interop (Manual, Visible Tests Only)**"]
+        if g:
+            lines.append(f"Server: {g.name} ({g.id})")
+        lines.append(f"Test channel: {test_ch.mention if test_ch else ('not set' if not test_ch_id else str(test_ch_id))}")
+        lines.append(f"Selected bot: {bot_name or 'not selected'}")
+        if g:
+            results = _bot_interop_results_for_guild(g.id)
+            if bot_id and str(bot_id) in results:
+                r = results[str(bot_id)]
+                lines.append(f"Last test: responded={bool(r.get('responded'))} latency_s={r.get('latency_s','')}")
+        lines.append("This cannot bypass bots that ignore other bots or require slash/human interaction.")
+        return "\n".join(lines)
+
+    @discord.ui.button(label="Set Test Channel (Here)", style=discord.ButtonStyle.primary)
+    async def set_channel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        if not interaction.guild or not isinstance(interaction.channel, discord.TextChannel):
+            return await interaction.response.send_message("Use this in a server text channel.", ephemeral=True)
+        _set_bot_interop_test_channel_id(interaction.guild.id, interaction.channel.id)
+        await STORE.mark_dirty()
+        await interaction.response.send_message(f"Test channel set to {interaction.channel.mention}.", ephemeral=True)
+
+    @discord.ui.button(label="Find Test Channel", style=discord.ButtonStyle.primary)
+    async def find_channel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        await interaction.response.send_modal(ChannelSearchModal(self))
+
+    @discord.ui.button(label="Send Test Command", style=discord.ButtonStyle.secondary)
+    async def send_test_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        await interaction.response.send_modal(BotInteropCommandModal(self))
+
+    @discord.ui.button(label="Macros", style=discord.ButtonStyle.secondary)
+    async def macros_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        g = bot.get_guild(self.guild_id) or interaction.guild
+        if not g:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+        bot_id = int(self.selected_bot_id or 0)
+        if not bot_id:
+            return await interaction.response.send_message("Select a bot first.", ephemeral=True)
+        view = BotInteropMacrosView(interaction.user.id, guild_id=g.id, bot_id=bot_id)
+        await view._ensure_select()
+        await interaction.response.send_message(view.status_text(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="Server Diagnostics", style=discord.ButtonStyle.secondary)
+    async def diag_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        g = bot.get_guild(self.guild_id) or interaction.guild
+        if not g:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+        view = BotInteropDiagnosticsView(interaction.user.id, guild_id=g.id, page=0)
+        await interaction.response.send_message(view.render(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="Show Status", style=discord.ButtonStyle.secondary)
+    async def status_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        await interaction.response.send_message(self.status_text(interaction.guild), ephemeral=True)
+
+    async def on_timeout(self):
+        return
+
+    async def _ensure_select(self, interaction: discord.Interaction) -> None:
+        if any(isinstance(c, BotSelect) for c in self.children):
+            return
+        g = interaction.guild or bot.get_guild(self.guild_id)
+        if g:
+            self.add_item(BotSelect(self.author_id, g))
+
+    async def _refresh_select(self, guild: discord.Guild) -> None:
+        # Rebuild the bot dropdown when switching target guilds.
+        to_remove = [c for c in self.children if isinstance(c, BotSelect)]
+        for c in to_remove:
+            try:
+                self.remove_item(c)
+            except Exception:
+                pass
+        self.add_item(BotSelect(self.author_id, guild))
+
+class MacroSelect(discord.ui.Select):
+    def __init__(self, macros: List[Dict[str, str]]):
+        opts: List[discord.SelectOption] = []
+        for idx, m in enumerate(macros[:25]):
+            label = str(m.get("name") or f"macro-{idx+1}")[:100]
+            desc = str(m.get("text") or "")[:80]
+            opts.append(discord.SelectOption(label=label, value=str(idx), description=desc or None))
+        if not opts:
+            opts = [discord.SelectOption(label="(no macros)", value="-1", default=True)]
+        super().__init__(placeholder="Select a macro…", min_values=1, max_values=1, options=opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
+        if not isinstance(view, BotInteropMacrosView):
+            return
+        picked = int(self.values[0]) if self.values and str(self.values[0]).lstrip("-").isdigit() else -1
+        view.selected_macro_idx = picked
+        await interaction.response.send_message(view.status_text(), ephemeral=True)
+
+class BotInteropMacrosView(BaseView):
+    def __init__(self, author_id: int, guild_id: int, bot_id: int):
+        super().__init__(author_id, timeout=180)
+        self.guild_id = int(guild_id)
+        self.bot_id = int(bot_id)
+        self.selected_macro_idx: int = -1
+
+    async def _require_god(self, interaction: discord.Interaction) -> bool:
+        lvl = await effective_level(interaction.user)
+        if lvl < 90 and not is_super(interaction.user.id):
+            await interaction.response.send_message("GOD only.", ephemeral=True)
+            return False
+        return True
+
+    def _macros(self) -> List[Dict[str, str]]:
+        return _bot_interop_macros_for_bot(self.guild_id, self.bot_id)
+
+    def status_text(self) -> str:
+        guild = bot.get_guild(self.guild_id)
+        gname = getattr(guild, "name", str(self.guild_id))
+        m = guild.get_member(self.bot_id) if guild else None
+        bname = getattr(m, "display_name", None) or str(self.bot_id)
+        macros = self._macros()
+        lines = [f"**Macros for {bname}**", f"Server: {gname}", f"Saved macros: {len(macros)}"]
+        if 0 <= self.selected_macro_idx < len(macros):
+            sel = macros[self.selected_macro_idx]
+            lines.append(f"Selected: {sel.get('name','')} -> `{sel.get('text','')}`")
+        else:
+            lines.append("Selected: none")
+        return "\n".join(lines)
+
+    async def _ensure_select(self) -> None:
+        if any(isinstance(c, MacroSelect) for c in self.children):
+            return
+        self.add_item(MacroSelect(self._macros()))
+
+    async def _refresh_select(self) -> None:
+        to_remove = [c for c in self.children if isinstance(c, MacroSelect)]
+        for c in to_remove:
+            try:
+                self.remove_item(c)
+            except Exception:
+                pass
+        self.add_item(MacroSelect(self._macros()))
+
+    @discord.ui.button(label="Add Macro", style=discord.ButtonStyle.primary)
+    async def add_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        await interaction.response.send_modal(AddMacroModal(self))
+
+    @discord.ui.button(label="Delete Macro", style=discord.ButtonStyle.danger)
+    async def del_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        macros = self._macros()
+        if not (0 <= self.selected_macro_idx < len(macros)):
+            return await interaction.response.send_message("Select a macro first.", ephemeral=True)
+        macros.pop(self.selected_macro_idx)
+        _bot_interop_macros_for_guild(self.guild_id)[str(self.bot_id)] = macros
+        self.selected_macro_idx = -1
+        await STORE.mark_dirty()
+        await self._refresh_select()
+        await interaction.response.send_message("Macro deleted.", ephemeral=True)
+
+    @discord.ui.button(label="Run Macro", style=discord.ButtonStyle.secondary)
+    async def run_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+        test_ch_id = _bot_interop_test_channel_id(guild.id)
+        test_ch = guild.get_channel(test_ch_id) if test_ch_id else None
+        if not isinstance(test_ch, discord.TextChannel):
+            return await interaction.response.send_message("Test channel not set/found. Set it first.", ephemeral=True)
+        macros = self._macros()
+        if not (0 <= self.selected_macro_idx < len(macros)):
+            return await interaction.response.send_message("Select a macro first.", ephemeral=True)
+        cmd = str(macros[self.selected_macro_idx].get("text") or "").strip()
+        if not cmd:
+            return await interaction.response.send_message("Macro text is empty.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            sent = await test_ch.send(cmd)
+        except Exception as exc:
+            return await interaction.followup.send(f"Send failed: {exc}", ephemeral=True)
+
+        def check(m: discord.Message) -> bool:
+            if m.channel.id != test_ch.id:
+                return False
+            if m.author.id != self.bot_id:
+                return False
+            try:
+                return m.created_at and sent.created_at and m.created_at >= sent.created_at
+            except Exception:
+                return True
+
+        start_mon = time.monotonic()
+        try:
+            reply = await bot.wait_for("message", timeout=8.0, check=check)
+        except Exception:
+            reply = None
+        latency = time.monotonic() - start_mon
+
+        entry = {
+            "tested_at": int(time.time()),
+            "test_channel_id": int(test_ch.id),
+            "sent": cmd[:250],
+            "responded": bool(reply),
+            "latency_s": round(latency, 3),
+            "reply_preview": truncate((reply.content or "").strip(), 300) if reply else "",
+        }
+        _bot_interop_results_for_guild(guild.id)[str(self.bot_id)] = entry
+        await STORE.mark_dirty()
+
+        if reply:
+            await interaction.followup.send(
+                f"Observed response in {latency:.2f}s.\nPreview: `{entry['reply_preview']}`",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send("No response observed (waited 8s).", ephemeral=True)
+
+class BotInteropDiagnosticsView(BaseView):
+    def __init__(self, author_id: int, guild_id: int, page: int = 0):
+        super().__init__(author_id, timeout=180)
+        self.guild_id = int(guild_id)
+        self.page = max(0, int(page))
+
+    async def _require_god(self, interaction: discord.Interaction) -> bool:
+        lvl = await effective_level(interaction.user)
+        if lvl < 90 and not is_super(interaction.user.id):
+            await interaction.response.send_message("GOD only.", ephemeral=True)
+            return False
+        return True
+
+    def render(self) -> str:
+        guild = bot.get_guild(self.guild_id)
+        if not guild:
+            return "Guild not found."
+        test_ch_id = _bot_interop_test_channel_id(guild.id)
+        test_ch = guild.get_channel(test_ch_id) if test_ch_id else None
+        bots = [m for m in (guild.members or []) if getattr(m, "bot", False)]
+        bots = sorted(bots, key=lambda m: (m.display_name or m.name or "").lower())
+        page_size = 10
+        start = self.page * page_size
+        end = start + page_size
+        chunk = bots[start:end]
+        results = _bot_interop_results_for_guild(guild.id)
+        total_pages = max(1, (len(bots) + page_size - 1) // page_size)
+        if self.page >= total_pages:
+            self.page = max(0, total_pages - 1)
+            start = self.page * page_size
+            end = start + page_size
+            chunk = bots[start:end]
+        lines = ["**Server Bot Diagnostics (No Probing)**"]
+        lines.append(f"Server: {guild.name} ({guild.id})")
+        lines.append(f"Test channel: {test_ch.mention if isinstance(test_ch, discord.TextChannel) else 'not set'}")
+        lines.append(f"Bots: {len(bots)} | Page {self.page+1}/{total_pages}")
+        for m in chunk:
+            perms_txt = ""
+            if isinstance(test_ch, discord.TextChannel):
+                try:
+                    p = test_ch.permissions_for(m)
+                    perms_txt = f" lab:view={'Y' if p.view_channel else 'N'} send={'Y' if p.send_messages else 'N'}"
+                except Exception:
+                    perms_txt = ""
+            r = results.get(str(m.id), {})
+            observed = "unknown"
+            if isinstance(r, dict) and "responded" in r:
+                observed = "yes" if r.get("responded") else "no"
+            lines.append(f"- {m.display_name} ({m.id}) responded={observed}{perms_txt}")
+        lines.append("Use Bot Interop tests/macros to record observed responses per bot.")
+        return "\n".join(lines)
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(content=self.render(), view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        self.page = self.page + 1
+        await interaction.response.edit_message(content=self.render(), view=self)
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.primary)
+    async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        await interaction.response.edit_message(content=self.render(), view=self)
+
+class ServerMenuView(BaseView):
+    async def _require_god(self, interaction: discord.Interaction) -> bool:
+        lvl = await effective_level(interaction.user)
+        if lvl < 90 and not is_super(interaction.user.id):
+            await interaction.response.send_message("GOD only.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Bot Interop", style=discord.ButtonStyle.primary)
+    async def bot_interop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        view = BotInteropMenuView(interaction.user.id, guild_id=getattr(interaction.guild, "id", 0))
+        await view._ensure_select(interaction)
+        await interaction.response.send_message(view.status_text(interaction.guild), view=view, ephemeral=True)
+
 # -----------------------------
 # Commands
 # -----------------------------
@@ -6573,6 +7190,16 @@ async def godmenu(ctx: commands.Context):
     await safe_delete(ctx.message)
     view = GodMenuView(ctx.author.id)
     msg = await ctx.send("**GOD MENU**", view=view)
+    view.message = msg
+
+@bot.command(name="servermenu")
+async def servermenu(ctx: commands.Context):
+    # Dedicated server-only admin menu (separate from !godmenu) for per-server tools.
+    if not await require_level_ctx(ctx, 90):
+        return
+    await safe_delete(ctx.message)
+    view = ServerMenuView(ctx.author.id)
+    msg = await ctx.send("**SERVER MENU**", view=view)
     view.message = msg
 
 @bot.command()

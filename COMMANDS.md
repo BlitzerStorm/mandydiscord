@@ -24,6 +24,8 @@ The bot supports both **classic commands** and **natural language** (via Mandy A
 - `!menu`: User menu panel.
 - `!godmenu`: Admin panel (GOD).
   - Includes **Command Routing** (allow anywhere / soft remind / hard enforce+cleanup).
+- `!servermenu`: Server-only admin panel (GOD). Includes Bot Interop (manual tests in a chosen channel).
+  - Bot Interop supports searching across servers for a test channel, running a visible manual test message, saving per-bot results, and creating "macros" (message templates) you can run again.
 
 ## Setup / Server Ops (admin server only)
 - `!setup bootstrap`: Create/update roles, categories, channels, topics, pins, and menus.
