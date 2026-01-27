@@ -2361,13 +2361,27 @@ async def dm_bridge_sync_history(user_id: int, ch: discord.TextChannel, limit: i
         lines = []
         async for m in dm.history(limit=limit, oldest_first=True):
             who = "Mandy" if m.author.id == bot.user.id else m.author.name
-            content = (m.content or "").replace("\n", " ")
+            content = (m.content or "").replace("\n", " ").strip()
+            if not content and m.attachments:
+                names = ", ".join(att.filename for att in m.attachments if att.filename)
+                content = f"[attachment] {names}".strip()
+            if not content:
+                content = "[message]"
             lines.append(f"[{m.created_at:%Y-%m-%d %H:%M}] {who}: {content}")
         await ch.send(f"dY\"\" **DM Bridge Opened** for <@{user_id}>")
         if lines:
             await ch.send("```text\n" + "\n".join(lines)[-1800:] + "\n```")
     except Exception:
         await ch.send(f"dY\"\" **DM Bridge Opened** for <@{user_id}>\nCould not pull DM history.")
+
+def _dm_bridge_format_line(author: str, content: str, attachments: List[discord.Attachment]) -> str:
+    clean = (content or "").strip()
+    if not clean and attachments:
+        names = ", ".join(att.filename for att in attachments if att.filename)
+        clean = f"[attachment] {names}".strip()
+    if not clean:
+        clean = "[message]"
+    return f"dY` **{author}**: {clean}"
 
 async def ensure_dm_bridge_channel(user_id: int, active: bool = True) -> Optional[discord.TextChannel]:
     admin = bot.get_guild(ADMIN_GUILD_ID)
@@ -7380,7 +7394,7 @@ async def on_message(message: discord.Message):
             if ch_id:
                 ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
                 if isinstance(ch, discord.TextChannel):
-                    await ch.send(f"dY` **{message.author}**: {message.content}")
+                    await ch.send(_dm_bridge_format_line(message.author.name, message.content or "", message.attachments))
                     await dm_bridge_touch(message.author.id)
             ai_enabled = await dm_ai_is_enabled(message.author.id)
         except Exception:
@@ -7484,6 +7498,10 @@ async def on_message(message: discord.Message):
                     try:
                         u = await bot.fetch_user(uid)
                         await u.send(message.content)
+                        if isinstance(message.channel, discord.TextChannel):
+                            await message.channel.send(
+                                _dm_bridge_format_line(message.author.display_name, message.content or "", message.attachments)
+                            )
                         await audit(message.author.id, "DM relay staff->user", {"user_id": uid})
                         await safe_delete(message)
                         await dm_bridge_touch(uid)
