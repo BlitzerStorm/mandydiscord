@@ -1513,10 +1513,13 @@ class MandyAI(commands.Cog):
         if force_intent:
             system_prompt += f"FORCED INTENT: You MUST return intent={force_intent}. Do not return other intents.\n"
         system_prompt += (
-            "For BUILD: files must live under extensions/ and end with .py, <=200KB. "
+            "For BUILD: primary file must be extensions/<slug>.py; files must live under extensions/ and end with .py, <=200KB. "
             "Allowed imports: discord, discord.ext.commands, typing, datetime, json, re, asyncio, math, random. "
             "Deny imports: os, sys, subprocess, socket, requests, aiohttp, httpx, pathlib, shutil, aiomysql, sqlite3, pickle. "
             "No eval/exec/open. Must define setup(bot). "
+            "TOOL_EXPORTS is required and must be a dict literal. "
+            "Each tool handler MUST be async def and accept ctx (or bot_ctx) as the first parameter. "
+            "Handlers should use ctx.bot/ctx.guild/ctx.channel/ctx.author and ctx.send(). "
             "Extension must include TOOL_EXPORTS = {\"tool_name\": {\"description\":...,\"args_schema\":...,\"side_effect\":\"read|write\","
             "\"cost\":\"cheap|normal|expensive\",\"handler\": async callable}}.\n"
             "TOOL_EXPORTS must be a dict literal and tools must be safe.\n"
@@ -1881,6 +1884,16 @@ class MandyAI(commands.Cog):
                 return False, "bad file entry"
             path = str(f.get("path") or "")
             content = str(f.get("content") or "")
+            path_norm = path.replace("\\", "/")
+            if not path_norm.startswith("extensions/"):
+                await self._send_chunks(channel, "Build failed: files must live under extensions/.")
+                return False, "path outside extensions"
+            if not path_norm.endswith(".py"):
+                await self._send_chunks(channel, "Build failed: extension must be a .py file.")
+                return False, "invalid extension path"
+            if not written_paths and not path_norm.endswith(f"/{slug}.py"):
+                await self._send_chunks(channel, f"Build failed: primary file must be extensions/{slug}.py.")
+                return False, "primary file mismatch"
             ok, err = validate_extension_path(path)
             if not ok:
                 await self._send_chunks(channel, f"Build failed: {err}")
@@ -1909,6 +1922,12 @@ class MandyAI(commands.Cog):
                 for path in written_paths:
                     await self.plugin_manager.load_plugin(path)
         except Exception as exc:
+            for path in written_paths:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass
             await self._send_chunks(channel, f"Build failed: plugin load error: {exc}")
             return False, "plugin load error"
 
@@ -2159,10 +2178,10 @@ class MandyAI(commands.Cog):
                 self._counter_inc("confirmations", 1)
                 return
             ok, msg = await self._handle_build_tool(user.id, channel, build)
-            if response:
-                await self._send_chunks(channel, response)
             if not ok:
                 return
+            if response:
+                await self._send_chunks(channel, response)
             actions = payload.get("actions") or []
             if actions:
                 results = await self._execute_actions(user.id, actions, guild=guild, channel=channel, message_id=message_id)
