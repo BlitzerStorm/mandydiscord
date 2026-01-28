@@ -476,6 +476,45 @@ class MandyAI(commands.Cog):
         remaining = wait_seconds - (time.time() - at)
         return max(0.0, remaining)
 
+    async def _try_agent_router_fallback(
+        self,
+        query: str,
+        transcript: List[Dict[str, Any]],
+        context: Dict[str, Any],
+        confirmed: bool,
+        guild: Optional[discord.Guild],
+        channel: Optional[discord.abc.Messageable],
+        force_intent: Optional[str] = None,
+    ) -> Optional[dict]:
+        model = self._agent_router_model()
+        if not model:
+            return None
+        if not self.agent_client or not self.agent_client.available:
+            return None
+        try:
+            payload = await self._call_router(
+                query,
+                transcript,
+                context,
+                confirmed,
+                guild,
+                channel,
+                model_override=model,
+                provider_override="agent_router",
+                force_intent=force_intent,
+            )
+            return payload
+        except AgentRouterRateLimitError as exc:
+            wait = exc.retry_after if exc.retry_after else self._backoff_seconds(0)
+            self._record_rate_limit(wait, "agent_router")
+            return None
+        except Exception as exc:
+            try:
+                await self._log(f"[Mandy ROUTER] agent_router fallback failed: {exc}")
+            except Exception:
+                pass
+            return None
+
     def _sentience_cfg(self) -> Dict[str, Any]:
         root = self._cfg_root() if callable(self._cfg_root_fn) else {}
         return root.setdefault("sentience", {})
@@ -2368,11 +2407,22 @@ class MandyAI(commands.Cog):
         except GeminiRateLimitError as exc:
             if from_queue:
                 raise
-            local_wait = self._check_local_limits(self._router_model(), self._estimate_tokens(text_query))
-            wait = exc.retry_after if exc.retry_after else max(self._backoff_seconds(0), local_wait)
-            await self._enqueue_rate_limit(channel, user.id, message_id, text_query, wait, 0)
-            self._record_rate_limit(wait, "gemini")
-            return
+            fallback = await self._try_agent_router_fallback(
+                text_query,
+                transcript,
+                context,
+                confirmed_local,
+                guild,
+                channel,
+            )
+            if fallback:
+                payload = fallback
+            else:
+                local_wait = self._check_local_limits(self._router_model(), self._estimate_tokens(text_query))
+                wait = exc.retry_after if exc.retry_after else max(self._backoff_seconds(0), local_wait)
+                await self._enqueue_rate_limit(channel, user.id, message_id, text_query, wait, 0)
+                self._record_rate_limit(wait, "gemini")
+                return
         except AgentRouterRateLimitError as exc:
             if from_queue:
                 raise
@@ -2703,6 +2753,74 @@ class MandyAI(commands.Cog):
             lines.append(
                 f"- {model} ({entry.get('date')}): count={entry.get('count', 0)} tokens={entry.get('tokens', 0)}"
             )
+        await self._send_chunks(ctx.channel, "\n".join(lines))
+
+    @commands.command(name="mandyping")
+    async def mandy_ping(self, ctx: commands.Context):
+        if not await self._require_god(ctx):
+            return
+        ai = self._cfg()
+        lines: List[str] = []
+        errors: List[str] = []
+        lines.append("**Mandy Diagnostics**")
+        lines.append(f"Bot: {'online' if self.bot and self.bot.is_ready() else 'offline'}")
+        lines.append(f"Guilds: {len(getattr(self.bot, 'guilds', []) or [])}")
+        lines.append(f"User cache: {len(getattr(self.bot, 'users', []) or [])}")
+        lines.append(f"Gemini: {'available' if self.client.available else 'unavailable'}")
+        if not self.client.available:
+            errors.append("Gemini API key missing or SDK unavailable")
+        lines.append(f"AgentRouter: {'available' if (self.agent_client and self.agent_client.available) else 'unavailable'}")
+        if self.agent_client and not self.agent_client.available and self._agent_router_model():
+            errors.append("AgentRouter model set but API key missing")
+
+        registry = self.registry or (CapabilityRegistry(self.tools) if self.tools else None)
+        if not registry:
+            errors.append("Capability registry missing")
+        lines.append(f"Tool registry: {'ok' if self.tools else 'missing'}")
+        lines.append(f"Plugin manager: {'ok' if self.plugin_manager else 'missing'}")
+        if not self.tools:
+            errors.append("Tool registry not available")
+        if not self.plugin_manager:
+            errors.append("Plugin manager not available")
+
+        if registry and self.tools:
+            ok, verify_errors = registry.verify_tool_registry()
+            lines.append(f"Tool registry verify: {'ok' if ok else 'errors'}")
+            for err in verify_errors[:5]:
+                errors.append(err)
+
+        dynamic = []
+        if self.tools:
+            dynamic = self.tools.list_dynamic_tools()
+        lines.append(f"Dynamic tools: {len(dynamic)}")
+        lines.append(f"Extensions loaded: {len(self.bot.extensions.keys())}")
+
+        lines.append(
+            "Models: "
+            f"default={self._default_model()} "
+            f"router={self._router_model()} "
+            f"build={self._build_model()} "
+            f"agent_router={self._agent_router_model() or 'unset'}"
+        )
+        lines.append(f"Cooldown: {self._cooldown_seconds()}s")
+        lines.append(f"Queue: {len(self._queue())} jobs")
+
+        last_rate = self._runtime.get("last_rate_limit")
+        if last_rate:
+            lines.append(
+                "Last rate limit: "
+                f"{_format_wait(last_rate.get('wait_seconds', 0))} "
+                f"source={last_rate.get('source', 'unknown')} "
+                f"at={last_rate.get('at', 0)}"
+            )
+
+        if errors:
+            lines.append("Errors:")
+            for err in errors[:10]:
+                lines.append(f"- {err}")
+        else:
+            lines.append("Errors: none")
+
         await self._send_chunks(ctx.channel, "\n".join(lines))
 
     @commands.command(name="mandy_power")
