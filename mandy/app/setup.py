@@ -34,8 +34,20 @@ def _rate_limit_info(exc: Exception) -> Tuple[bool, Optional[float]]:
     return False, None
 
 
+def _setup_adaptive_enabled() -> bool:
+    if state.SETUP_ADAPTIVE_ACTIVE:
+        return True
+    try:
+        tuning = cfg().get("tuning", {})
+        if not isinstance(tuning, dict):
+            return False
+        return bool(tuning.get("setup_adaptive", False))
+    except Exception:
+        return False
+
+
 def _setup_adjust_delay(success: bool, retry_after: Optional[float] = None) -> None:
-    if not state.SETUP_ADAPTIVE_ACTIVE:
+    if not _setup_adaptive_enabled():
         return
     current = state.SETUP_DELAY_OVERRIDE if state.SETUP_DELAY_OVERRIDE is not None else setup_delay_base()
     if success:

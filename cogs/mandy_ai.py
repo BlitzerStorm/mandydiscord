@@ -350,6 +350,10 @@ class MandyAI(commands.Cog):
         ai = self._cfg()
         return str(ai.get("router_model") or ai.get("default_model") or "gemini-2.5-flash-lite")
 
+    def _build_model(self) -> str:
+        ai = self._cfg()
+        return str(ai.get("build_model") or ai.get("default_model") or "gemini-2.5-pro")
+
     def _default_model(self) -> str:
         ai = self._cfg()
         return str(ai.get("default_model") or "gemini-2.5-flash-lite")
@@ -362,6 +366,12 @@ class MandyAI(commands.Cog):
     def _router_only_enabled(self) -> bool:
         ai = self._cfg()
         return bool(ai.get("router_only", False))
+
+    def _fast_path_enabled(self) -> bool:
+        if self._router_only_enabled():
+            return False
+        ai = self._cfg()
+        return bool(ai.get("fast_path", False))
 
     def _auto_build_tools(self) -> bool:
         ai = self._cfg()
@@ -971,7 +981,7 @@ class MandyAI(commands.Cog):
             return False
 
         lower = text.lower()
-        if re.match(r"^(?:new|create|build)\s+tool\b|^tool\s+(?:new|create|build)\b", lower):
+        if "tool" in lower and any(word in lower for word in ("create", "build", "make", "design", "new")):
             return False
 
         if lower in ("tools", "tool", "capabilities"):
@@ -1454,6 +1464,7 @@ class MandyAI(commands.Cog):
         tts_model: str,
         guild: Optional[discord.Guild],
         channel: Optional[discord.abc.Messageable],
+        force_intent: Optional[str] = None,
     ) -> Tuple[str, str]:
         registry = self.registry or (CapabilityRegistry(self.tools) if self.tools else None)
         tool_help = registry.format_tools_summary(include_args=True) if registry else "No tools available."
@@ -1499,6 +1510,8 @@ class MandyAI(commands.Cog):
         )
         if confirmed:
             system_prompt += "User already confirmed. Do NOT return NEEDS_CONFIRMATION.\n"
+        if force_intent:
+            system_prompt += f"FORCED INTENT: You MUST return intent={force_intent}. Do not return other intents.\n"
         system_prompt += (
             "For BUILD: files must live under extensions/ and end with .py, <=200KB. "
             "Allowed imports: discord, discord.ext.commands, typing, datetime, json, re, asyncio, math, random. "
@@ -1931,23 +1944,35 @@ class MandyAI(commands.Cog):
         confirmed: bool,
         guild: Optional[discord.Guild],
         channel: Optional[discord.abc.Messageable],
+        model_override: Optional[str] = None,
+        force_intent: Optional[str] = None,
     ) -> dict:
         tts_model = str(self._cfg().get("tts_model") or "")
-        sys_prompt, user_prompt = self._build_router_prompts(query, transcript, context, confirmed, tts_model, guild, channel)
+        sys_prompt, user_prompt = self._build_router_prompts(
+            query,
+            transcript,
+            context,
+            confirmed,
+            tts_model,
+            guild,
+            channel,
+            force_intent=force_intent,
+        )
+        model = model_override or self._router_model()
         tokens_in = self._estimate_tokens(sys_prompt + user_prompt)
-        wait = self._check_local_limits(self._router_model(), tokens_in)
+        wait = self._check_local_limits(model, tokens_in)
         if wait > 0:
             raise LocalRateLimitError(wait)
         text = await self.client.generate(
             sys_prompt,
             user_prompt,
-            model=self._router_model(),
+            model=model,
             response_format="json",
             timeout=60.0,
         )
         self._counter_inc("router_calls", 1)
         tokens_out = self._estimate_tokens(text)
-        self._record_usage(self._router_model(), tokens_in, tokens_out)
+        self._record_usage(model, tokens_in, tokens_out)
         payload = self._extract_json(text)
         if payload is None:
             raise RuntimeError("Malformed JSON from router")
@@ -1988,7 +2013,7 @@ class MandyAI(commands.Cog):
             except Exception:
                 msg = None
 
-        if text_query and not self._router_only_enabled():
+        if text_query and self._fast_path_enabled():
             handled = await self._handle_fast_path(user, channel, guild, msg, text_query)
             if handled:
                 return
@@ -2076,6 +2101,30 @@ class MandyAI(commands.Cog):
             return
 
         intent = payload.get("intent")
+        build_model = self._build_model()
+        if intent in ("DESIGN_TOOL", "BUILD_TOOL") and build_model and build_model != self._router_model():
+            target_intent = "BUILD_TOOL" if intent == "DESIGN_TOOL" and self._auto_build_tools() else intent
+            try:
+                upgraded = await self._call_router(
+                    text_query,
+                    transcript,
+                    context,
+                    confirmed_local,
+                    guild,
+                    channel,
+                    model_override=build_model,
+                    force_intent=target_intent,
+                )
+                if upgraded.get("intent") in ("DESIGN_TOOL", "BUILD_TOOL"):
+                    payload = upgraded
+                    intent = payload.get("intent")
+            except LocalRateLimitError as exc:
+                self._record_rate_limit(exc.wait_seconds, "local")
+            except GeminiRateLimitError as exc:
+                wait = exc.retry_after if exc.retry_after else 0
+                self._record_rate_limit(wait, "gemini")
+            except Exception as exc:
+                await self._log(f"[Mandy BUILDER] error={exc}")
         response = payload.get("response") or ""
         if intent == "TALK":
             await self._send_chunks(channel, response or "No response.")
@@ -2354,7 +2403,7 @@ class MandyAI(commands.Cog):
         ai = self._cfg()
         lines = []
         lines.append(f"Cooldown: {self._cooldown_seconds()}s")
-        lines.append(f"Default model: {self._default_model()} | Router: {self._router_model()}")
+        lines.append(f"Default model: {self._default_model()} | Router: {self._router_model()} | Build: {self._build_model()}")
         lines.append(f"Queue size: {len(self._queue())}")
         lines.append("Limits (AI Studio is source of truth):")
         for model, lim in ai.get("limits", {}).items():
