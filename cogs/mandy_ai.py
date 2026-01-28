@@ -359,9 +359,21 @@ class MandyAI(commands.Cog):
         mandy = root.get("mandy", {}) if isinstance(root, dict) else {}
         return bool(mandy.get("power_mode", False))
 
+    def _router_only_enabled(self) -> bool:
+        ai = self._cfg()
+        return bool(ai.get("router_only", False))
+
+    def _auto_build_tools(self) -> bool:
+        ai = self._cfg()
+        return bool(ai.get("auto_build_tools", False))
+
+    def _limits_disabled(self) -> bool:
+        ai = self._cfg()
+        return bool(ai.get("disable_limits", False))
+
     def _cooldown_seconds(self) -> int:
         ai = self._cfg()
-        if self._power_mode_enabled():
+        if self._power_mode_enabled() or self._limits_disabled():
             return 0
         try:
             return max(0, int(ai.get("cooldown_seconds", 5)))
@@ -542,6 +554,8 @@ class MandyAI(commands.Cog):
         return max(1, int(len(text) / 4))
 
     def _check_local_limits(self, model: str, tokens: int) -> float:
+        if self._limits_disabled():
+            return 0.0
         limits = self._limits_for(model)
         rpm = int(limits.get("rpm", 0) or 0)
         tpm = int(limits.get("tpm", 0) or 0)
@@ -1429,6 +1443,9 @@ class MandyAI(commands.Cog):
         tool_help = registry.format_tools_summary(include_args=True) if registry else "No tools available."
         snapshot = self._capabilities_snapshot(guild, channel)
         snapshot_text = json.dumps(snapshot, ensure_ascii=True)
+        auto_build = self._auto_build_tools()
+        tool_pref = "BUILD_TOOL" if auto_build else "DESIGN_TOOL"
+        missing_pref = "BUILD_TOOL" if auto_build else "DESIGN_TOOL"
         system_prompt = (
             "You are Mandy AI, a strict intent router for a Discord bot. "
             "Return ONLY valid JSON with this schema:\n"
@@ -1451,10 +1468,10 @@ class MandyAI(commands.Cog):
             "No other tools are allowed. Actions must include only tool and args.\n"
             "Routing policy: if user asks to do something with bot features, prefer ACTION. "
             "If user wants chat, explanation, brainstorming, prefer TALK. "
-            "If user requests a new command/feature, prefer DESIGN_TOOL. "
+            f"If user requests a new command/feature, prefer {tool_pref}. "
             "If action is risky/irreversible, return NEEDS_CONFIRMATION.\n"
             "For TALK: be direct, helpful, and creative when appropriate. Ask a short clarification question if needed.\n"
-            "BUILD-IF-MISSING: If the request cannot be satisfied using allowed tools, return DESIGN_TOOL. "
+            f"BUILD-IF-MISSING: If the request cannot be satisfied using allowed tools, return {missing_pref}. "
             "Do not fabricate answers or claim to have executed actions without ACTION.\n"
             "If the user request is ambiguous, return NEEDS_CONFIRMATION with a clarification question.\n"
             "If the user asks to DM/privately message someone, you MUST use send_dm.\n"
@@ -1953,7 +1970,7 @@ class MandyAI(commands.Cog):
             except Exception:
                 msg = None
 
-        if text_query:
+        if text_query and not self._router_only_enabled():
             handled = await self._handle_fast_path(user, channel, guild, msg, text_query)
             if handled:
                 return
