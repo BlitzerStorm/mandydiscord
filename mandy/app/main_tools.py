@@ -9,7 +9,7 @@ from mandy.capability_registry import CapabilityRegistry
 from mandy.tool_plugin_manager import ToolPluginManager
 
 from . import state
-from .config import GEMINI_API_KEY
+from .config import GEMINI_API_KEY, AGENT_ROUTER_TOKEN, AGENT_ROUTER_BASE_URL
 from .core import request_elevation
 from .logging import audit, debug, log_to
 from .store import STORE, ai_cfg, cfg
@@ -483,6 +483,8 @@ def attach_mandy_context(
     bot.mandy_cfg = cfg
     bot.mandy_get_ai_config = ai_cfg
     bot.mandy_api_key = GEMINI_API_KEY
+    bot.mandy_agent_router_token = AGENT_ROUTER_TOKEN
+    bot.mandy_agent_router_base_url = AGENT_ROUTER_BASE_URL
     bot.mandy_store = STORE
     bot.mandy_audit = audit
     bot.mandy_log_to = log_to

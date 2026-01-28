@@ -19,6 +19,7 @@ except Exception:
     genai_types = None
 
 from .mandy_ai_gemini import GeminiClient, GeminiRateLimitError
+from .mandy_ai_agent_router import AgentRouterClient, AgentRouterRateLimitError
 from .mandy_ai_views import ConfirmView, RateLimitView, UserPickView
 
 
@@ -300,6 +301,7 @@ class MandyAI(commands.Cog):
         self._queue_tasks: Dict[str, asyncio.Task] = {}
         self._queue_lock = asyncio.Lock()
         self._pending_designs: Dict[int, Dict[str, Any]] = {}
+        self._pending_fixes: Dict[int, Dict[str, Any]] = {}
         self._runtime = getattr(bot, "mandy_runtime", None)
         if self._runtime is None:
             self._runtime = {"counters": {}, "last_actions": [], "last_rate_limit": None}
@@ -311,6 +313,10 @@ class MandyAI(commands.Cog):
         self._intelligent_processor = None
         self._intelligence = None
         self._resolver_cache = GuildIndexCache(ttl_seconds=120)
+        self.agent_client = AgentRouterClient(
+            getattr(bot, "mandy_agent_router_token", None),
+            getattr(bot, "mandy_agent_router_base_url", None),
+        )
         if INTELLIGENT_PROCESSOR_AVAILABLE:
             try:
                 self._intelligent_processor = IntelligentCommandProcessor(bot)
@@ -353,6 +359,10 @@ class MandyAI(commands.Cog):
     def _build_model(self) -> str:
         ai = self._cfg()
         return str(ai.get("build_model") or ai.get("default_model") or "gemini-2.5-pro")
+
+    def _agent_router_model(self) -> str:
+        ai = self._cfg()
+        return str(ai.get("agent_router_model") or "")
 
     def _default_model(self) -> str:
         ai = self._cfg()
@@ -441,6 +451,16 @@ class MandyAI(commands.Cog):
         }
         self._counter_inc("rate_limits", 1)
         self._auto_tune(wait_seconds, source)
+
+    def _record_pending_fix(self, user_id: int, slug: str, files: Dict[str, str], error: str) -> None:
+        if not user_id or not slug:
+            return
+        self._pending_fixes[user_id] = {
+            "slug": slug,
+            "files": dict(files or {}),
+            "error": str(error),
+            "at": _now_ts(),
+        }
 
     def _remaining_rate_limit_wait(self, sources: Optional[set] = None) -> float:
         last = self._runtime.get("last_rate_limit") or {}
@@ -968,6 +988,37 @@ class MandyAI(commands.Cog):
                 return 50
         return 50
 
+    def _parse_model_hint(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+        provider = None
+        model = None
+        if not text:
+            return provider, model
+        lowered = text.lower()
+        if "agentrouter" in lowered or "agent router" in lowered:
+            provider = "agent_router"
+        if "gemini" in lowered:
+            provider = "gemini"
+        match = re.search(r"(?:using|with|model)\s+([a-zA-Z0-9_.:-]+)", text, re.IGNORECASE)
+        if match:
+            model = match.group(1).strip()
+        return provider, model
+
+    def _parse_fix_request(self, text: str) -> Optional[Dict[str, str]]:
+        match = re.match(
+            r"^(?:fix|repair|patch)\s+(?:tool\s+)?(?P<slug>[a-z0-9_]{3,32}|last)\b(?P<rest>.*)$",
+            (text or "").strip(),
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        rest = match.group("rest") or ""
+        provider, model = self._parse_model_hint(rest)
+        return {
+            "slug": match.group("slug").lower(),
+            "provider": provider or "",
+            "model": model or "",
+        }
+
     async def _handle_fast_path(
         self,
         user: discord.User,
@@ -1185,6 +1236,134 @@ class MandyAI(commands.Cog):
             return True
 
         return False
+
+    async def _run_tool_fix(
+        self,
+        user: discord.User,
+        channel: discord.abc.Messageable,
+        guild: Optional[discord.Guild],
+        slug: str,
+        provider_hint: Optional[str] = None,
+        model_hint: Optional[str] = None,
+    ) -> bool:
+        fix_info = None
+        if slug == "last":
+            fix_info = self._pending_fixes.get(user.id)
+            if not fix_info:
+                await self._send_chunks(channel, "No pending build to fix.")
+                return True
+            slug = str(fix_info.get("slug") or "")
+            if not slug:
+                await self._send_chunks(channel, "No pending build to fix.")
+                return True
+
+        if not re.fullmatch(r"[a-z0-9_]{3,32}", slug):
+            await self._send_chunks(channel, "Fix failed: invalid tool slug.")
+            return True
+
+        path = os.path.join("extensions", f"{slug}.py")
+        path_norm = path.replace("\\", "/")
+        current_source = ""
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fhandle:
+                    current_source = fhandle.read()
+            except Exception:
+                current_source = ""
+        if not current_source and fix_info:
+            files = fix_info.get("files") or {}
+            current_source = str(files.get(path_norm) or "")
+        if not current_source:
+            await self._send_chunks(channel, f"Fix failed: tool file not found at {path_norm}.")
+            return True
+
+        provider = (provider_hint or "").strip().lower()
+        model = (model_hint or "").strip()
+        if not provider and model and not model.startswith("gemini"):
+            provider = "agent_router"
+        provider = provider or "gemini"
+        if provider == "agent_router":
+            if not self.agent_client or not self.agent_client.available:
+                await self._send_chunks(channel, "AgentRouter API key not configured.")
+                return True
+            if not model:
+                model = self._agent_router_model()
+            if not model:
+                await self._send_chunks(channel, "AgentRouter model not set. Use: fix tool <slug> using agentrouter <model>.")
+                return True
+        else:
+            if not model:
+                model = self._build_model()
+            provider = "gemini"
+
+        transcript: List[Dict[str, Any]] = []
+        if isinstance(channel, discord.TextChannel):
+            try:
+                transcript = await self.tools.get_recent_transcript(channel.id, limit=30) if self.tools else []
+            except Exception:
+                transcript = []
+
+        context = {
+            "author_id": user.id,
+            "guild_id": guild.id if guild else 0,
+            "channel_id": getattr(channel, "id", 0),
+            "message_id": 0,
+            "confirmed": True,
+            "power_mode": self._power_mode_enabled(),
+            "repair": {
+                "slug": slug,
+                "path": path_norm,
+                "current_source": current_source,
+                "last_error": (fix_info or {}).get("error") if fix_info else "",
+            },
+        }
+
+        try:
+            payload = await self._call_router(
+                f"Repair tool {slug}",
+                transcript,
+                context,
+                confirmed=True,
+                guild=guild,
+                channel=channel,
+                model_override=model,
+                provider_override=provider,
+                force_intent="BUILD_TOOL",
+            )
+        except LocalRateLimitError as exc:
+            await self._send_chunks(channel, f"Fix rate-limited. Try again in {_format_wait(exc.wait_seconds)}.")
+            self._record_rate_limit(exc.wait_seconds, "local")
+            return True
+        except GeminiRateLimitError as exc:
+            wait = exc.retry_after if exc.retry_after else self._backoff_seconds(0)
+            await self._send_chunks(channel, f"Fix rate-limited by Gemini. Try again in {_format_wait(wait)}.")
+            self._record_rate_limit(wait, "gemini")
+            return True
+        except AgentRouterRateLimitError as exc:
+            wait = exc.retry_after if exc.retry_after else self._backoff_seconds(0)
+            await self._send_chunks(channel, f"Fix rate-limited by AgentRouter. Try again in {_format_wait(wait)}.")
+            self._record_rate_limit(wait, "agent_router")
+            return True
+        except Exception as exc:
+            await self._send_chunks(channel, f"Fix failed: {exc}")
+            return True
+
+        if payload.get("intent") != "BUILD_TOOL":
+            await self._send_chunks(channel, "Fix failed: router did not return BUILD_TOOL.")
+            return True
+
+        response = payload.get("response") or ""
+        build = payload.get("build") or {}
+        ok, _ = await self._handle_build_tool(user.id, channel, build, allow_overwrite=True, expected_slug=slug)
+        if not ok:
+            return True
+        if response:
+            await self._send_chunks(channel, response)
+        actions = payload.get("actions") or []
+        if actions:
+            results = await self._execute_actions(user.id, actions, guild=guild, channel=channel, message_id=0)
+            await self._send_chunks(channel, "\n".join(results))
+        return True
 
     async def handle_mention(self, message: discord.Message, text: str) -> bool:
         if not await self._is_god_user(message.author):
@@ -1512,6 +1691,10 @@ class MandyAI(commands.Cog):
             system_prompt += "User already confirmed. Do NOT return NEEDS_CONFIRMATION.\n"
         if force_intent:
             system_prompt += f"FORCED INTENT: You MUST return intent={force_intent}. Do not return other intents.\n"
+        system_prompt += (
+            "If Context includes a 'repair' object, you MUST return BUILD_TOOL for the same slug "
+            "and replace the existing tool file in extensions/. Keep the tool name and args compatible unless explicitly asked.\n"
+        )
         system_prompt += (
             "For BUILD: primary file must be extensions/<slug>.py; files must live under extensions/ and end with .py, <=200KB. "
             "Allowed imports: discord, discord.ext.commands, typing, datetime, json, re, asyncio, math, random. "
@@ -1863,7 +2046,14 @@ class MandyAI(commands.Cog):
             lines.append(f"Counters: {counter_text}")
         return "\n".join(lines)
 
-    async def _handle_build_tool(self, user_id: int, channel: discord.abc.Messageable, build: Dict[str, Any]) -> Tuple[bool, str]:
+    async def _handle_build_tool(
+        self,
+        user_id: int,
+        channel: discord.abc.Messageable,
+        build: Dict[str, Any],
+        allow_overwrite: bool = False,
+        expected_slug: Optional[str] = None,
+    ) -> Tuple[bool, str]:
         if not self.plugin_manager:
             await self._send_chunks(channel, "Build failed: plugin manager unavailable.")
             return False, "plugin manager missing"
@@ -1873,11 +2063,16 @@ class MandyAI(commands.Cog):
         if not re.fullmatch(r"[a-z0-9_]{3,32}", slug):
             await self._send_chunks(channel, "Build failed: invalid slug.")
             return False, "invalid slug"
+        if expected_slug and slug != expected_slug:
+            await self._send_chunks(channel, f"Build failed: slug mismatch (expected {expected_slug}).")
+            return False, "slug mismatch"
         if not isinstance(files, list) or not files:
             await self._send_chunks(channel, "Build failed: missing files.")
             return False, "missing files"
 
-        written_paths = []
+        written_paths: List[str] = []
+        attempted_files: Dict[str, str] = {}
+        backups: Dict[str, Optional[str]] = {}
         for f in files:
             if not isinstance(f, dict):
                 await self._send_chunks(channel, "Build failed: bad file entry.")
@@ -1885,31 +2080,46 @@ class MandyAI(commands.Cog):
             path = str(f.get("path") or "")
             content = str(f.get("content") or "")
             path_norm = path.replace("\\", "/")
+            attempted_files[path_norm] = content
             if not path_norm.startswith("extensions/"):
                 await self._send_chunks(channel, "Build failed: files must live under extensions/.")
+                self._record_pending_fix(user_id, slug, attempted_files, "path outside extensions")
                 return False, "path outside extensions"
             if not path_norm.endswith(".py"):
                 await self._send_chunks(channel, "Build failed: extension must be a .py file.")
+                self._record_pending_fix(user_id, slug, attempted_files, "invalid extension path")
                 return False, "invalid extension path"
             if not written_paths and not path_norm.endswith(f"/{slug}.py"):
                 await self._send_chunks(channel, f"Build failed: primary file must be extensions/{slug}.py.")
+                self._record_pending_fix(user_id, slug, attempted_files, "primary file mismatch")
                 return False, "primary file mismatch"
             ok, err = validate_extension_path(path)
             if not ok:
                 await self._send_chunks(channel, f"Build failed: {err}")
+                self._record_pending_fix(user_id, slug, attempted_files, err)
                 return False, err
             if os.path.exists(path):
-                await self._send_chunks(channel, "Build failed: file already exists.")
-                return False, "file exists"
+                if not allow_overwrite:
+                    await self._send_chunks(channel, "Build failed: file already exists.")
+                    self._record_pending_fix(user_id, slug, attempted_files, "file exists")
+                    return False, "file exists"
+                try:
+                    with open(path, "r", encoding="utf-8") as fhandle:
+                        backups[path] = fhandle.read()
+                except Exception:
+                    backups[path] = None
             if len(content.encode("utf-8")) > 200 * 1024:
                 await self._send_chunks(channel, "Build failed: file too large.")
+                self._record_pending_fix(user_id, slug, attempted_files, "file too large")
                 return False, "file too large"
             if "TOOL_EXPORTS" not in content:
                 await self._send_chunks(channel, "Build failed: TOOL_EXPORTS required.")
+                self._record_pending_fix(user_id, slug, attempted_files, "missing TOOL_EXPORTS")
                 return False, "missing TOOL_EXPORTS"
             valid, errors = validate_extension_source("", content)
             if not valid:
                 await self._send_chunks(channel, "Build failed:\n" + "\n".join(errors[:8]))
+                self._record_pending_fix(user_id, slug, attempted_files, "validation failed")
                 return False, "validation failed"
 
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1918,6 +2128,12 @@ class MandyAI(commands.Cog):
             written_paths.append(path)
 
         try:
+            primary_path = written_paths[0].replace("\\", "/")
+            module_name = os.path.splitext(primary_path)[0].replace("/", ".")
+            if allow_overwrite and self.tools:
+                for tool_name, meta in list(self.tools.dynamic_tools.items()):
+                    if meta.get("module") == module_name:
+                        self.tools.unregister_dynamic_tool(tool_name)
             if self.plugin_manager:
                 for path in written_paths:
                     await self.plugin_manager.load_plugin(path)
@@ -1925,9 +2141,25 @@ class MandyAI(commands.Cog):
             for path in written_paths:
                 try:
                     if os.path.exists(path):
-                        os.remove(path)
+                        if allow_overwrite and path in backups:
+                            prior = backups.get(path)
+                            if prior is None:
+                                os.remove(path)
+                            else:
+                                with open(path, "w", encoding="utf-8") as fhandle:
+                                    fhandle.write(prior)
+                        else:
+                            os.remove(path)
                 except Exception:
                     pass
+            if allow_overwrite and self.plugin_manager:
+                try:
+                    primary_path = written_paths[0].replace("\\", "/")
+                    if os.path.exists(primary_path):
+                        await self.plugin_manager.load_plugin(primary_path)
+                except Exception:
+                    pass
+            self._record_pending_fix(user_id, slug, attempted_files, f"plugin load error: {exc}")
             await self._send_chunks(channel, f"Build failed: plugin load error: {exc}")
             return False, "plugin load error"
 
@@ -1964,6 +2196,7 @@ class MandyAI(commands.Cog):
         guild: Optional[discord.Guild],
         channel: Optional[discord.abc.Messageable],
         model_override: Optional[str] = None,
+        provider_override: Optional[str] = None,
         force_intent: Optional[str] = None,
     ) -> dict:
         tts_model = str(self._cfg().get("tts_model") or "")
@@ -1978,17 +2211,29 @@ class MandyAI(commands.Cog):
             force_intent=force_intent,
         )
         model = model_override or self._router_model()
+        provider = (provider_override or "gemini").strip().lower()
         tokens_in = self._estimate_tokens(sys_prompt + user_prompt)
         wait = self._check_local_limits(model, tokens_in)
         if wait > 0:
             raise LocalRateLimitError(wait)
-        text = await self.client.generate(
-            sys_prompt,
-            user_prompt,
-            model=model,
-            response_format="json",
-            timeout=60.0,
-        )
+        if provider == "agent_router":
+            if not self.agent_client or not self.agent_client.available:
+                raise RuntimeError("AgentRouter API key missing or client unavailable")
+            text = await self.agent_client.generate(
+                sys_prompt,
+                user_prompt,
+                model=model,
+                response_format="json",
+                timeout=60.0,
+            )
+        else:
+            text = await self.client.generate(
+                sys_prompt,
+                user_prompt,
+                model=model,
+                response_format="json",
+                timeout=60.0,
+            )
         self._counter_inc("router_calls", 1)
         tokens_out = self._estimate_tokens(text)
         self._record_usage(model, tokens_in, tokens_out)
@@ -2035,6 +2280,19 @@ class MandyAI(commands.Cog):
         if text_query and self._fast_path_enabled():
             handled = await self._handle_fast_path(user, channel, guild, msg, text_query)
             if handled:
+                return
+
+        if text_query:
+            fix_req = self._parse_fix_request(text_query)
+            if fix_req:
+                await self._run_tool_fix(
+                    user,
+                    channel,
+                    guild,
+                    fix_req.get("slug", ""),
+                    provider_hint=fix_req.get("provider") or None,
+                    model_hint=fix_req.get("model") or None,
+                )
                 return
 
         if msg:
@@ -2114,6 +2372,13 @@ class MandyAI(commands.Cog):
             wait = exc.retry_after if exc.retry_after else max(self._backoff_seconds(0), local_wait)
             await self._enqueue_rate_limit(channel, user.id, message_id, text_query, wait, 0)
             self._record_rate_limit(wait, "gemini")
+            return
+        except AgentRouterRateLimitError as exc:
+            if from_queue:
+                raise
+            wait = exc.retry_after if exc.retry_after else self._backoff_seconds(0)
+            await self._enqueue_rate_limit(channel, user.id, message_id, text_query, wait, 0)
+            self._record_rate_limit(wait, "agent_router")
             return
         except Exception as exc:
             await self._send_chunks(channel, f"Router error: {exc}")

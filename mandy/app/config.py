@@ -80,6 +80,15 @@ MYSQL_DB = SECRETS.get("MYSQL_DB") or os.getenv("MYSQL_DB")
 MYSQL_USER = SECRETS.get("MYSQL_USER") or os.getenv("MYSQL_USER")
 MYSQL_PASS = SECRETS.get("MYSQL_PASS") or os.getenv("MYSQL_PASS")
 GEMINI_API_KEY = SECRETS.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+AGENT_ROUTER_TOKEN = (
+    SECRETS.get("AGENT_ROUTER_TOKEN")
+    or SECRETS.get("AGENTKEY")
+    or SECRETS.get("AGENT_KEY")
+    or os.getenv("AGENT_ROUTER_TOKEN")
+    or os.getenv("AGENTKEY")
+    or os.getenv("AGENT_KEY")
+)
+AGENT_ROUTER_BASE_URL = SECRETS.get("AGENT_ROUTER_BASE_URL") or os.getenv("AGENT_ROUTER_BASE_URL") or "https://agentrouter.org/v1"
 
 MYSQL_ENABLED = bool(MYSQL_HOST and MYSQL_DB and MYSQL_USER is not None)
 

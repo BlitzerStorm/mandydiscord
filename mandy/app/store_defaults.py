@@ -53,6 +53,7 @@ DEFAULT_JSON: Dict[str, Any] = {
         "default_model": "gemini-2.5-flash-lite",
         "router_model": "gemini-2.5-flash-lite",
         "build_model": "gemini-2.5-pro",
+        "agent_router_model": "",
         "tts_model": "",
         "cooldown_seconds": 5,
         "fast_path": False,
