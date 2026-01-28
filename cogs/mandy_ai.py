@@ -338,6 +338,27 @@ class MandyAI(commands.Cog):
         except Exception as e:
             print(f"Warning: Could not initialize intelligence layer: {e}")
 
+    def _ensure_queue_tasks(self) -> None:
+        """
+        Ensure queued jobs have a running asyncio task.
+
+        Note: queue state lives in database.json; tasks are in-memory and can be lost on restart,
+        so we reschedule opportunistically.
+        """
+        for job_id, job in list(self._queue().items()):
+            status = str(job.get("status", "pending"))
+            if status not in ("pending", "waiting"):
+                continue
+            task = self._queue_tasks.get(job_id)
+            if task and not task.done():
+                continue
+            # Auto-run queued jobs; they will self-reschedule on further rate limits.
+            job["status"] = "waiting"
+            try:
+                self._queue_tasks[job_id] = asyncio.create_task(self._run_job(job_id))
+            except Exception:
+                continue
+
     def _cfg(self) -> Dict[str, Any]:
         if callable(self._cfg_fn):
             return self._cfg_fn()
@@ -2540,7 +2561,7 @@ class MandyAI(commands.Cog):
             "channel_id": getattr(channel, "id", 0),
             "message_id": message_id,
             "query": query,
-            "status": "pending",
+            "status": "waiting",
             "attempts": attempts,
             "next_retry_at": _now_ts() + int(wait_seconds),
             "created_at": _now_ts(),
@@ -2549,6 +2570,9 @@ class MandyAI(commands.Cog):
             self._queue()[job_id] = job
             await self._mark_dirty()
         self._counter_inc("queued", 1)
+
+        # Ensure there's a runner task even if the user never clicks WAIT.
+        self._ensure_queue_tasks()
 
         wait_text = _format_wait(wait_seconds)
         msg = f"Rate-limited. Next attempt in ~{wait_text}. Choose: [WAIT] [CANCEL]. Job: {job_id}"
@@ -2640,9 +2664,14 @@ class MandyAI(commands.Cog):
             if not job:
                 return
             job["status"] = "waiting"
+            try:
+                # If the user clicks WAIT after the retry time, run ASAP.
+                if int(job.get("next_retry_at", 0) or 0) <= _now_ts():
+                    job["next_retry_at"] = _now_ts()
+            except Exception:
+                job["next_retry_at"] = _now_ts()
             await self._mark_dirty()
-        if job_id not in self._queue_tasks or self._queue_tasks[job_id].done():
-            self._queue_tasks[job_id] = asyncio.create_task(self._run_job(job_id))
+        self._ensure_queue_tasks()
 
     async def cancel_job(self, job_id: str, silent: bool = False):
         async with self._queue_lock:
@@ -2685,6 +2714,7 @@ class MandyAI(commands.Cog):
     async def mandy_cmd(self, ctx: commands.Context, *, query: str = ""):
         if not await self._require_god(ctx):
             return
+        self._ensure_queue_tasks()
         await self._post_internal_thought(query)
         await self._process_request(ctx.author, ctx.channel, ctx.guild, ctx.message.id, query)
 
@@ -2759,6 +2789,7 @@ class MandyAI(commands.Cog):
     async def mandy_ping(self, ctx: commands.Context):
         if not await self._require_god(ctx):
             return
+        self._ensure_queue_tasks()
         ai = self._cfg()
         lines: List[str] = []
         errors: List[str] = []
