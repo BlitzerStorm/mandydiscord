@@ -971,6 +971,8 @@ class MandyAI(commands.Cog):
             return False
 
         lower = text.lower()
+        if re.match(r"^(?:new|create|build)\s+tool\b|^tool\s+(?:new|create|build)\b", lower):
+            return False
 
         if lower in ("tools", "tool", "capabilities"):
             snapshot = self._capabilities_snapshot(guild, channel)
@@ -1485,6 +1487,8 @@ class MandyAI(commands.Cog):
             f"If user requests a new command/feature, prefer {tool_pref}. "
             "If action is risky/irreversible, return NEEDS_CONFIRMATION.\n"
             "For TALK: be direct, helpful, and creative when appropriate. Ask a short clarification question if needed.\n"
+            "If the user asks to create a new tool but gives no spec, ask ONE concise question. "
+            "Do NOT list tools unless the user asks for a list.\n"
             f"BUILD-IF-MISSING: If the request cannot be satisfied using allowed tools, return {missing_pref}. "
             "Do not fabricate answers or claim to have executed actions without ACTION.\n"
             "If the user request is ambiguous, return NEEDS_CONFIRMATION with a clarification question.\n"
