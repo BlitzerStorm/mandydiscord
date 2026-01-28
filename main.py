@@ -816,7 +816,12 @@ async def _update_setup_status_panel(results: List[SetupPhaseResult], note: str 
     if not ch:
         return
     lines = ["**Mandy Setup Status**"]
-    now_text = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    now_text = (
+        datetime.datetime.now(datetime.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
     lines.append(f"Updated: {now_text}")
     for r in results:
         icon = {
@@ -1272,7 +1277,7 @@ def chat_stats_guild_state(guild_id: int) -> Dict[str, Any]:
     return gstate
 
 def chat_stats_day_key(dt: Optional[datetime.datetime] = None) -> str:
-    ts = dt or datetime.datetime.utcnow()
+    ts = dt or datetime.datetime.now(datetime.timezone.utc)
     if ts.tzinfo is not None:
         ts = ts.astimezone(datetime.timezone.utc).replace(tzinfo=None)
     return ts.date().isoformat()
@@ -1337,7 +1342,7 @@ def window_needs_reset(window: str, entry: Dict[str, Any], now_dt: datetime.date
     last_reset = int(entry.get("last_reset", 0))
     if not last_reset:
         return True
-    last_dt = datetime.datetime.utcfromtimestamp(last_reset)
+    last_dt = datetime.datetime.fromtimestamp(last_reset, datetime.timezone.utc)
     return window_key_for_dt(window, last_dt) != window_key_for_dt(window, now_dt)
 
 def rolling24_bucket_ts(dt: datetime.datetime) -> int:
@@ -1399,7 +1404,7 @@ async def chat_stats_increment(message: discord.Message, mark_dirty: bool = True
     if message.author.bot:
         return
 
-    now_dt = message.created_at or datetime.datetime.utcnow()
+    now_dt = message.created_at or datetime.datetime.now(datetime.timezone.utc)
     if now_dt.tzinfo is not None:
         now_dt = now_dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
     now_ts = int(now_dt.timestamp())
@@ -1505,7 +1510,7 @@ def chat_stats_window_state(guild: discord.Guild, window: str) -> Dict[str, Any]
     return gstate.setdefault(window, {})
 
 async def chat_stats_build_live_embed(guild: discord.Guild, window: str) -> Tuple[discord.Embed, bool]:
-    now_dt = datetime.datetime.utcnow()
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
     now_ts = int(now_dt.timestamp())
     window_state = chat_stats_window_state(guild, window)
     changed = False
@@ -1642,7 +1647,7 @@ def global_user_label(user_id: int) -> str:
     return str(user_id)
 
 def aggregate_global_stats(window: str) -> Tuple[Dict[str, int], Dict[str, Any], bool]:
-    now_dt = datetime.datetime.utcnow()
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
     now_ts = int(now_dt.timestamp())
     users: Dict[str, Dict[str, Any]] = {}
     changed = False
@@ -7556,7 +7561,7 @@ def _generate_phoenix_key(snapshot_id: str) -> str:
 
 
 def _snapshot_id(guild: discord.Guild) -> str:
-    stamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
     return f"ARK-{guild.id}-{stamp}"
 
 
@@ -8091,7 +8096,7 @@ async def setlogs(ctx: commands.Context, which: str, channel_id: int):
 async def cmd_mystats(ctx: commands.Context, window: str = None):
     await safe_delete(ctx.message)
     window = normalize_stats_window(window, "daily")
-    now_dt = datetime.datetime.utcnow()
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
     entry, changed = chat_stats_get_user_entry(ctx.guild, window, ctx.author.id, now_dt)
     if changed:
         await STORE.mark_dirty()
@@ -8558,7 +8563,7 @@ async def presence_controller():
 async def daily_reflection_loop():
     if not daily_reflection_enabled():
         return
-    now_dt = datetime.datetime.utcnow()
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
     if not _daily_reflection_due(now_dt):
         return
     thoughts = await _resolve_thoughts_channel()
@@ -8625,7 +8630,9 @@ async def diagnostics_loop():
     if not ch:
         return
     dm_bridges = await dm_bridge_list_active()
-    lines = [f"Diagnostics Snapshot (UTC {datetime.datetime.utcnow().replace(microsecond=0).isoformat()}Z)"]
+    lines = [
+        f"Diagnostics Snapshot (UTC {datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')})"
+    ]
     lines.extend(_diagnostic_status_lines(len(dm_bridges)))
     payload = "\n".join(lines[:25])
     diag = diagnostics_cfg()

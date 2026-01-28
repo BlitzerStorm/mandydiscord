@@ -79,7 +79,12 @@ MYSQL_HOST = SECRETS.get("MYSQL_HOST") or os.getenv("MYSQL_HOST")
 MYSQL_DB = SECRETS.get("MYSQL_DB") or os.getenv("MYSQL_DB")
 MYSQL_USER = SECRETS.get("MYSQL_USER") or os.getenv("MYSQL_USER")
 MYSQL_PASS = SECRETS.get("MYSQL_PASS") or os.getenv("MYSQL_PASS")
-GEMINI_API_KEY = SECRETS.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = (
+    SECRETS.get("GEMINI_API_KEY")
+    or os.getenv("GEMINI_API_KEY")
+    or SECRETS.get("GOOGLE_API_KEY")
+    or os.getenv("GOOGLE_API_KEY")
+)
 AGENT_ROUTER_TOKEN = (
     SECRETS.get("AGENT_ROUTER_TOKEN")
     or SECRETS.get("AGENTKEY")

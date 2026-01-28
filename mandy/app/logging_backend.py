@@ -31,7 +31,12 @@ _LOG_DEDUP: Dict[str, float] = {}
 
 
 def _log_now() -> str:
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def _clean_log_message(text: str) -> str:

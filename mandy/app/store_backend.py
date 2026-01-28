@@ -100,7 +100,7 @@ class JsonStore:
             pass
         except OSError:
             pass
-        timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         base = os.path.basename(self.path)
         backup_path = os.path.join(self.backup_dir, f"{base}.{timestamp}.bak")
         try:

@@ -16,14 +16,24 @@ class RateLimitView(discord.ui.View):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("Not authorized.", ephemeral=True)
         await self.cog.accept_job(self.job_id)
-        await interaction.response.edit_message(content="Queued. Will retry automatically.", view=None)
+        try:
+            await interaction.response.edit_message(content="Queued. Will retry automatically.", view=None)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        finally:
+            self.stop()
 
     @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.danger)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("Not authorized.", ephemeral=True)
         await self.cog.cancel_job(self.job_id)
-        await interaction.response.edit_message(content="Cancelled.", view=None)
+        try:
+            await interaction.response.edit_message(content="Cancelled.", view=None)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        finally:
+            self.stop()
 
 class ConfirmView(discord.ui.View):
     def __init__(self, cog, user_id: int, channel_id: int, query: str):

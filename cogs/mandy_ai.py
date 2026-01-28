@@ -685,10 +685,11 @@ class MandyAI(commands.Cog):
             daily["count"] = 0
             daily["tokens"] = 0
         if rpd and int(daily.get("count", 0)) >= rpd:
-            tomorrow = (datetime.datetime.utcnow() + datetime.timedelta(days=1)).replace(
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            tomorrow = (now_utc + datetime.timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
-            wait = max(wait, (tomorrow - datetime.datetime.utcnow()).total_seconds())
+            wait = max(wait, (tomorrow - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
 
         return max(0.0, wait)
 

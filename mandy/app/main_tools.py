@@ -378,7 +378,7 @@ class ToolRegistry:
         window = normalize_stats_window(scope, "daily")
         if window not in ("daily", "weekly", "monthly", "yearly", "rolling24"):
             window = "daily"
-        now_dt = datetime.datetime.utcnow()
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
 
         if user_id:
             uid = self._as_int(user_id, "user_id")
