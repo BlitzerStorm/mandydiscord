@@ -43,7 +43,7 @@ DEFAULT_JSON: Dict[str, Any] = {
     "menu_messages": {},
     "rbac": {"role_levels": config.ROLE_LEVEL_DEFAULTS.copy()},
     "auto": {"setup": True, "backfill": True, "backfill_limit": 50, "backfill_per_channel": 20, "backfill_delay": 0.2},
-    "tuning": {"setup_delay": 1.0},
+    "tuning": {"setup_delay": 1.0, "discord_send_delay": 0.0, "discord_send_adaptive": True},
     "ai": {
         "default_model": "gemini-2.5-flash-lite",
         "router_model": "gemini-2.5-flash-lite",

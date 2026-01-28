@@ -333,6 +333,52 @@ def typing_delay_seconds() -> float:
     except Exception:
         return 5.0
 
+def discord_send_delay_base() -> float:
+    try:
+        tuning = cfg().get("tuning", {})
+        if not isinstance(tuning, dict):
+            return 0.0
+        return max(0.0, float(tuning.get("discord_send_delay", 0.0)))
+    except Exception:
+        return 0.0
+
+def discord_send_delay() -> float:
+    override = state.DISCORD_SEND_DELAY_OVERRIDE
+    if override is not None:
+        try:
+            return max(0.0, float(override))
+        except Exception:
+            return discord_send_delay_base()
+    return discord_send_delay_base()
+
+def _discord_rate_limit_info(exc: Exception) -> Tuple[bool, Optional[float]]:
+    status = getattr(exc, "status", None)
+    retry_after = getattr(exc, "retry_after", None)
+    if status == 429 or retry_after is not None:
+        try:
+            retry_val = float(retry_after) if retry_after is not None else None
+        except Exception:
+            retry_val = None
+        return True, retry_val
+    msg = str(exc).lower()
+    if "rate limit" in msg or "too many requests" in msg:
+        return True, None
+    return False, None
+
+def _discord_adjust_send_delay(success: bool, retry_after: Optional[float] = None) -> None:
+    tuning = cfg().get("tuning", {})
+    if not isinstance(tuning, dict):
+        return
+    if not bool(tuning.get("discord_send_adaptive", True)):
+        return
+    current = state.DISCORD_SEND_DELAY_OVERRIDE if state.DISCORD_SEND_DELAY_OVERRIDE is not None else discord_send_delay_base()
+    if success:
+        new_delay = max(state.DISCORD_SEND_DELAY_MIN, current - state.DISCORD_SEND_DELAY_STEP)
+    else:
+        bump = (retry_after + 0.25) if retry_after else (current * 1.5 + 0.25)
+        new_delay = min(state.DISCORD_SEND_DELAY_MAX, max(current, bump))
+    state.DISCORD_SEND_DELAY_OVERRIDE = new_delay
+
 def dm_bridge_history_limit() -> int:
     try:
         return max(5, min(200, int(cfg().get("dm_bridge_history_limit", 50))))
@@ -379,7 +425,30 @@ def install_typing_delay_patch() -> None:
                 await typing_delay(self)
         except Exception:
             pass
-        return await _ORIG_MESSAGEABLE_SEND(self, *args, **kwargs)
+        if not _skip_typing_for_channel(self):
+            delay = discord_send_delay()
+            if delay > 0:
+                try:
+                    await asyncio.sleep(delay)
+                except Exception:
+                    pass
+        try:
+            result = await _ORIG_MESSAGEABLE_SEND(self, *args, **kwargs)
+            _discord_adjust_send_delay(success=True)
+            return result
+        except discord.HTTPException as exc:
+            is_rate, retry_after = _discord_rate_limit_info(exc)
+            if is_rate:
+                _discord_adjust_send_delay(success=False, retry_after=retry_after)
+                if retry_after and retry_after > 0:
+                    try:
+                        await asyncio.sleep(float(retry_after))
+                        result = await _ORIG_MESSAGEABLE_SEND(self, *args, **kwargs)
+                        _discord_adjust_send_delay(success=True)
+                        return result
+                    except Exception:
+                        pass
+            raise
 
     discord.abc.Messageable.send = _patched_send
     TYPING_DELAY_PATCHED = True

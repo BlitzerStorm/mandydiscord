@@ -432,6 +432,20 @@ class MandyAI(commands.Cog):
         self._counter_inc("rate_limits", 1)
         self._auto_tune(wait_seconds, source)
 
+    def _remaining_rate_limit_wait(self, sources: Optional[set] = None) -> float:
+        last = self._runtime.get("last_rate_limit") or {}
+        if sources and last.get("source") not in sources:
+            return 0.0
+        try:
+            wait_seconds = float(last.get("wait_seconds", 0) or 0)
+            at = float(last.get("at", 0) or 0)
+        except Exception:
+            return 0.0
+        if wait_seconds <= 0 or at <= 0:
+            return 0.0
+        remaining = wait_seconds - (time.time() - at)
+        return max(0.0, remaining)
+
     def _sentience_cfg(self) -> Dict[str, Any]:
         root = self._cfg_root() if callable(self._cfg_root_fn) else {}
         return root.setdefault("sentience", {})
@@ -2019,6 +2033,12 @@ class MandyAI(commands.Cog):
                 transcript = await self.tools.get_recent_transcript(channel.id, limit=50)
             except Exception:
                 transcript = []
+
+        if not from_queue:
+            remaining = self._remaining_rate_limit_wait({"gemini", "local"})
+            if remaining > 1:
+                await self._enqueue_rate_limit(channel, user.id, message_id, text_query, remaining, 0)
+                return
 
         context = {
             "author_id": user.id,
