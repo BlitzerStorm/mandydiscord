@@ -4180,6 +4180,7 @@ async def _purge_setup_dms(user_id: int) -> None:
             if ch:
                 try:
                     await ch.delete()
+                    await setup_pause()
                 except Exception:
                     pass
         if state.POOL:
@@ -4200,6 +4201,7 @@ async def _purge_setup_dms(user_id: int) -> None:
             if msg.author and bot.user and msg.author.id == bot.user.id:
                 try:
                     await msg.delete()
+                    await setup_pause()
                 except Exception:
                     pass
     except Exception:
@@ -5157,15 +5159,13 @@ async def run_setup_bio(guild: discord.Guild, actor_id: int) -> None:
     prev_override = state.SETUP_DELAY_OVERRIDE
     paused_state: Optional[Dict[str, Any]] = None
     bio_setup_cfg = sentience_cfg(cfg()).setdefault("bio_setup", {})
-    pause_background = bool(bio_setup_cfg.get("pause_background", True))
     resume_background = bool(bio_setup_cfg.get("resume_background", False))
     try:
         async with state.AUTO_SETUP_LOCK:
             state.SETUP_ADAPTIVE_ACTIVE = True
             if state.SETUP_DELAY_OVERRIDE is None:
                 state.SETUP_DELAY_OVERRIDE = setup_delay_base()
-            if pause_background:
-                paused_state = await _pause_background_tasks_for_setup()
+            paused_state = await _pause_background_tasks_for_setup()
             system_log = await _setup_bio_preflight(guild)
             if not system_log:
                 await setup_log("BIO-GENESIS aborted: recovery anchor failed.")
