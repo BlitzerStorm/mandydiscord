@@ -69,6 +69,8 @@ DEFAULT_JSON: Dict[str, Any] = {
     "mandy": {"mention_dm_cooldowns": {}, "power_mode": True},
     "ai_layout": {"enabled": False, "layout": {}, "log_channels": {}, "command_channels": {}, "gate": {}, "updated_at": 0},
     "soc_access": {
+        "sync_interval_minutes": 30,
+        "initial_delay_seconds": 60,
         "sections": {
             "docs": {"role": "SEC:DOCS", "default": True},
             "guest_area": {"role": "SEC:GUEST-AREA", "default": True},

@@ -970,6 +970,13 @@ async def run_boot_orchestrator() -> List[SetupPhaseResult]:
         admin = bot.get_guild(ADMIN_GUILD_ID)
         if admin:
             try:
+                initial_delay = int(soc_access_cfg().get("initial_delay_seconds", 60) or 60)
+            except Exception:
+                initial_delay = 60
+            initial_delay = max(0, min(3600, initial_delay))
+            if initial_delay:
+                await asyncio.sleep(initial_delay)
+            try:
                 await soc_apply_core_permissions(admin)
                 await soc_apply_admin_server_permissions()
             except Exception:
@@ -2966,7 +2973,10 @@ async def ensure_roles(guild: discord.Guild):
         pass
 
 def soc_access_cfg() -> Dict[str, Any]:
-    return cfg().setdefault("soc_access", {})
+    access = cfg().setdefault("soc_access", {})
+    access.setdefault("sync_interval_minutes", 30)
+    access.setdefault("initial_delay_seconds", 60)
+    return access
 
 def soc_onboarding_cfg() -> Dict[str, Any]:
     return cfg().setdefault("soc_onboarding", {})
@@ -9351,11 +9361,21 @@ async def manual_upload_loop():
 async def dm_bridge_archive():
     await archive_inactive_dm_bridges()
 
-@tasks.loop(minutes=10)
+_soc_access_last_sync_ts = 0
+
+@tasks.loop(minutes=1)
 async def soc_access_sync_loop():
+    global _soc_access_last_sync_ts
     admin = bot.get_guild(ADMIN_GUILD_ID)
     if not admin:
         return
+    access = soc_access_cfg()
+    interval_minutes = int(access.get("sync_interval_minutes", 30) or 30)
+    interval_minutes = max(1, interval_minutes)
+    now = now_ts()
+    if _soc_access_last_sync_ts and (now - _soc_access_last_sync_ts) < (interval_minutes * 60):
+        return
+    _soc_access_last_sync_ts = now
     try:
         await soc_apply_core_permissions(admin)
         await soc_apply_admin_server_permissions()
@@ -9368,6 +9388,16 @@ async def soc_access_sync_loop():
             await soc_sync_member_access(member)
         except Exception:
             continue
+
+@soc_access_sync_loop.before_loop
+async def _soc_access_sync_before_loop():
+    try:
+        delay = int(soc_access_cfg().get("initial_delay_seconds", 60) or 60)
+    except Exception:
+        delay = 60
+    delay = max(0, min(3600, delay))
+    if delay:
+        await asyncio.sleep(delay)
 
 @bot.event
 async def on_member_join(member: discord.Member):
