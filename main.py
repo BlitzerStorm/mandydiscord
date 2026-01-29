@@ -56,6 +56,8 @@ from mandy.app.config import (
 )
 from mandy.app.store import STORE, MENTION_COOLDOWN, cfg, ai_cfg
 from mandy.app import state
+from mandy.app.api_governor import set_governor_context, reset_governor_context
+from mandy.app.api_governor_discord import install_discord_governor
 from mandy.app.tasking import spawn_task
 from mandy.app.db import (
     db_init,
@@ -9595,6 +9597,7 @@ async def nuke(ctx: commands.Context, limit: int = 300, mode: str = "run"):
 @bot.event
 async def on_ready():
     await STORE.load()
+    install_discord_governor(bot)
     install_typing_delay_patch()
     await maybe_load_mandy_extension(bot)
     try:
@@ -9606,8 +9609,10 @@ async def on_ready():
 async def _before_command_invoke(ctx: commands.Context):
     try:
         ctx._typing_delay_token = COMMAND_CONTEXT.set(True)
+        ctx._governor_token = set_governor_context(essential=True, priority=80)
     except Exception:
         ctx._typing_delay_token = None
+        ctx._governor_token = None
 
 @bot.after_invoke
 async def _after_command_invoke(ctx: commands.Context):
@@ -9615,6 +9620,12 @@ async def _after_command_invoke(ctx: commands.Context):
         token = getattr(ctx, "_typing_delay_token", None)
         if token is not None:
             COMMAND_CONTEXT.reset(token)
+    except Exception:
+        pass
+    try:
+        token = getattr(ctx, "_governor_token", None)
+        if token is not None:
+            reset_governor_context(token)
     except Exception:
         pass
 

@@ -49,6 +49,22 @@ DEFAULT_JSON: Dict[str, Any] = {
         "discord_send_delay": 0.25,
         "discord_send_adaptive": True,
     },
+    "api_governor": {
+        "enabled": True,
+        "safe_window_seconds": 90.0,
+        "recovery_step": 0.08,
+        "jitter_ratio": 0.2,
+        "min_jitter_ms": 15,
+        "max_jitter_ms": 120,
+        "max_queue": 10000,
+        "breaker": {"threshold": 4, "window_seconds": 30.0, "cooldown_seconds": 60.0},
+        "buckets": {
+            "LOW": {"max_rate": 2.0, "refill_speed": 2.0, "cooldown_multiplier": 1.5, "min_rate": 0.2},
+            "MEDIUM": {"max_rate": 5.0, "refill_speed": 5.0, "cooldown_multiplier": 1.8, "min_rate": 0.3},
+            "HIGH": {"max_rate": 10.0, "refill_speed": 10.0, "cooldown_multiplier": 2.2, "min_rate": 0.4},
+            "CRITICAL": {"max_rate": 20.0, "refill_speed": 20.0, "cooldown_multiplier": 2.5, "min_rate": 0.6},
+        },
+    },
     "ai": {
         "default_model": "gemini-2.5-flash-lite",
         "router_model": "gemini-2.5-flash-lite",

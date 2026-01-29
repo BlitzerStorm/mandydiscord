@@ -23,6 +23,8 @@ ACTIVE_TASKS: Dict[str, Set[asyncio.Task]] = {}
 MANDY_EXTENSION = "cogs.mandy_ai"
 MANDY_LOADED = False
 
+API_GOVERNOR = None
+
 SETUP_ADAPTIVE_ACTIVE = False
 SETUP_DELAY_OVERRIDE: Optional[float] = None
 SETUP_DELAY_MIN = 0.4
