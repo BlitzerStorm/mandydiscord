@@ -300,6 +300,7 @@ By default, Mandy AI is GOD-only.
 
 Entry points:
 - `!mandy <prompt>`
+- `!mandyai <prompt>` (bypass fast path/regex and go straight to AI)
 - Mention the bot with a prompt (GOD-only): `@Mandy do the thing`
 
 Control commands:
@@ -313,6 +314,7 @@ Control commands:
 How requests are handled:
 1) The intelligent "fast path" tries to interpret common natural-language intents without calling Gemini.
 2) If fast path cannot confidently handle it, Mandy asks whether to submit to AI.
+   - `!mandyai` skips the fast path and submits directly to AI.
 3) If Gemini fails or rate-limits, Mandy automatically falls back to the other model (AgentRouter) and announces it.
 4) If both models fail, the request is cancelled and the user is notified.
 

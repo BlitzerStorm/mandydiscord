@@ -2350,7 +2350,10 @@ class MandyAI(commands.Cog):
                 msg = None
 
         fast_path_failed = False
-        if text_query and self._fast_path_enabled():
+        skip_fast_path = False
+        if isinstance(extra_context, dict):
+            skip_fast_path = bool(extra_context.get("skip_fast_path", False))
+        if text_query and self._fast_path_enabled() and not skip_fast_path:
             handled = await self._handle_fast_path(user, channel, guild, msg, text_query)
             if handled:
                 return
@@ -2794,6 +2797,21 @@ class MandyAI(commands.Cog):
         self._ensure_queue_tasks()
         await self._post_internal_thought(query)
         await self._process_request(ctx.author, ctx.channel, ctx.guild, ctx.message.id, query)
+
+    @commands.command(name="mandyai")
+    async def mandy_ai_cmd(self, ctx: commands.Context, *, query: str = ""):
+        if not await self._require_god(ctx):
+            return
+        self._ensure_queue_tasks()
+        await self._post_internal_thought(query)
+        await self._process_request(
+            ctx.author,
+            ctx.channel,
+            ctx.guild,
+            ctx.message.id,
+            query,
+            extra_context={"skip_fast_path": True},
+        )
 
     @commands.command(name="mandy_model")
     async def mandy_model(self, ctx: commands.Context, *, name: str):
