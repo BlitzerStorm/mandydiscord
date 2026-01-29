@@ -53,7 +53,7 @@ DEFAULT_JSON: Dict[str, Any] = {
         "default_model": "gemini-2.5-flash-lite",
         "router_model": "gemini-2.5-flash-lite",
         "build_model": "gemini-2.5-pro",
-        "agent_router_model": "",
+        "agent_router_model": "gpt-4o-mini",
         "tts_model": "",
         "cooldown_seconds": 5,
         "fast_path": False,
@@ -68,6 +68,23 @@ DEFAULT_JSON: Dict[str, Any] = {
     },
     "mandy": {"mention_dm_cooldowns": {}, "power_mode": True},
     "ai_layout": {"enabled": False, "layout": {}, "log_channels": {}, "command_channels": {}, "gate": {}, "updated_at": 0},
+    "soc_access": {
+        "sections": {
+            "docs": {"role": "SEC:DOCS", "default": True},
+            "guest_area": {"role": "SEC:GUEST-AREA", "default": True},
+            "guest_write": {"role": "SEC:GUEST-WRITE", "default": False},
+            "mirrors": {"role": "SEC:MIRRORS", "default": True},
+            "server_info": {"role": "SEC:SERVER-INFO", "default": True},
+        },
+        "users": {},
+    },
+    "soc_onboarding": {
+        "admin_invite_url": "",
+        "bot_invite_permissions": 8,
+        "token_ttl_minutes": 30,
+        "users": {},
+        "tokens": {},
+    },
     "roast": {
         "enabled": False,
         "trigger_word": "mandy",
@@ -108,7 +125,7 @@ DEFAULT_JSON: Dict[str, Any] = {
         "last_hash": "",
         "last_message_id": 0,
         "last_upload": 0,
-        "auto_upload_enabled": False,
+        "auto_upload_enabled": True,
     },
     "memory": {"events": []},
     "ark_snapshots": {},
@@ -121,7 +138,7 @@ DEFAULT_JSON: Dict[str, Any] = {
     "chat_stats_global_live_message": {},
     "layout": {
         "categories": {
-            "Welcome & Information": ["rules-and-guidelines", "announcements", "guest-briefing"],
+            "Welcome & Information": ["rules-and-guidelines", "announcements", "guest-briefing", "manual-for-living"],
             "Bot Control & Monitoring": ["bot-status", "command-requests", "error-reporting"],
             "Research & Development": ["algorithm-discussion", "data-analysis"],
             "Guest Access": ["guest-chat", "guest-feedback", "quarantine"],
@@ -134,6 +151,7 @@ DEFAULT_JSON: Dict[str, Any] = {
         "rules-and-guidelines": "Read these first. Required for all members.",
         "announcements": "Server announcements and updates.",
         "guest-briefing": "How to join and get approved.",
+        "manual-for-living": "Latest SOC manual uploads and operator runbooks.",
         "guest-chat": "Guest chat (limited).",
         "guest-feedback": "Feedback and questions from guests.",
         "quarantine": "Restricted holding channel.",

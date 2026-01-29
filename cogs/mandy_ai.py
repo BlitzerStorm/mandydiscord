@@ -20,7 +20,7 @@ except Exception:
 
 from .mandy_ai_gemini import GeminiClient, GeminiRateLimitError
 from .mandy_ai_agent_router import AgentRouterClient, AgentRouterRateLimitError
-from .mandy_ai_views import ConfirmView, RateLimitView, UserPickView
+from .mandy_ai_views import ConfirmView, RateLimitView, UserPickView, SubmitToAIView
 
 
 from mandy.capability_registry import CapabilityRegistry
@@ -384,6 +384,15 @@ class MandyAI(commands.Cog):
     def _agent_router_model(self) -> str:
         ai = self._cfg()
         return str(ai.get("agent_router_model") or "")
+
+    def _agent_router_fallback_model(self) -> str:
+        model = self._agent_router_model()
+        if model:
+            return model
+        return "gpt-4o-mini"
+
+    def _agent_router_available(self) -> bool:
+        return bool(self.agent_client and getattr(self.agent_client, "available", False))
 
     def _default_model(self) -> str:
         ai = self._cfg()
@@ -1213,20 +1222,6 @@ class MandyAI(commands.Cog):
             await self._send_chunks(channel, summary)
             return True
 
-        # Universal intelligence layer - handles natural language commands
-        if self._intelligence:
-            try:
-                if await self._intelligence.process(
-                    user,
-                    channel,
-                    guild,
-                    message,
-                    text,
-                    allow_intent_choice=True,
-                ):
-                    return True
-            except Exception as e:
-                print(f"Intelligence layer error (falling back): {e}")
         summary_limit = self._parse_transcript_summarize(text)
         if summary_limit:
             await self._summarize_transcript(user, channel, guild, summary_limit, query_text=text)
@@ -1295,6 +1290,22 @@ class MandyAI(commands.Cog):
             results = await self._execute_actions(user.id, actions, guild=guild, channel=channel)
             await self._send_chunks(channel, "\n".join(results))
             return True
+
+        # Universal intelligence layer - handles broader natural language after regex passes
+        if self._intelligence:
+            try:
+                if await self._intelligence.process(
+                    user,
+                    channel,
+                    guild,
+                    message,
+                    text,
+                    allow_intent_choice=False,
+                    allow_clarify=False,
+                ):
+                    return True
+            except Exception as e:
+                print(f"Intelligence layer error (falling back): {e}")
 
         return False
 
@@ -2338,10 +2349,12 @@ class MandyAI(commands.Cog):
             except Exception:
                 msg = None
 
+        fast_path_failed = False
         if text_query and self._fast_path_enabled():
             handled = await self._handle_fast_path(user, channel, guild, msg, text_query)
             if handled:
                 return
+            fast_path_failed = True
 
         if text_query:
             fix_req = self._parse_fix_request(text_query)
@@ -2407,6 +2420,23 @@ class MandyAI(commands.Cog):
                 await self._enqueue_rate_limit(channel, user.id, message_id, text_query, remaining, 0)
                 return
 
+        # If the regex/fast path did not handle the request, ask before submitting to AI.
+        if fast_path_failed and not confirmed_local and not power_mode and not from_queue:
+            lowered = text_query.lower()
+            explicit_ai = lowered.startswith("ai:") or "use ai" in lowered or "submit to ai" in lowered
+            if not explicit_ai:
+                prompt = "I couldn't confidently match that to a known command. Submit to AI?"
+                view = SubmitToAIView(self, user.id, getattr(channel, "id", 0), text_query)
+                await channel.send(prompt, view=view)
+                self._counter_inc("confirmations", 1)
+                return
+
+        provider_override = None
+        model_override = None
+        if isinstance(extra_context, dict):
+            provider_override = extra_context.get("provider_override") or None
+            model_override = extra_context.get("model_override") or None
+
         context = {
             "author_id": user.id,
             "guild_id": guild.id if guild else 0,
@@ -2418,8 +2448,34 @@ class MandyAI(commands.Cog):
         if extra_context:
             context.update(extra_context)
 
+        async def _call_primary() -> dict:
+            return await self._call_router(
+                text_query,
+                transcript,
+                context,
+                confirmed_local,
+                guild,
+                channel,
+                model_override=model_override,
+                provider_override=provider_override,
+            )
+
+        async def _call_fallback() -> dict:
+            model = self._agent_router_fallback_model()
+            await self._send_chunks(channel, f"Primary AI failed; falling back to other model ({model}).")
+            return await self._call_router(
+                text_query,
+                transcript,
+                context,
+                confirmed_local,
+                guild,
+                channel,
+                model_override=model,
+                provider_override="agent_router",
+            )
+
         try:
-            payload = await self._call_router(text_query, transcript, context, confirmed_local, guild, channel)
+            payload = await _call_primary()
         except LocalRateLimitError as exc:
             if from_queue:
                 raise
@@ -2429,16 +2485,20 @@ class MandyAI(commands.Cog):
         except GeminiRateLimitError as exc:
             if from_queue:
                 raise
-            fallback = await self._try_agent_router_fallback(
-                text_query,
-                transcript,
-                context,
-                confirmed_local,
-                guild,
-                channel,
-            )
-            if fallback:
-                payload = fallback
+            if provider_override == "agent_router":
+                local_wait = self._check_local_limits(self._router_model(), self._estimate_tokens(text_query))
+                wait = exc.retry_after if exc.retry_after else max(self._backoff_seconds(0), local_wait)
+                await self._enqueue_rate_limit(channel, user.id, message_id, text_query, wait, 0)
+                self._record_rate_limit(wait, "gemini")
+                return
+            if self._agent_router_available():
+                try:
+                    payload = await _call_fallback()
+                except Exception as fexc:
+                    if from_queue:
+                        raise RuntimeError(f"AI fallback failed after Gemini rate limit: {fexc}")
+                    await self._notify_user(user.id, getattr(channel, "id", 0), "Request failed: Gemini was rate-limited and the fallback model also failed. Please try again later.")
+                    return
             else:
                 local_wait = self._check_local_limits(self._router_model(), self._estimate_tokens(text_query))
                 wait = exc.retry_after if exc.retry_after else max(self._backoff_seconds(0), local_wait)
@@ -2453,8 +2513,20 @@ class MandyAI(commands.Cog):
             self._record_rate_limit(wait, "agent_router")
             return
         except Exception as exc:
-            await self._send_chunks(channel, f"Router error: {exc}")
-            return
+            if provider_override == "agent_router":
+                await self._send_chunks(channel, f"Other model error: {exc}")
+                return
+            if self._agent_router_available():
+                try:
+                    payload = await _call_fallback()
+                except Exception as fexc:
+                    if from_queue:
+                        raise RuntimeError(f"AI fallback failed: {fexc}")
+                    await self._notify_user(user.id, getattr(channel, "id", 0), "Request failed: Gemini errored and the fallback model also failed. Please try again later.")
+                    return
+            else:
+                await self._send_chunks(channel, f"Router error: {exc}")
+                return
 
         intent = payload.get("intent")
         build_model = self._build_model()
@@ -2640,7 +2712,11 @@ class MandyAI(commands.Cog):
             self._record_rate_limit(wait, "gemini")
             return
         except Exception as exc:
-            await self._notify_user(user_id, channel_id, f"Queued job failed: {exc}")
+            await self._notify_user(
+                user_id,
+                channel_id,
+                "Queued job failed: tried Gemini and the fallback model, but both failed. Please try again later.",
+            )
             await self.cancel_job(job_id)
             return
 

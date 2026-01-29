@@ -62,6 +62,28 @@ class ConfirmView(discord.ui.View):
             return await interaction.response.send_message("Not authorized.", ephemeral=True)
         await interaction.response.send_message("Waiting. Use CONFIRM when ready.", ephemeral=True)
 
+class SubmitToAIView(discord.ui.View):
+    def __init__(self, cog, user_id: int, channel_id: int, query: str):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.user_id = user_id
+        self.channel_id = channel_id
+        self.query = query
+
+    @discord.ui.button(label="SUBMIT TO AI", style=discord.ButtonStyle.success)
+    async def submit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("Not authorized.", ephemeral=True)
+        await interaction.response.edit_message(content="Submitting to AI...", view=None)
+        await self.cog.confirm_request(self.user_id, self.channel_id, self.query)
+
+    @discord.ui.button(label="CANCEL", style=discord.ButtonStyle.danger)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("Not authorized.", ephemeral=True)
+        await interaction.response.edit_message(content="Cancelled.", view=None)
+
+
 class UserPickView(discord.ui.View):
     def __init__(self, cog, requester_id: int, action: Dict[str, Any], candidates: List[Tuple[int, str]]):
         super().__init__(timeout=120)

@@ -965,6 +965,21 @@ async def run_boot_orchestrator() -> List[SetupPhaseResult]:
         await _start_task_if_needed(sentience_maintenance_loop)
         await _start_task_if_needed(diagnostics_loop)
         await _start_task_if_needed(manual_upload_loop)
+        await _start_task_if_needed(soc_access_sync_loop)
+        # One-time SOC permission + role sync (avoid waiting for the periodic loop).
+        admin = bot.get_guild(ADMIN_GUILD_ID)
+        if admin:
+            try:
+                await soc_apply_core_permissions(admin)
+                await soc_apply_admin_server_permissions()
+            except Exception:
+                pass
+            for member in list(getattr(admin, "members", []) or []):
+                if isinstance(member, discord.Member):
+                    try:
+                        await soc_sync_member_access(member)
+                    except Exception:
+                        continue
         await resume_live_stats_panels()
         await resume_global_live_panel()
         return "OK", "maintenance loops running"
@@ -2917,6 +2932,9 @@ async def ensure_roles(guild: discord.Guild):
     levels = rbac.setdefault("role_levels", {})
     for name, lvl in ROLE_LEVEL_DEFAULTS.items():
         levels.setdefault(name, lvl)
+    # migrate old Guest level defaults (historically 1) to 10 unless the operator has explicitly customized it
+    if levels.get(GUEST_ROLE_NAME) in (None, 1):
+        levels[GUEST_ROLE_NAME] = 10
     await STORE.mark_dirty()
 
     # reorder under bot top role
@@ -2947,30 +2965,392 @@ async def ensure_roles(guild: discord.Guild):
     except Exception:
         pass
 
-async def apply_guest_permissions(guild: discord.Guild):
-    guest = get_role(guild, GUEST_ROLE_NAME)
-    if not guest:
+def soc_access_cfg() -> Dict[str, Any]:
+    return cfg().setdefault("soc_access", {})
+
+def soc_onboarding_cfg() -> Dict[str, Any]:
+    return cfg().setdefault("soc_onboarding", {})
+
+def _soc_sections_def() -> Dict[str, Any]:
+    access = soc_access_cfg()
+    sections = access.get("sections")
+    if not isinstance(sections, dict):
+        access["sections"] = {}
+    return access.setdefault("sections", {})
+
+def _soc_users_cfg() -> Dict[str, Any]:
+    access = soc_access_cfg()
+    users = access.get("users")
+    if not isinstance(users, dict):
+        access["users"] = {}
+    return access.setdefault("users", {})
+
+def _soc_user_cfg(user_id: int) -> Dict[str, Any]:
+    users = _soc_users_cfg()
+    entry = users.get(str(user_id))
+    if not isinstance(entry, dict):
+        entry = {}
+        users[str(user_id)] = entry
+    return entry
+
+def _soc_section_role_name(section_key: str, fallback: str) -> str:
+    sections = _soc_sections_def()
+    ent = sections.get(section_key)
+    if isinstance(ent, dict) and ent.get("role"):
+        return str(ent.get("role"))
+    return fallback
+
+def _soc_section_default(section_key: str, fallback: bool) -> bool:
+    sections = _soc_sections_def()
+    ent = sections.get(section_key)
+    if isinstance(ent, dict) and "default" in ent:
+        return bool(ent.get("default"))
+    return fallback
+
+def _soc_role(guild: discord.Guild, name: str) -> Optional[discord.Role]:
+    return discord.utils.get(guild.roles, name=name)
+
+async def ensure_soc_section_roles(guild: discord.Guild) -> None:
+    if guild.id != ADMIN_GUILD_ID:
         return
-    gate_cfg = cfg().get("gate_layout", {})
-    guest_category_name = str(gate_cfg.get("category") or "Guest Access")
-    guest_briefing_name = str(gate_cfg.get("guest_briefing") or "guest-briefing")
-    guest_chat_name = str(gate_cfg.get("guest_chat") or "guest-chat")
-    allow_channel_names = {guest_briefing_name, guest_chat_name}
-    for cat in guild.categories:
+    role_names = [
+        _soc_section_role_name("docs", "SEC:DOCS"),
+        _soc_section_role_name("guest_area", "SEC:GUEST-AREA"),
+        _soc_section_role_name("guest_write", "SEC:GUEST-WRITE"),
+        _soc_section_role_name("mirrors", "SEC:MIRRORS"),
+        _soc_section_role_name("server_info", "SEC:SERVER-INFO"),
+    ]
+    existing = {r.name for r in guild.roles}
+    for name in role_names:
+        if name in existing:
+            continue
         try:
-            allow = cat.name == guest_category_name
-            if not allow:
-                for ch in cat.text_channels:
-                    if ch.name in allow_channel_names:
-                        allow = True
-                        break
-            if allow:
-                await cat.set_permissions(guest, view_channel=True, send_messages=True, read_message_history=True)
-            else:
-                await cat.set_permissions(guest, view_channel=False)
+            await guild.create_role(name=name, reason="Mandy SOC access role bootstrap")
             await setup_pause()
         except Exception:
+            continue
+
+def _soc_mirror_role_name(guild_id: int) -> str:
+    return f"SOC:MIRROR:{guild_id}"
+
+def _soc_info_role_name(guild_id: int) -> str:
+    return f"SOC:INFO:{guild_id}"
+
+async def _ensure_soc_server_roles(admin_guild: discord.Guild, source_guild_id: int) -> Tuple[Optional[discord.Role], Optional[discord.Role]]:
+    if admin_guild.id != ADMIN_GUILD_ID:
+        return None, None
+    mirror_name = _soc_mirror_role_name(source_guild_id)
+    info_name = _soc_info_role_name(source_guild_id)
+    mirror_role = _soc_role(admin_guild, mirror_name)
+    info_role = _soc_role(admin_guild, info_name)
+    if not mirror_role:
+        try:
+            mirror_role = await admin_guild.create_role(name=mirror_name, reason="Mandy SOC mirror access role")
+            await setup_pause()
+        except Exception:
+            mirror_role = None
+    if not info_role:
+        try:
+            info_role = await admin_guild.create_role(name=info_name, reason="Mandy SOC server-info access role")
+            await setup_pause()
+        except Exception:
+            info_role = None
+    return mirror_role, info_role
+
+async def soc_apply_core_permissions(guild: discord.Guild) -> None:
+    if guild.id != ADMIN_GUILD_ID:
+        return
+    await ensure_soc_section_roles(guild)
+
+    docs_role = _soc_role(guild, _soc_section_role_name("docs", "SEC:DOCS"))
+    guest_area_role = _soc_role(guild, _soc_section_role_name("guest_area", "SEC:GUEST-AREA"))
+    guest_write_role = _soc_role(guild, _soc_section_role_name("guest_write", "SEC:GUEST-WRITE"))
+
+    # Hide these channels from @everyone and expose via section roles.
+    docs_channels = [
+        "rules-and-guidelines",
+        "announcements",
+        "guest-briefing",
+        "manual-for-living",
+    ]
+    guest_read_channels = [
+        "guest-chat",
+        "guest-feedback",
+    ]
+
+    for name in docs_channels:
+        ch = discord.utils.get(guild.text_channels, name=name)
+        if not ch:
+            continue
+        try:
+            await ch.set_permissions(guild.default_role, view_channel=False)
+            if docs_role:
+                await ch.set_permissions(docs_role, view_channel=True, send_messages=False, read_message_history=True)
+        except Exception:
             pass
+
+    for name in guest_read_channels:
+        ch = discord.utils.get(guild.text_channels, name=name)
+        if not ch:
+            continue
+        try:
+            await ch.set_permissions(guild.default_role, view_channel=False)
+            if guest_area_role:
+                await ch.set_permissions(guest_area_role, view_channel=True, send_messages=False, read_message_history=True)
+            if guest_write_role:
+                await ch.set_permissions(guest_write_role, view_channel=True, send_messages=True, read_message_history=True)
+        except Exception:
+            pass
+
+    # Quarantine channel remains Quarantine-only.
+    try:
+        gate_cfg = cfg().get("gate_layout", {})
+        quarantine_name = str(gate_cfg.get("quarantine") or "quarantine")
+        qch = discord.utils.get(guild.text_channels, name=quarantine_name)
+        quarantine = get_role(guild, QUARANTINE_ROLE_NAME)
+        if qch and quarantine:
+            await qch.set_permissions(guild.default_role, view_channel=False)
+            await qch.set_permissions(quarantine, view_channel=True, send_messages=True, read_message_history=True)
+    except Exception:
+        pass
+
+async def soc_apply_admin_server_permissions() -> None:
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if not admin:
+        return
+    await ensure_soc_section_roles(admin)
+    state_map = cfg().get("admin_servers", {}) or {}
+    if not isinstance(state_map, dict):
+        return
+    for gid_s, entry in state_map.items():
+        if not str(gid_s).isdigit() or not isinstance(entry, dict):
+            continue
+        gid = int(gid_s)
+        mirror_feed = admin.get_channel(int(entry.get("mirror_feed", 0) or 0))
+        info_ch = admin.get_channel(int(entry.get("server_info", 0) or 0))
+        if not isinstance(mirror_feed, discord.TextChannel) and not isinstance(info_ch, discord.TextChannel):
+            continue
+        mirror_role, info_role = await _ensure_soc_server_roles(admin, gid)
+        try:
+            if isinstance(mirror_feed, discord.TextChannel):
+                await mirror_feed.set_permissions(admin.default_role, view_channel=False)
+                # Access role computed by sync: membership + section.
+                if mirror_role:
+                    await mirror_feed.set_permissions(mirror_role, view_channel=True, send_messages=False, read_message_history=True)
+        except Exception:
+            pass
+        try:
+            if isinstance(info_ch, discord.TextChannel):
+                await info_ch.set_permissions(admin.default_role, view_channel=False)
+                if info_role:
+                    await info_ch.set_permissions(info_role, view_channel=True, send_messages=False, read_message_history=True)
+        except Exception:
+            pass
+
+def _soc_user_section_overrides(user_id: int) -> Dict[str, Any]:
+    ent = _soc_user_cfg(user_id)
+    sections = ent.get("sections")
+    if not isinstance(sections, dict):
+        sections = {}
+        ent["sections"] = sections
+    return sections
+
+def _soc_user_guild_filters(user_id: int) -> Tuple[Optional[Set[int]], Set[int]]:
+    ent = _soc_user_cfg(user_id)
+    allowed_raw = ent.get("allowed_guilds", None)
+    denied_raw = ent.get("denied_guilds", []) or []
+    allowed: Optional[Set[int]] = None
+    if isinstance(allowed_raw, list) and allowed_raw:
+        allowed = {int(x) for x in allowed_raw if str(x).isdigit()}
+    denied = {int(x) for x in denied_raw if str(x).isdigit()}
+    return allowed, denied
+
+def _soc_section_enabled_for_member(member: discord.Member, section_key: str) -> bool:
+    # quarantine => nothing
+    if any(r.name == QUARANTINE_ROLE_NAME for r in member.roles):
+        return False
+    overrides = _soc_user_section_overrides(member.id)
+    if section_key in overrides:
+        return bool(overrides.get(section_key))
+    return _soc_section_default(section_key, False)
+
+async def soc_sync_member_access(member: discord.Member) -> None:
+    if member.guild.id != ADMIN_GUILD_ID:
+        return
+    await ensure_roles(member.guild)
+    await ensure_soc_section_roles(member.guild)
+
+    guest = get_role(member.guild, GUEST_ROLE_NAME)
+    quarantine = get_role(member.guild, QUARANTINE_ROLE_NAME)
+
+    # baseline identity roles
+    is_quarantined = bool(quarantine and quarantine in member.roles)
+    if not is_quarantined and guest and guest not in member.roles:
+        try:
+            await member.add_roles(guest, reason="SOC baseline Guest")
+        except Exception:
+            pass
+
+    # section roles
+    section_map = {
+        "docs": _soc_section_role_name("docs", "SEC:DOCS"),
+        "guest_area": _soc_section_role_name("guest_area", "SEC:GUEST-AREA"),
+        "guest_write": _soc_section_role_name("guest_write", "SEC:GUEST-WRITE"),
+        "mirrors": _soc_section_role_name("mirrors", "SEC:MIRRORS"),
+        "server_info": _soc_section_role_name("server_info", "SEC:SERVER-INFO"),
+    }
+    desired_section_roles: Set[discord.Role] = set()
+    for key, role_name in section_map.items():
+        role = _soc_role(member.guild, role_name)
+        if not role:
+            continue
+        if _soc_section_enabled_for_member(member, key):
+            desired_section_roles.add(role)
+
+    current_section_roles = {r for r in member.roles if r.name in set(section_map.values())}
+
+    # computed per-guild roles for admin mirror/info visibility
+    allowed, denied = _soc_user_guild_filters(member.id)
+    desired_server_roles: Set[discord.Role] = set()
+    current_server_roles = {r for r in member.roles if r.name.startswith("SOC:MIRROR:") or r.name.startswith("SOC:INFO:")}
+
+    if not is_quarantined:
+        want_mirrors = _soc_section_enabled_for_member(member, "mirrors")
+        want_info = _soc_section_enabled_for_member(member, "server_info")
+        for g in list(bot.guilds):
+            if not g or g.id == ADMIN_GUILD_ID:
+                continue
+            if denied and g.id in denied:
+                continue
+            if allowed is not None and g.id not in allowed:
+                continue
+            # membership check (cached)
+            if not g.get_member(member.id):
+                continue
+            mirror_role, info_role = await _ensure_soc_server_roles(member.guild, g.id)
+            if want_mirrors and mirror_role:
+                desired_server_roles.add(mirror_role)
+            if want_info and info_role:
+                desired_server_roles.add(info_role)
+
+    to_add = list((desired_section_roles | desired_server_roles) - (current_section_roles | current_server_roles))
+    to_remove = list((current_section_roles | current_server_roles) - (desired_section_roles | desired_server_roles))
+
+    if to_add:
+        try:
+            await member.add_roles(*to_add, reason="SOC access sync")
+        except Exception:
+            pass
+    if to_remove:
+        try:
+            await member.remove_roles(*to_remove, reason="SOC access sync")
+        except Exception:
+            pass
+
+async def soc_send_onboarding_dm(actor_id: int, target_user_id: int, guild_scope: Optional[Set[int]] = None) -> str:
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if not admin or not bot.user:
+        return "Admin hub or bot user not available."
+
+    # Record onboarding intent + optional server scope.
+    ucfg = _soc_user_cfg(target_user_id)
+    if guild_scope and len(guild_scope) > 0:
+        ucfg["allowed_guilds"] = sorted({int(x) for x in guild_scope if int(x) > 0})
+
+    onb = soc_onboarding_cfg()
+    onb_users = onb.setdefault("users", {})
+    onb_tokens = onb.setdefault("tokens", {})
+
+    ttl_minutes = int(onb.get("token_ttl_minutes", 30) or 30)
+    ttl_minutes = max(5, min(24 * 60, ttl_minutes))
+    token = secrets.token_urlsafe(8)
+    expires_at = now_ts() + ttl_minutes * 60
+    onb_tokens[str(target_user_id)] = {
+        "token": token,
+        "expires_at": int(expires_at),
+        "created_at": now_ts(),
+        "created_by": int(actor_id),
+    }
+    onb_users.setdefault(str(target_user_id), {})
+    onb_users[str(target_user_id)]["last_sent_at"] = now_ts()
+    onb_users[str(target_user_id)]["last_sent_by"] = int(actor_id)
+
+    # Admin hub invite
+    admin_invite_url = str(onb.get("admin_invite_url") or "").strip()
+    if not admin_invite_url:
+        ch = discord.utils.get(admin.text_channels, name="guest-briefing") or discord.utils.get(admin.text_channels, name="guest-chat")
+        if ch:
+            try:
+                inv = await ch.create_invite(
+                    max_age=ttl_minutes * 60,
+                    max_uses=1,
+                    unique=True,
+                    reason=f"SOC onboarding for {target_user_id}",
+                )
+                admin_invite_url = str(getattr(inv, "url", None) or str(inv))
+            except Exception:
+                admin_invite_url = ""
+
+    # Bot invite
+    perms_int = int(onb.get("bot_invite_permissions", 8) or 8)
+    perms_int = max(0, perms_int)
+    try:
+        bot_invite = discord.utils.oauth_url(
+            bot.user.id,
+            permissions=discord.Permissions(perms_int),
+            scopes=("bot", "applications.commands"),
+        )
+    except Exception:
+        bot_invite = ""
+
+    await STORE.mark_dirty()
+
+    try:
+        user = bot.get_user(target_user_id) or await bot.fetch_user(target_user_id)
+    except Exception:
+        user = None
+    if not user:
+        return "Target user not found."
+
+    scope_text = ""
+    if guild_scope:
+        names: List[str] = []
+        for gid in sorted(guild_scope)[:10]:
+            g = bot.get_guild(int(gid))
+            if g:
+                names.append(g.name)
+        scope_text = f"Server scope: {', '.join(names) if names else 'custom'}"
+
+    lines = [
+        "**Mandy SOC Onboarding**",
+        "",
+        "1) Invite the bot to your server:",
+        bot_invite or "(bot invite not available; ask an admin)",
+        "",
+        "2) Join the admin hub:",
+        admin_invite_url or "(admin hub invite not configured; ask an admin)",
+        "",
+        "3) Gate access:",
+        f"Paste this one-time token in your `gate-...` channel: `{token}`",
+        f"Expires: {fmt_ts(expires_at)}",
+    ]
+    if scope_text:
+        lines.extend(["", scope_text])
+
+    try:
+        await user.send("\n".join(lines))
+    except Exception:
+        return "DM failed (user may have DMs closed)."
+
+    await audit(actor_id, "SOC onboard DM sent", {"user_id": target_user_id, "scope": sorted(list(guild_scope or []))})
+    return "Onboarding DM sent."
+
+async def apply_guest_permissions(guild: discord.Guild):
+    # Backwards compatible entrypoint: "guest permissions" now means applying SOC section perms.
+    if guild.id != ADMIN_GUILD_ID:
+        return
+    await soc_apply_core_permissions(guild)
+    await soc_apply_admin_server_permissions()
 
 async def apply_quarantine_permissions(guild: discord.Guild):
     quarantine = get_role(guild, QUARANTINE_ROLE_NAME)
@@ -3010,10 +3390,17 @@ async def gate_approve_user(member: discord.Member):
     g = cfg().setdefault("gate", {})
     gate_info = g.pop(str(member.id), None)
     await STORE.mark_dirty()
-    guest = get_role(member.guild, GUEST_ROLE_NAME)
-    if guest in member.roles:
+    # Gate pass means: remove quarantine posture and ensure baseline Guest.
+    quarantine = get_role(member.guild, QUARANTINE_ROLE_NAME)
+    if quarantine and quarantine in member.roles:
         try:
-            await member.remove_roles(guest, reason="Gate approved")
+            await member.remove_roles(quarantine, reason="Gate approved")
+        except Exception:
+            pass
+    guest = get_role(member.guild, GUEST_ROLE_NAME)
+    if guest and guest not in member.roles:
+        try:
+            await member.add_roles(guest, reason="Gate approved (baseline Guest)")
         except Exception:
             pass
     # delete gate channel
@@ -3026,6 +3413,10 @@ async def gate_approve_user(member: discord.Member):
                     await ch.delete()
                 except Exception:
                     pass
+    try:
+        await soc_sync_member_access(member)
+    except Exception:
+        pass
 
 async def gate_quarantine_user(member: discord.Member, reason: str = ""):
     if member.guild.id != ADMIN_GUILD_ID:
@@ -3037,6 +3428,12 @@ async def gate_quarantine_user(member: discord.Member, reason: str = ""):
     if quarantine and quarantine not in member.roles:
         try:
             await member.add_roles(quarantine, reason="Gate quarantine")
+        except Exception:
+            pass
+    guest = get_role(member.guild, GUEST_ROLE_NAME)
+    if guest and guest in member.roles:
+        try:
+            await member.remove_roles(guest, reason="Gate quarantine")
         except Exception:
             pass
     # delete gate channel
@@ -3057,6 +3454,10 @@ async def gate_quarantine_user(member: discord.Member, reason: str = ""):
             await qch.send(f"Quarantine: <@{member.id}> {reason}".strip())
         except Exception:
             pass
+    try:
+        await soc_sync_member_access(member)
+    except Exception:
+        pass
 
 async def start_gate(member: discord.Member):
     if member.guild.id != ADMIN_GUILD_ID:
@@ -3095,6 +3496,10 @@ async def start_gate(member: discord.Member):
     await STORE.mark_dirty()
 
     await ch.send("Enter the server password. (Attempts auto-deleted)")
+    try:
+        await soc_sync_member_access(member)
+    except Exception:
+        pass
 
 async def handle_gate_attempt(message: discord.Message) -> bool:
     if not message.guild or message.guild.id != ADMIN_GUILD_ID:
@@ -3109,7 +3514,32 @@ async def handle_gate_attempt(message: discord.Message) -> bool:
     # consume attempt
     await safe_delete(message)
 
-    if SERVER_PASSWORD and (message.content or "").strip() == SERVER_PASSWORD:
+    content = (message.content or "").strip()
+    # Per-user SOC onboarding token (preferred)
+    try:
+        soc_onb = soc_onboarding_cfg()
+        tokens = soc_onb.get("tokens")
+        if isinstance(tokens, dict):
+            ent = tokens.get(uid)
+            if isinstance(ent, dict):
+                token = str(ent.get("token") or "").strip()
+                expires = int(ent.get("expires_at", 0) or 0)
+                if token and content == token and (expires <= 0 or now_ts() <= expires):
+                    tokens.pop(uid, None)
+                    soc_onb.setdefault("users", {}).setdefault(uid, {})["last_gate_token_used_at"] = now_ts()
+                    await STORE.mark_dirty()
+                    await gate_approve_user(message.author)
+                    try:
+                        await message.author.send("Access granted (token).")
+                    except Exception:
+                        pass
+                    await audit(message.author.id, "Gate PASS (token)", {"user_id": message.author.id})
+                    return True
+    except Exception:
+        pass
+
+    # Static password (fallback)
+    if SERVER_PASSWORD and content == SERVER_PASSWORD:
         # pass
         await gate_approve_user(message.author)
         try:
@@ -3385,6 +3815,10 @@ async def ensure_admin_server_channels(source_guild: discord.Guild):
         entry["server_info"] = info_ch.id
 
     await STORE.mark_dirty()
+    try:
+        await soc_apply_admin_server_permissions()
+    except Exception:
+        pass
     return mirror_feed, info_ch
 
 def find_category_by_name(guild: discord.Guild, name: str) -> Optional[discord.CategoryChannel]:
@@ -6486,6 +6920,194 @@ class GateToolsView(BaseView):
         await gate_reset_attempts(self.target.id)
         await interaction.response.send_message("Attempts reset.", ephemeral=True)
 
+class SocTargetUserModal(discord.ui.Modal):
+    def __init__(self, view: "SocAccessPanelView"):
+        super().__init__(title="SOC Access: Target User")
+        self.view_ref = view
+        self.user_id = discord.ui.TextInput(
+            label="Target user ID",
+            placeholder="123456789012345678",
+            required=True,
+            max_length=24,
+        )
+        self.add_item(self.user_id)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.user_id.value or "").strip()
+        if not raw.isdigit():
+            return await interaction.response.send_message("User ID must be numeric.", ephemeral=True)
+        self.view_ref.target_user_id = int(raw)
+        await interaction.response.edit_message(content=self.view_ref.status_text(), view=self.view_ref)
+
+class SocAccessEditorView(BaseView):
+    def __init__(self, author_id: int, target_user_id: int, preset_guild_ids: Optional[Set[int]] = None):
+        super().__init__(author_id, timeout=180)
+        self.target_user_id = int(target_user_id)
+        self.preset_guild_ids = set(preset_guild_ids or set())
+
+        self.sections_select = discord.ui.Select(
+            placeholder="Enabled sections (read-only unless write enabled)",
+            min_values=0,
+            max_values=5,
+            options=[
+                discord.SelectOption(label="Docs", value="docs"),
+                discord.SelectOption(label="Guest Area (read)", value="guest_area"),
+                discord.SelectOption(label="Guest Write (guest-chat/feedback)", value="guest_write"),
+                discord.SelectOption(label="Mirrors (scoped)", value="mirrors"),
+                discord.SelectOption(label="Server Info (scoped)", value="server_info"),
+            ],
+        )
+        self.sections_select.callback = self._on_sections
+        self.add_item(self.sections_select)
+
+        # Guild scope is optional. If set, the user will only get mirror/info access for these guild IDs.
+        opts: List[discord.SelectOption] = []
+        for g in bot.guilds:
+            if not g or g.id == ADMIN_GUILD_ID:
+                continue
+            opts.append(discord.SelectOption(label=g.name[:100], value=str(g.id)))
+        opts = opts[:25]
+        self.guilds_select = discord.ui.Select(
+            placeholder="Allowed servers (optional scope limit; empty = all shared servers)",
+            min_values=0,
+            max_values=max(1, min(25, len(opts))) if opts else 1,
+            options=opts or [discord.SelectOption(label="(no servers found)", value="0")],
+            disabled=not bool(opts),
+        )
+        self.guilds_select.callback = self._on_guilds
+        self.add_item(self.guilds_select)
+
+        self._pending_sections: Optional[Set[str]] = None
+        self._pending_guilds: Optional[Set[int]] = set(self.preset_guild_ids) if self.preset_guild_ids else None
+
+    def status_text(self) -> str:
+        uid = self.target_user_id
+        user_cfg = _soc_users_cfg().get(str(uid), {}) if isinstance(_soc_users_cfg(), dict) else {}
+        sections = (user_cfg.get("sections") if isinstance(user_cfg, dict) else {}) or {}
+        allowed = (user_cfg.get("allowed_guilds") if isinstance(user_cfg, dict) else None)
+        return (
+            "**SOC Access Editor**\n"
+            f"Target: `{uid}`\n"
+            f"Sections override: `{json.dumps(sections, ensure_ascii=True)}`\n"
+            f"Allowed guilds: `{json.dumps(allowed, ensure_ascii=True)}`"
+        )
+
+    async def _apply_and_sync(self, interaction: discord.Interaction):
+        await STORE.mark_dirty()
+        try:
+            await soc_apply_core_permissions(interaction.guild)
+            await soc_apply_admin_server_permissions()
+        except Exception:
+            pass
+        member = interaction.guild.get_member(self.target_user_id) if interaction.guild else None
+        if member:
+            try:
+                await soc_sync_member_access(member)
+            except Exception:
+                pass
+
+    async def _on_sections(self, interaction: discord.Interaction):
+        self._pending_sections = set(self.sections_select.values or [])
+        await interaction.response.send_message("Sections selected. Press Save.", ephemeral=True)
+
+    async def _on_guilds(self, interaction: discord.Interaction):
+        vals = [v for v in (self.guilds_select.values or []) if str(v).isdigit()]
+        self._pending_guilds = {int(v) for v in vals}
+        await interaction.response.send_message("Server scope selected. Press Save.", ephemeral=True)
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.success)
+    async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or interaction.guild.id != ADMIN_GUILD_ID:
+            return await interaction.response.send_message("Admin hub only.", ephemeral=True)
+        ucfg = _soc_user_cfg(self.target_user_id)
+        if self._pending_sections is not None:
+            # Explicit override for every known section key.
+            overrides = _soc_user_section_overrides(self.target_user_id)
+            for key in ("docs", "guest_area", "guest_write", "mirrors", "server_info"):
+                overrides[key] = key in self._pending_sections
+        if self._pending_guilds is not None:
+            if len(self._pending_guilds) == 0:
+                ucfg.pop("allowed_guilds", None)
+            else:
+                ucfg["allowed_guilds"] = sorted(self._pending_guilds)
+        await self._apply_and_sync(interaction)
+        await interaction.response.edit_message(content=self.status_text(), view=self)
+
+    @discord.ui.button(label="Reset Overrides", style=discord.ButtonStyle.secondary)
+    async def reset_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or interaction.guild.id != ADMIN_GUILD_ID:
+            return await interaction.response.send_message("Admin hub only.", ephemeral=True)
+        ucfg = _soc_user_cfg(self.target_user_id)
+        ucfg.pop("sections", None)
+        ucfg.pop("allowed_guilds", None)
+        await self._apply_and_sync(interaction)
+        await interaction.response.edit_message(content=self.status_text(), view=self)
+
+class SocAccessPanelView(BaseView):
+    def __init__(self, author_id: int):
+        super().__init__(author_id, timeout=180)
+        self.target_user_id: Optional[int] = None
+        self.selected_guild_ids: Set[int] = set()
+
+        opts: List[discord.SelectOption] = []
+        for g in bot.guilds:
+            if not g or g.id == ADMIN_GUILD_ID:
+                continue
+            opts.append(discord.SelectOption(label=g.name[:100], value=str(g.id)))
+        opts = opts[:25]
+        self.guilds_select = discord.ui.Select(
+            placeholder="Select server scope for onboarding (optional)",
+            min_values=0,
+            max_values=max(1, min(25, len(opts))) if opts else 1,
+            options=opts or [discord.SelectOption(label="(no servers found)", value="0")],
+            disabled=not bool(opts),
+        )
+        self.guilds_select.callback = self._on_guilds
+        self.add_item(self.guilds_select)
+
+    def status_text(self) -> str:
+        target = f"`{self.target_user_id}`" if self.target_user_id else "(none)"
+        selected = sorted(self.selected_guild_ids)
+        onb = soc_onboarding_cfg().get("users", {}) if isinstance(soc_onboarding_cfg().get("users", {}), dict) else {}
+        is_onboarded = bool(self.target_user_id and str(self.target_user_id) in onb)
+        return (
+            "**SOC Onboarding + Access Panel**\n"
+            f"Target user: {target}\n"
+            f"Selected servers: `{json.dumps(selected, ensure_ascii=True)}`\n"
+            f"Onboarded record: `{is_onboarded}`\n"
+            "Actions: set target -> (optional) select servers -> send onboarding DM / edit access."
+        )
+
+    async def _on_guilds(self, interaction: discord.Interaction):
+        vals = [v for v in (self.guilds_select.values or []) if str(v).isdigit() and int(v) > 0]
+        self.selected_guild_ids = {int(v) for v in vals}
+        await interaction.response.edit_message(content=self.status_text(), view=self)
+
+    @discord.ui.button(label="Set Target User", style=discord.ButtonStyle.primary)
+    async def set_target_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SocTargetUserModal(self))
+
+    @discord.ui.button(label="Send Onboarding DM", style=discord.ButtonStyle.success)
+    async def send_onboard_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or interaction.guild.id != ADMIN_GUILD_ID:
+            return await interaction.response.send_message("Admin hub only.", ephemeral=True)
+        if not self.target_user_id:
+            return await interaction.response.send_message("Set a target user ID first.", ephemeral=True)
+        try:
+            msg = await soc_send_onboarding_dm(interaction.user.id, self.target_user_id, self.selected_guild_ids)
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"Failed: {e}", ephemeral=True)
+
+    @discord.ui.button(label="Edit Access", style=discord.ButtonStyle.secondary)
+    async def edit_access_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or interaction.guild.id != ADMIN_GUILD_ID:
+            return await interaction.response.send_message("Admin hub only.", ephemeral=True)
+        if not self.target_user_id:
+            return await interaction.response.send_message("Set a target user ID first.", ephemeral=True)
+        view = SocAccessEditorView(interaction.user.id, self.target_user_id, preset_guild_ids=self.selected_guild_ids)
+        await interaction.response.send_message(view.status_text(), view=view, ephemeral=True)
+
 class GodMenuView(BaseView):
     async def _require_god(self, interaction: discord.Interaction) -> bool:
         lvl = await effective_level(interaction.user)
@@ -6557,6 +7179,17 @@ class GodMenuView(BaseView):
         if not await self._require_god(interaction):
             return
         await interaction.response.send_message("Gate tools panel.", view=GateToolsView(interaction.user.id), ephemeral=True)
+
+    @discord.ui.button(label="SOC Access", style=discord.ButtonStyle.primary)
+    async def soc_access_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._require_god(interaction):
+            return
+        view = SocAccessPanelView(interaction.user.id)
+        await interaction.response.send_message(
+            view.status_text(),
+            view=view,
+            ephemeral=True,
+        )
 
 def bot_interop_cfg() -> Dict[str, Any]:
     # Stores per-guild test channel + last observed results for manual interop tests.
@@ -7249,6 +7882,7 @@ async def cmd_cancel(ctx: commands.Context):
         sentience_maintenance_loop,
         diagnostics_loop,
         manual_upload_loop,
+        soc_access_sync_loop,
     ]
     stopped = 0
     for loop_task in loops:
@@ -7287,6 +7921,35 @@ async def godmenu(ctx: commands.Context):
     view = GodMenuView(ctx.author.id)
     msg = await ctx.send("**GOD MENU**", view=view)
     view.message = msg
+
+@bot.command(name="menuonboarding", aliases=["onboardmenu", "socaccess", "soc_onboarding"])
+async def menuonboarding(ctx: commands.Context):
+    if not ctx.guild or ctx.guild.id != ADMIN_GUILD_ID:
+        await safe_delete(ctx.message)
+        return
+    if not await require_level_ctx(ctx, MANDY_GOD_LEVEL):
+        return
+    await safe_delete(ctx.message)
+    view = SocAccessPanelView(ctx.author.id)
+    msg = await ctx.send(view.status_text(), view=view)
+    view.message = msg
+
+@bot.command(name="onboard")
+async def onboard(ctx: commands.Context, user_id: int, scope: str = ""):
+    if not ctx.guild or ctx.guild.id != ADMIN_GUILD_ID:
+        await safe_delete(ctx.message)
+        return
+    if not await require_level_ctx(ctx, MANDY_GOD_LEVEL):
+        return
+    await safe_delete(ctx.message)
+    raw = (scope or "").strip().lower()
+    guild_ids: Set[int] = set()
+    if raw and raw not in ("all", "*"):
+        for part in re.split(r"[ ,]+", raw):
+            if part.isdigit():
+                guild_ids.add(int(part))
+    msg = await soc_send_onboarding_dm(ctx.author.id, int(user_id), guild_ids if guild_ids else None)
+    await ctx.send(msg, delete_after=10)
 
 @bot.command(name="servermenu")
 async def servermenu(ctx: commands.Context):
@@ -8687,6 +9350,24 @@ async def manual_upload_loop():
 @tasks.loop(minutes=12)
 async def dm_bridge_archive():
     await archive_inactive_dm_bridges()
+
+@tasks.loop(minutes=10)
+async def soc_access_sync_loop():
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if not admin:
+        return
+    try:
+        await soc_apply_core_permissions(admin)
+        await soc_apply_admin_server_permissions()
+    except Exception:
+        pass
+    for member in list(getattr(admin, "members", []) or []):
+        if not isinstance(member, discord.Member):
+            continue
+        try:
+            await soc_sync_member_access(member)
+        except Exception:
+            continue
 
 @bot.event
 async def on_member_join(member: discord.Member):

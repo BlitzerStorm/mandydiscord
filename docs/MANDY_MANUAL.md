@@ -1,28 +1,28 @@
-# Mandy OS Manual (A-Z)
+# Mandy SOC Runbook (Single-File Manual)
+
+This is the canonical "how to run Mandy" manual for operators (Staff/Admin/GOD) running the bot across multiple servers with a central admin hub.
 
 Mandy OS is a Discord control-plane bot: command routing, logging, mirrors, DM bridges, watchers, stats, and an AI operator (Gemini) that can run approved tools.
 
-This manual is for operators (Staff/Admin/GOD) running Mandy across multiple servers.
+## 0x00 Capabilities (What Mandy Can and Cannot Do)
 
-## What Mandy Can (and Cannot) Do
-
-She can:
+Mandy can:
 - Work across every guild the bot is in (cross-server user/channel lookup).
-- Mirror messages into a central admin hub.
+- Mirror messages into a central admin hub (your "SOC").
 - Maintain stats, watchers, DM bridges, and audit logs.
 - Use Gemini to plan actions and run approved tools (GOD-only by default).
 
-She cannot:
+Mandy cannot:
 - Access servers she is not in.
-- DM users who have DMs closed or block the bot.
-- Bypass Discord permissions (missing View Channel, Read Message History, Send Messages, etc.).
+- DM users who have DMs closed or who block the bot.
+- Bypass Discord permissions (View Channel, Read Message History, Send Messages, etc.).
 
-## Quick Start
+## 0x01 First Boot (Quick Start)
 
-### 0) Discord developer portal checklist
-In your bot settings, enable:
-- Message Content Intent (required)
-- Server Members Intent (recommended; improves cross-server name lookup)
+### 0) Discord Developer Portal checklist
+Enable in the bot's settings:
+- Message Content Intent (required).
+- Server Members Intent (recommended; improves cross-server name lookup).
 
 ### 1) Install dependencies
 ```bash
@@ -31,45 +31,46 @@ pip install -r requirements.txt
 
 ### 2) Configure secrets
 Copy `passwords.example.txt` to `passwords.txt` and fill in:
-- `DISCORD_TOKEN` (required)
-- `GEMINI_API_KEY` (optional, enables Mandy AI features)
-- `MYSQL_*` (optional, enables MySQL persistence)
-- `SERVER_PASSWORD` (optional, enables the admin-server gate)
+- `DISCORD_TOKEN` (required).
+- `GEMINI_API_KEY` (optional; enables Mandy AI features).
+- `MYSQL_*` (optional; enables MySQL persistence).
+- `SERVER_PASSWORD` (optional; enables the admin-server gate).
 
 Never commit `passwords.txt`.
 
-### 3) Choose your "Admin Hub" server
+### 3) Pick your Admin Hub server ("control room")
 Mandy has a special admin hub guild where she centralizes monitoring and staff tooling.
 
 Edit these constants in `main.py` to match your IDs:
-- `ADMIN_GUILD_ID`: your admin hub server (where `!setup` works)
-- `SUPER_USER_ID`: the owner (level 100)
-- `AUTO_GOD_ID`: optional extra GOD account (level 90)
+- `ADMIN_GUILD_ID`: your admin hub server (where `!setup` works).
+- `SUPER_USER_ID`: the owner (level 100).
+- `AUTO_GOD_ID`: optional extra GOD account (level 90).
 
-### 4) Run the bot
+### 4) Run
 ```bash
 python main.py
 ```
 
-### 5) Bootstrap the admin hub
-In the admin hub (only), run:
-- `!setup bootstrap` (safe sync)
-- `!setup fullsync` / `!setup destructive` (SUPERUSER-only; rebuilds layout)
+### 5) Bootstrap the admin hub (admin hub only)
+- `!setup bootstrap` (safe sync).
+- `!setup fullsync` / `!setup destructive` (SUPERUSER-only; rebuilds layout).
+- `!setup_audit` (shows missing pieces and permission issues after setup).
 
-### 6) First checks
-- `!menu` and `!godmenu`
-- `!watchers` (shows watch list)
-- `!ambient status`
-- If Gemini is configured: `!mandy health`, `!mandy queue`, `!mandy tools`
+### 6) First checks ("ping the perimeter")
+- `!menu`, `!godmenu`, and `!servermenu`.
+- `!setlogs system <channel_id>` (and the other log routes).
+- `!watchers` and `!health`.
+- `!ambient status`.
+- If Gemini is configured: `!mandy health`, `!mandy queue`, `!mandy tools`, `!mandyping`.
 
-## Mental Model (How Mandy OS Is Organized)
+## 0x02 Mental Model (How Mandy Is Wired)
 
-### Admin hub vs. all other servers
+### Admin hub vs. satellite servers
 Think of Mandy like this:
-- Admin hub: your control room (logs, mirror feeds, server info, DM bridges, gate)
-- Other guilds: satellite servers that can be mirrored and monitored
+- Admin hub: your control room (logs, mirror feeds, server info panels, DM bridges, gate tools).
+- Other guilds: satellites that can be mirrored and monitored.
 
-When auto-setup is enabled, Mandy will:
+When auto-setup is enabled, Mandy can:
 - Create a server folder in the admin hub for each satellite guild.
 - Create/maintain a server-scope mirror rule so messages flow into the admin hub.
 - Post a pinned Server Info panel (invite link + mirror status + permissions).
@@ -81,404 +82,344 @@ Good habits:
 - Back up `database.json` periodically.
 - If you enable MySQL, back up the database too.
 
-## Permissions, Roles, and Levels (RBAC)
+## 0x03 Access Control (RBAC)
 
-Mandy uses a numeric access model:
-- 100: SUPERUSER (`SUPER_USER_ID`)
-- 90: GOD (`GOD` role by default)
-- 70: Admin
-- 50: Staff
-- 1: Guest / Quarantine (limited)
+Mandy uses numeric access levels:
+- 100: SUPERUSER (`SUPER_USER_ID`).
+- 90: GOD (`GOD` role by default).
+- 70: Admin.
+- 50: Staff.
+- 10: Member (required for `!menu`).
+- 1: Guest / Quarantine (limited).
 
 Effective level is computed as:
-1) User override level (MySQL `users_permissions` if enabled, else `database.json.permissions`)
-2) Highest mapped role level (`database.json.rbac.role_levels`)
-3) The maximum of (1) and (2) wins
+1) User override level (MySQL `users_permissions` if enabled, else `database.json.permissions`).
+2) Highest mapped role level (`database.json.rbac.role_levels`).
+3) The max of (1) and (2) wins.
 
 Tip: To change what Staff/Admin/GOD means, edit `database.json.rbac.role_levels`.
 
-## Command Routing (Clean Channels)
+## 0x04 Consoles (Menus)
+
+Mandy is menu-driven by design. The menus are your "terminal UI".
+
+- `!menu` (level >= 10): user menu panel (status/help/DM visibility/roast opt-in).
+- `!godmenu` (level >= 90): admin control panel (perms, mirrors, watchers, DM bridges, logs, routing, setup, gate tools, roast settings, live JSON editor).
+- `!servermenu` (level >= 90): server-only admin panel (includes Bot Interop/manual tests/macros).
+
+## 0x05 Clean Channels (Command Routing)
 
 Mandy can keep servers tidy by forcing commands into dedicated channels.
 
 Configure in GOD menu:
-- `!godmenu` -> Command Routing
+- `!godmenu` -> Command Routing.
 
 Modes (`database.json.command_channels.mode`):
-- `off`: commands allowed anywhere
-- `soft`: forward a reminder + command snippet to the proper channel (does not delete)
-- `hard`: forward a reminder + snippet and delete the original command message
+- `off`: commands allowed anywhere.
+- `soft`: forward a reminder + command snippet to the proper channel (does not delete).
+- `hard`: forward a reminder + snippet and delete the original command message.
 
 Targets (`database.json.command_channels`):
-- `user`: normal command channel name (default `command-requests`)
-- `god`: GOD command channel name (default `admin-chat`)
+- `user`: normal command channel name (default `command-requests`).
+- `god`: GOD command channel name (default `admin-chat`).
 
-## Sentience Layer (Optional)
+## 0x06 Logs (Wiretap Your Own Bot)
 
-Mandy can run a lightweight sentience layer that changes tone, status posture, and daily reflections.
+Logs are routed by channel ID in `database.json.logs`.
+
+Command (level >= 90):
+- `!setlogs <system|audit|debug|mirror|ai|voice> <channel_id>`
+
+## 0x07 Sentience Layer (Optional)
+
+Mandy can run a lightweight sentience layer that changes tone, status posture, and periodic reports.
 
 Core toggles:
-- `database.json.sentience.enabled`: master switch
-- `database.json.sentience.dialect`: `sentient_core` or `plain`
+- `database.json.sentience.enabled`: master switch.
+- `database.json.sentience.dialect`: `sentient_core` or `plain`.
 
 Presence controller (bio never changes):
-- `database.json.presence.bio`: activity text (set once; never modified by code)
-- `database.json.presence.autopresence_enabled`: enable status automation
-- Rules: recent messages => online; otherwise idle if members online; otherwise dnd if SUPERUSER active in admin hub; else invisible
+- `database.json.presence.bio`: activity text (set once; never modified by code).
+- `database.json.presence.autopresence_enabled`: enable status automation.
 
-Daily cognition report:
-- `database.json.sentience.daily_reflection.enabled`: enable daily reflection
-- `database.json.sentience.daily_reflection.hour_utc`: optional hour (0-23)
-- `database.json.sentience.daily_reflection.max_messages`: context size for logs
+Daily reflection (optional):
+- `database.json.sentience.daily_reflection.enabled`
+- `database.json.sentience.daily_reflection.hour_utc` (0-23)
+- `database.json.sentience.daily_reflection.max_messages`
 - Posts to `#thoughts` in the admin hub if the channel exists (silent skip if missing).
 
 Internal monologue (optional):
-- `database.json.sentience.internal_monologue.enabled`: enable periodic monologue
-- `database.json.sentience.internal_monologue.interval_minutes`: spacing between posts
-- `database.json.sentience.internal_monologue.max_lines`: target line count
-
-Mirror interactivity:
-- `database.json.mirrors.interactive_controls_enabled`: buttons under mirrored messages
+- `database.json.sentience.internal_monologue.enabled`
+- `database.json.sentience.internal_monologue.interval_minutes`
+- `database.json.sentience.internal_monologue.max_lines`
 
 Self-maintenance:
-- `database.json.sentience.maintenance.ai_queue_max_age_hours`: drop stale AI jobs
+- `database.json.sentience.maintenance.ai_queue_max_age_hours`: drop stale AI jobs.
 
-## Core Commands (Prefix: `!`)
+Mirror interactivity:
+- `database.json.mirrors.interactive_controls_enabled`: buttons under mirrored messages.
 
-Quick reference lives in `COMMANDS.md`. The highlights:
+## 0x08 Modules (What You Actually Operate)
 
-### Menus
-- `!menu`: user menu panel (level >= 10)
-- `!godmenu`: admin panel (level >= 90)
-- `!menu` -> Roast Opt-In: users can enable/disable playful roast mode for themselves.
-- `!godmenu` -> Roast Settings: manage roast allowlist, enable/disable roast mode, toggle Gemini, and run Gemini diagnostic.
-- `!godmenu` -> Live JSON Editor: edit any `database.json` path with JSON input.
+### Watchers (Tripwires)
 
-### Setup / Ops (admin hub only)
-- `!setup`: opens a menu explaining Bootstrap vs Fullsync vs Destructive and starts the selected flow.
-- `!setup bootstrap`
-- `!setup fullsync` / `!setup destructive` (SUPERUSER only)
-- Destructive mode now prompts for Default vs AI-assisted rebuild (Gemini). AI mode sends a sentient brief + post-rebuild debrief and falls back to default if rate-limited or unavailable.
-- `!setup_bio`: bio-themed admin hub rebuild (SUPERUSER only). Includes recovery anchor, sentience channels, a menu hub, and automatic legacy ops reseed.
-- During `!setup_bio`, Mandy can optionally generate AI-assisted topics/pins and will ask for confirmation before applying.
-- `!setup_bio` also re-ensures roles, quarantine permissions, and guest permissions in the admin hub after rebuild.
-- Manual auto-upload: when enabled, Mandy posts the latest `docs/MANDY_MANUAL.md` to `#manual-for-living` (tracked by file hash).
-- `!leavevc`: emergency voice disconnect (SUPERUSER only)
-- `!cancel`: cancels running background tasks/loops (SUPERUSER only)
-- `!health`: health snapshot (level >= 70)
-- `#diagnostics`: auto-updated status board every 10 minutes
+A watcher is a message counter trigger for a user:
+- After they send N messages, Mandy replies with configured text.
+- Multiple reply variants can be separated by `|` (Mandy picks one at random).
 
-### Watchers / Mirrors / DM bridges
-- `!watchers` / `!watcher`: show watch list (level >= 50)
-- `!addtarget <user_id> <count> <text>`: add JSON watcher (level >= 90)
-- `!remove <user>`: drop someone from JSON + MySQL watches (IDs, mentions, nicknames)
-- `!mirroradd <source_channel_id> <target_channel_id>` (level >= 70)
-- `!mirroraddscope <server|category|channel> <source_id> <target_channel_id>` (level >= 70)
-- `!mirrorremove <source_channel_id> [simulate]` (level >= 70)
-- `!dmopen <user_id>` / `!dmclose <user_id>` (admin hub only, level >= 70)
-- `!dmai on|off|status|list <user_id|@user|#channel|this>`: per-user DM AI control (admin hub only, GOD)
-- `!setlogs <system|audit|debug|mirror|ai|voice> <channel_id>` (level >= 90)
+Where it lives:
+- JSON: `database.json.targets[user_id] = {count,current,text}`
+- MySQL (optional): table `watchers`
 
-### Roast Mode (opt-in only)
-- Trigger: any message that matches a regex variant of “mandy” and includes roast intent (e.g., “roast me”, “insult”, “make fun”, “diss”).
-- Only users in the opt-in list can be roasted.
-- Cooldown and channel allow/block lists apply.
-- Gemini roast generation is optional and can be toggled in Roast Settings.
+Commands:
+- View: `!watchers` (level >= 50).
+- Add: `!addtarget <user_id> <count> <text>` (level >= 90).
+- Remove: `!remove <user>` (drops JSON + MySQL watches; IDs/mentions/nicknames) (level >= 50).
 
-### Stats
-- `!mystats [daily|weekly|monthly|yearly|rolling24]`
+Long-term memory (notes + sentiment):
+- `!remember <note>`
+- `!memory [limit]`
+
+### Mirrors (Relays)
+
+Mirrors are how messages flow from a satellite server/channel into the admin hub.
+
+Scopes:
+- server: mirror a whole guild (except excluded).
+- category: mirror a category.
+- channel: mirror a single channel.
+
+Commands (level >= 70):
+- `!mirroradd <source_channel_id> <target_channel_id>`
+- `!mirroraddscope <server|category|channel> <source_id> <target_channel_id>`
+- `!mirrorremove <source_channel_id> [simulate]`
+
+Failure handling:
+- Mirror rules disable after N send failures.
+- Disabled rules are auto-deleted after a TTL (`database.json.mirror_disable_ttl`).
+
+Optional: reaction propagation + interactive controls on mirrored messages (buttons under mirror feed).
+
+### DM Bridges (Staff-Visible DMs)
+
+DM bridges create staff-visible channels in the admin hub that mirror DMs to/from a user.
+
+Commands (admin hub only):
+- `!dmopen <user_id>` (level >= 70).
+- `!dmclose <user_id>` (level >= 70).
+- `!dmai on|off|status|list <user_id|@user|#channel|this>` (GOD-only).
+
+Notes:
+- DM bridges auto-archive after inactivity.
+- DM channels include a pinned control panel.
+
+### Gate (Password-Protected Entry)
+
+If `SERVER_PASSWORD` is set:
+- New joiners get a private gate channel.
+- They get 3 attempts.
+- Failing puts them into a quarantine role/channel.
+
+Gate tools live in `!godmenu`.
+
+### Roast Mode (Opt-In, Playful Only)
+
+Roasts are automatic (no `!roast` command). If enabled, Mandy will reply directly to a user who opts in.
+
+Trigger requirements:
+- Roast must be enabled (`roast.enabled`).
+- The user must be opted in (via `!menu` -> Roast Opt-In), or auto-opt-in must be enabled for the guild.
+- Message must mention the bot OR match a regex variant of the trigger word (default `mandy`).
+- Message must include roast intent (ex: `roast me`, `insult`, `make fun`, `mock`, `diss`, `clown me`, `trash me`), or Gemini can classify it as roast intent.
+
+Admin controls:
+- `!godmenu` -> Roast Settings: enable/disable, toggle Gemini generation, manage allowlists.
+- Mass allowlists (GOD-level):
+  - `!roast_whitelist_guild [here|all|<guild_id>] [add|remove|clear]` (controls `roast.allowed_guilds`).
+  - `!roast_whitelist_users [here|all|<guild_id>] [add|remove|clear]` (controls `roast.auto_opt_in_guilds`).
+
+Common config keys (`database.json.roast`):
+- `enabled`, `trigger_word`, `use_ai`, `cooldown_seconds`, `max_history`
+- `opt_in_users`, `allowed_guilds`, `auto_opt_in_guilds`
+- `allowed_channels`, `blocked_channels`
+
+### Stats (Local + Global)
+
+Windows:
+- `daily`, `weekly`, `monthly`, `yearly`, `rolling24`
+
+Local commands:
+- `!mystats [window]`
 - `!allstats [window]`
 - `!livestats [window]` (staff+)
+
+Global commands:
 - `!globalstats [window]` (admin+)
 - `!globallive [window]` (admin+)
 
-### Cleanup
-- `!clean [limit]`: delete bot messages in a channel (level >= 50)
-- `!nuke [limit] [simulate]`: SUPERUSER-only heavy cleanup; add `simulate`/`dry` to preview and avoid deleting, Mandy repopulates managed pins/menus after a real nuke
+Auto backfill:
+- `database.json.auto.backfill`
 
-### Media
-- `!movie`: GOD-only. Opens the control panel (DM or server). Use the panel or `!movie <url>` to play. Only YouTube links are accepted.
-- `!movie add <url>`: Queue a YouTube link.
-- `!movie queue`: Show now playing and the queue.
-- `!movie stay [minutes]`: Keep the bot in VC after playback (default 15, max 30).
-- `!movie leave`: Stop and disconnect.
+### Cleanup (Purge)
+
+- `!clean [limit]` (level >= 50): delete the bot's own recent messages in the channel.
+- `!nuke [limit] [simulate]` (SUPERUSER): heavy cleanup; add `simulate`/`dry` to preview.
+
+### Media + Voice
+
+- `!movie` (GOD-only): opens the control panel (DM or server). YouTube-only is enforced.
+- `!movie <url>` / `!movie add <url>` / `!movie queue`
 - `!movie pause` / `!movie resume` / `!movie skip`
+- `!movie stay [minutes]` / `!movie leave`
 - `!movie volume <0-100>` or `!volume <0-100>`
-- DM `!movie` opens a control panel with Play/Queue/Skip/Volume/Stay/Leave buttons and a server selector if you're in multiple VCs.
+- `!leavevc` (SUPERUSER): emergency voice disconnect
 
-## Mandy AI (Gemini): The Operator
+VIP auto-join:
+- If `SPECIAL_VOICE_USER_ID` is set, Mandy can auto-join when that user joins voice (disabled during movie playback).
+
+### Ark + Phoenix (Rebuild With Memory)
+
+- `!ark [theme]`: captures roles, channels, overwrites, pins, plus legacy logs for key channels.
+- `!phoenix <snapshot_id> simulate`: generates a report and a confirmation key.
+- `!phoenix <snapshot_id> run <CONFIRM-...>`: executes the rebuild only after the key matches.
+
+### Ambient Engine (Optional "Life")
+
+- `!ambient status` (GOD)
+- `!ambient on` (GOD)
+- `!ambient off` (GOD)
+
+### Ops / Health
+
+- `!health` (level >= 70): health snapshot.
+- `!cancel` (SUPERUSER): cancels running background tasks/loops.
+
+## 0x09 Mandy AI (Gemini Operator)
 
 By default, Mandy AI is GOD-only.
 
-### Silent action handling
-- When Gemini decides to perform an action (e.g., DM someone or send a report) but has nothing to say, Mandy now records an empty text response instead of rejecting the packet. This prevents the old “Router validation failed: response must be string” crash when the AI stays quiet.
-
-### Entry points
-- `!mandy <prompt>`: ask Mandy to answer and/or run tools
+Entry points:
+- `!mandy <prompt>`
 - Mention the bot with a prompt (GOD-only): `@Mandy do the thing`
 
-### Two brains: Fast Path vs. Gemini
-When you run `!mandy ...`:
-1) Fast Path handles common intents without calling Gemini.
-2) If Fast Path cannot confidently handle it, Mandy calls Gemini (router model).
+Control commands:
+- `!mandy_model <flash-lite|flash|pro|model-name>`
+- `!mandy_queue`
+- `!mandy_cancel <job_id>`
+- `!mandy_limits`
+- `!mandy_power on|off|status`
+- `!mandyping`
 
-### Cross-server smartness
-When you say a name like `dm john hello`, Mandy:
-- Tries the current server first.
-- Falls back to a global search across all guilds the bot is in.
-- Uses fuzzy scoring (exact/prefix/contains/fuzzy).
-- If ambiguous, she asks you to pick from candidates.
+How requests are handled:
+1) The intelligent "fast path" tries to interpret common natural-language intents without calling Gemini.
+2) If fast path cannot confidently handle it, Mandy asks whether to submit to AI.
+3) If Gemini fails or rate-limits, Mandy automatically falls back to the other model (AgentRouter) and announces it.
+4) If both models fail, the request is cancelled and the user is notified.
 
-Same idea applies to channels when you reference `#general` without an ID.
-
-### Self-tuning (rate limits)
-When Gemini rate limits hit, Mandy automatically adjusts:
-- `database.json.ai.cooldown_seconds`
-- `database.json.ai.router_model` (switches to a lighter model if needed)
-
-### Queue (rate-limit resistant)
-If an AI job is rate-limited, Mandy can enqueue it and retry later.
-
-Commands:
-- `!mandy_queue`: show queued jobs
-- `!mandy_cancel <job_id>`: cancel a job
-- `!mandy_limits`: show cooldown + usage counters
-- `!mandy_power on|off|status`: toggle power mode (removes local cooldown + confirmation prompts)
-- `!mandy extensions`: list installed tool extensions
-- `!mandy selftest`: run a quick AI/tool self-test
-
-### Prompting tips
-Fast Path examples:
+Fast path examples (natural language inside `!mandy ...`):
 - `!mandy dm john, sarah hello`
 - `!mandy open dm john`
 - `!mandy watch john after 5 say ping|pong|hello`
+- `!mandy stop watching john`
+- `!mandy show watchers`
 - `!mandy mirror #general to #archive`
 - `!mandy stats weekly for john`
-- `!mandy set status dnd building Mandy OS`
-- `!mandy broadcast all servers in #announcements: maintenance at 5pm`
-- `!mandy dm all users: maintenance at 5pm`
+- `!mandy health`
+- `!mandy queue`
+- `!mandy tools`
+- `!mandy selftest`
 
 Gemini examples (tool + reasoning):
 - `!mandy summarize the last 50 messages in #debug-logs`
 - `!mandy post an announcement in #announcements: maintenance at 5pm`
 - `!mandy build a tool that bans spammers after 3 links (design first)`
 
-## Watchers (The Watch List)
+Self-tuning (rate limits):
+- When Gemini rate limits hit, Mandy can automatically adjust `database.json.ai.cooldown_seconds` and switch `database.json.ai.router_model` to a lighter model.
+- Fallback model: `database.json.ai.agent_router_model` (default `gpt-4o-mini`) is used for automatic failover.
 
-A watcher is a "message counter trigger" for a user:
-- After they send N messages, Mandy replies with configured text.
-- Multiple reply variants can be separated by `|` (Mandy picks one at random).
+## 0x0A Setup / Rebuild Runbooks (Admin Hub Only)
 
-Where they live:
-- JSON: `database.json.targets["<user_id>"] = {"count": N, "current": 0, "text": "a|b|c"}`
-- MySQL (optional): table `watchers`
+Setup commands (admin hub only):
+- `!setup` (menu: Bootstrap vs Fullsync vs Destructive).
+- `!setup bootstrap`
+- `!setup fullsync` / `!setup destructive` (SUPERUSER only).
+- `!setup_bio` (SUPERUSER only): bio-themed admin hub rebuild.
+- `!setup_audit`: quick audit report after rebuilds.
 
-How to manage:
-- Menu: `!godmenu` watcher controls (JSON/MySQL)
-- Command: `!addtarget <user_id> <count> <text>` (JSON)
-- Command: `!remove <user>`: drop someone from both JSON and MySQL watches
-- AI: `!mandy watch <name> after <count> say <text>`
-- View: `!watchers`
+Manual auto-upload:
+- Enabled by default (`manual.auto_upload_enabled`).
+- Mandy posts the latest `docs/MANDY_MANUAL.md` to `#manual-for-living` (tracked by file hash).
 
-Important: Watchers are global by user ID. If that user chats in any server the bot sees, the watcher can fire in that server.
+Diagnostics:
+- `#diagnostics` is auto-updated status board (periodic loop).
 
-### Long-term memory (notes + sentiment)
-- `!remember <note>`: save a staff note to Mandy's memory
-- `!memory [limit]`: show recent notes/moods
-- Mandy auto-logs non-neutral sentiments from chat for richer summaries over time.
+## 0x0B Configuration Reference (database.json)
 
-## Mirrors (Cross-server Message Relays)
-
-Mandy supports unified mirror rules stored in `database.json.mirror_rules` (and optionally MySQL).
-
-### Rule scopes
-- `server`: mirror an entire guild into the admin hub
-- `category`: mirror all channels under a category
-- `channel`: mirror one source channel to one target channel
-
-### Failure handling (auto-disable + auto-clean)
-- `database.json.mirror_fail_threshold`: after N failures, a rule disables itself
-- `database.json.mirror_disable_ttl`: if a rule stays disabled longer than this, it is deleted
-
-### Creating mirrors
-- Classic: `!mirroradd ...` / `!mirroraddscope ...`
-- Menu: `!godmenu` mirror panels
-- AI: `!mandy mirror #source to #dest` (cross-server channel lookup supported)
-- Removal: `!mirrorremove <source_channel_id> [simulate]`
-
-### Reactions on mirror feeds
-- Reacting to a mirrored message in the admin hub will mirror that emoji back onto the original source message (when permissions allow).
-
-### Interactive controls (optional)
-When enabled, mirrored messages in the admin hub include buttons:
-- Reply (send a reply back to the origin)
-- DM Author (send DM or open a DM bridge)
-- Jump (link to source message)
-- Mute Source (disable the mirror rule)
-
-## Ark + Phoenix Protocol (Rebuild With Memory)
-
-Mandy can snapshot a server (Ark) and rebuild it (Phoenix) with analysis and safety gates.
-
-### Ark (Intelligent Snapshot)
-- `!ark [theme]`: captures roles, channels, overwrites, pins, plus legacy logs for key channels.
-- Builds an optimized blueprint from real traffic (top words) to suggest new categories.
-
-### Phoenix (Pre-mortem + Rebuild)
-- `!phoenix <snapshot_id> simulate`: generates a report and a confirmation key.
-- `!phoenix <snapshot_id> run <CONFIRM-...>`: executes the rebuild only after the key matches.
-
-Phoenix behaviors:
-- Dynamic architecture based on usage (adds DEVELOPMENT or GAMING categories when relevant).
-- Prewired automation (rules channel auto-role via "I agree").
-- Legacy preservation (creates `legacy-logs` and reposts recent history).
-- Prewired mirrors (announcements mirrored to admin hub feed).
-- Owner report after rebuild (members, watchers, and missing permissions).
-
-## Owner Reports (Auto)
-
-Mandy sends an owner DM report when:
-- The bot joins a server
-- Phoenix rebuild completes
-
-Report contents:
-- Member count and a sample list
-- Watcher IDs present in that guild
-- Missing bot permissions (view/read/send/manage roles/channels/messages)
-
-## DM Bridges (Staff-Visible DMs)
-
-DM bridges let staff handle user DMs inside the admin hub:
-- If a user DMs the bot, Mandy can create/activate a `dm-<user_id>` channel.
-- Inbound DM is copied into that channel.
-- Staff messages in that channel are relayed back to the user (staff level >= 70).
-- Old/inactive bridges auto-archive after ~24 hours of inactivity.
-
-Manual controls (admin hub only):
-- `!dmopen <user_id>`: open/activate the bridge and dump recent DM history
-- `!dmclose <user_id>`: archive the bridge
-
-## Gate (Password-protected Entry)
-
-The admin hub can require a server password:
-- Configure `SERVER_PASSWORD` in `passwords.txt` (or env var).
-- On join, Mandy creates a private `gate-<username>` channel.
-- The user gets 3 attempts; failures quarantine them.
-
-Staff tools:
-- `!godmenu` -> Gate Tools (approve guest, release quarantine, reset attempts)
-
-## VIP Voice Auto-Join
-
-- When `SUPER_USER_ID` (your owner/GOD) joins any voice channel, Mandy auto-joins, streams `https://youtu.be/UukrfHmWmuY` with `yt-dlp` + `ffmpeg`, and stays until that VIP leaves.
-- After the VIP exits, the bot waits ~27 seconds and disconnects.
-- Ensure `ffmpeg` is installed and the bot retains `CONNECT/SPEAK` plus `SEND_MESSAGES` rights where it should speak afterward.
-- While a `!movie` session is active in a guild, the VIP auto-join clip is suppressed to avoid competing audio.
-- Emergency exit: `!leavevc` forces a hard disconnect from all voice channels (SUPERUSER only).
-
-## Stats (Local + Global)
-
-Mandy tracks message stats and can render panels.
-
-Windows:
-- `daily`, `weekly`, `monthly`, `yearly`, `rolling24`
-
-Local server commands:
-- `!mystats [window]`: your stats
-- `!allstats [window]`: leaderboard
-- `!livestats [window]`: pins a live-updating panel
-
-Global commands:
-- `!globalstats [window]`: global totals across all guilds
-- `!globallive [window]`: pinned live global panel
-
-Auto backfill:
-- `database.json.auto.backfill`: backfills recent history so stats are not empty after a restart.
-
-## Ambient Engine (Optional "Life")
-
-The ambient engine adds small alive behaviors (status/typing style effects).
-
-Commands (GOD):
-- `!ambient status`
-- `!ambient on`
-- `!ambient off`
-
-## Configuration Reference (database.json)
-
-Top-level keys you will edit most often:
-- `logs`: channel IDs for `system|audit|debug|mirror|ai|voice`
-- `command_channels`: routing mode + channel names
-- `rbac.role_levels`: role-name -> numeric level mapping
-- `permissions`: user-id -> numeric level overrides
-- `ai`: Gemini models, cooldown, limits, queue, installed extensions
-- `auto`: auto-setup/backfill toggles
-- `presence`: bio + autopresence controller toggles
-- `sentience`: dialect, daily reflection schedule, maintenance toggles
-- `targets`: watchers (JSON)
-- `mirror_rules`: mirrors (unified rules)
-- `mirrors.interactive_controls_enabled`: mirror buttons in admin hub
-- `mirror_disable_ttl`: seconds before a disabled mirror rule is auto-deleted
-- `dm_bridges`: DM bridge state
-- `ark_snapshots`, `phoenix_keys`, `memory`, `onboarding`
-- `layout`, `channel_topics`, `pinned_text`: what `!setup` creates and pins
+Common keys you will edit:
+- `logs`: channel IDs for `system|audit|debug|mirror|ai|voice`.
+- `command_channels`: routing mode + channel names.
+- `rbac.role_levels`: role-name -> numeric level mapping.
+- `permissions`: user-id -> numeric level overrides.
+- `ai`: Gemini models, cooldown, limits, queue, installed extensions.
+- `roast`: roast-mode toggles, allowlists, channels, cooldown.
+- `auto`: auto-setup/backfill toggles.
+- `manual`: manual upload config and last hash.
+- `presence`: bio + autopresence controller toggles.
+- `sentience`: dialect, reflection schedule, maintenance toggles.
+- `targets`: watchers.
+- `mirror_rules`: mirrors (unified rules).
+- `mirrors.interactive_controls_enabled`: mirror buttons in admin hub.
+- `mirror_disable_ttl`: seconds before a disabled mirror rule is auto-deleted.
+- `dm_bridges`: DM bridge state.
+- `ark_snapshots`, `phoenix_keys`, `memory`, `onboarding`.
+- `layout`, `channel_topics`, `pinned_text`: what `!setup` creates and pins.
 
 Note: Mandy reloads `database.json` automatically and autosaves when she changes state.
 
-## Extension Development
+## 0x0C Extensions (Tools/Plugins)
 
 Extensions are how Mandy gains new tools.
 
-### What is a tool?
-A tool is an async function Mandy can call with structured arguments, for example:
-- send a message
-- DM a user
-- create a mirror
-- manage watchers
+What is a tool?
+- A tool is an async function Mandy can call with structured arguments (send a message, DM a user, create a mirror, manage watchers, etc.).
+- Built-in tools are defined by `CapabilityRegistry` and implemented by `ToolRegistry` in `main.py`.
 
-Built-in tools are defined by `CapabilityRegistry` and implemented by `ToolRegistry` in `main.py`.
+Writing an extension manually:
+- Put a file in `extensions/` that defines `TOOL_EXPORTS` (see `extensions/tool_ping.py`).
 
-### Writing an extension manually
-Put a file in `extensions/` that defines `TOOL_EXPORTS`.
+Loading extensions:
+- On startup Mandy loads all `extensions/*.py` (except `__init__.py` and `validator.py`).
 
-Minimal example (see `extensions/tool_ping.py`):
-```py
-TOOL_EXPORTS = {
-  "tool_ping": {
-    "description": "Simple ping tool for plugin testing.",
-    "args_schema": {},
-    "side_effect": "read",
-    "cost": "cheap",
-    "handler": _tool_ping,
-  }
-}
+Building tools with Mandy AI:
+1) Ask for a tool ("design a tool that...").
+2) Mandy returns a design (confirmable).
+3) If you confirm, Mandy writes `extensions/<slug>.py` and loads it.
 
-async def _tool_ping(ctx):
-  return "OK"
-```
+Validator and safety:
+- Extensions are validated by `extensions/validator.py`.
+- Current repo note: the validator is permissive (it mostly checks syntax/size). Treat AI-generated tools as trusted code unless you harden the validator.
 
-Schema fields:
-- `description`: short human description
-- `args_schema`: dict of arg-name -> schema (`type`, optional ranges/choices)
-- `side_effect`: `read` or `write`
-- `cost`: `cheap`, `normal`, or `expensive`
-- `handler`: `async def handler(ctx, ...)` (first param must be `ctx` or `bot_ctx`)
+## 0x0D Troubleshooting (Incident Response)
 
-### Loading extensions
-On startup Mandy loads all `extensions/*.py` (except `__init__.py` and `validator.py`).
+Roast mode not firing:
+- Confirm `database.json.roast.enabled` is `true`.
+- Confirm you opted in via `!menu` -> Roast Opt-In (or your guild is in `roast.auto_opt_in_guilds`).
+- Confirm you are in an allowed guild/channel (allow/block lists).
+- Confirm you're mentioning the bot or using the trigger word (default `mandy`) plus roast intent.
 
-### Building tools with Mandy AI
-Mandy can propose and build new tools through the Gemini router:
-1) Ask for a tool ("design a tool that...")
-2) Mandy returns a design (confirmable)
-3) If you confirm, Mandy writes `extensions/<slug>.py` and loads it
+Menus not opening:
+- Check your effective RBAC level (menu is >= 10; godmenu/servermenu are >= 90).
+- Check command routing mode (hard mode may delete commands outside the command channel).
 
-### Validator and safety (important)
-Extensions are validated by `extensions/validator.py`.
+Stats look empty:
+- Enable `database.json.auto.backfill` and/or wait for new messages to accumulate.
 
-Current repo note: the validator is permissive (it mostly checks syntax/size). Treat AI-generated tools as trusted code. If you want a locked-down model, tighten the validator (deny dangerous imports/calls) before letting Mandy generate tools freely.
+Gemini not responding:
+- Confirm `GEMINI_API_KEY` exists and the bot can reach the network.
+- Use `!mandy health` and `!mandy_limits` to inspect rate limits and cooldown.
 
-## A-Z Glossary (because you asked for A-Z)
+## 0x0E Glossary (A-Z, minimal)
 
 A - Ambient Engine: optional alive behaviors (`!ambient ...`)
 B - Backfill: fills stats/mirrors history after joining/restart
@@ -487,8 +428,8 @@ D - DM Bridges: staff-visible DM relay channels in the admin hub
 E - Extensions: `extensions/*.py` tool plugins
 F - Fail Threshold: mirror auto-disable after N failures
 G - Gate: password entry flow in the admin hub
-H - Health: `!mandy health` / status reports
-I - Intelligence Layer: rule-based natural language + clarifications
+H - Health: `!health` and `!mandy health`
+I - Intelligence Layer: fast path + clarifications before Gemini router
 J - Jobs: queued AI requests when rate limited
 K - Keys: `passwords.txt` / environment variables
 L - Logs: system/audit/debug/mirror routing
@@ -498,7 +439,7 @@ O - Ops: `!setup`, MySQL bootstrap, server info panels
 P - Permissions: RBAC + per-user overrides (JSON/MySQL)
 Q - Quarantine: gate failure holding role/channel
 R - Resolver: fuzzy matching for users/channels/roles
-S - Stats: per-guild + global message analytics and live panels
+S - Stats: per-guild + global analytics and live panels
 T - Tools: the internal capability API Mandy can call
 U - UI: menus, confirms, and pickers (buttons/selects/modals)
 V - Validator: decides what extensions may load
@@ -506,3 +447,349 @@ W - Watchers: "after N messages, reply with ..." triggers
 X - eXtras: MySQL mode, auto-setup, and plugins
 Y - Yearly window: long-range stats (`yearly`)
 Z - Zero-drama reload: `database.json` hot reload + autosave
+
+---
+
+## Appendix A: Command Cheat Sheet (Verbatim Snapshot)
+
+# Mandy OS Command Cheat Sheet (Hacker Edition)
+
+Prefix: `!`
+
+Canonical operator manual: `docs/MANDY_MANUAL.md` (this file is the quick terminal sheet).
+
+## Menus / Consoles
+- `!menu` (level >= 10): user panel (status/help/DM visibility/roast opt-in)
+- `!godmenu` (level >= 90): admin panel (routing/logs/mirrors/watchers/DM bridges/gate/roast/live JSON)
+- `!servermenu` (level >= 90): server-only admin panel (Bot Interop/manual tests/macros)
+
+## Setup / Ops (admin hub only)
+- `!setup` (menu: bootstrap/fullsync/destructive)
+- `!setup bootstrap`
+- `!setup fullsync` / `!setup destructive` (SUPERUSER only)
+- `!setup_bio` (SUPERUSER only)
+- `!setup_audit` (level >= 70): setup audit report
+
+## Watchers / Mirrors / DM bridges
+- `!watchers` / `!watcher` (level >= 50): show watcher list
+- `!addtarget <user_id> <count> <text>` (level >= 90): add watcher
+- `!remove <user>` (level >= 50): remove watcher (JSON + MySQL if configured)
+- `!mirroradd <source_channel_id> <target_channel_id>` (level >= 70)
+- `!mirroraddscope <server|category|channel> <source_id> <target_channel_id>` (level >= 70)
+- `!mirrorremove <source_channel_id> [simulate]` (level >= 70)
+- `!dmopen <user_id>` / `!dmclose <user_id>` (admin hub only, level >= 70)
+- `!dmai on|off|status|list <user_id|@user|#channel|this>` (admin hub only, GOD)
+
+## Logging / Routing
+- `!setlogs <system|audit|debug|mirror|ai|voice> <channel_id>` (level >= 90)
+
+## Roast Mode (opt-in only)
+- User: `!menu` -> Roast Opt-In
+- Admin: `!godmenu` -> Roast Settings
+- Mass enablement (GOD):
+  - `!roast_whitelist_guild [here|all|<guild_id>] [add|remove|clear]`
+  - `!roast_whitelist_users [here|all|<guild_id>] [add|remove|clear]`
+- Trigger (after opt-in): mention Mandy or include the trigger word (default `mandy`) + intent like "roast me"
+
+## Stats
+- `!mystats [daily|weekly|monthly|yearly|rolling24]`
+- `!allstats [window]`
+- `!livestats [window]` (staff+)
+- `!globalstats [window]` (admin+)
+- `!globallive [window]` (admin+)
+- `!remember <note>`
+- `!memory [limit]`
+
+## Cleanup
+- `!clean [limit]` (level >= 50)
+- `!nuke [limit] [simulate]` (SUPERUSER)
+
+## Media + Voice
+- `!movie` (GOD): control panel (DM or server)
+- `!movie <url>` / `!movie add <url>` / `!movie queue`
+- `!movie pause` / `!movie resume` / `!movie skip`
+- `!movie stay [minutes]` / `!movie leave`
+- `!movie volume <0-100>` or `!volume <0-100>`
+- `!leavevc` (SUPERUSER)
+
+## Ark / Phoenix
+- `!ark [theme]`
+- `!phoenix <snapshot_id> simulate`
+- `!phoenix <snapshot_id> run <CONFIRM-...>`
+
+## Ambient Engine
+- `!ambient status` / `!ambient on` / `!ambient off` (GOD)
+
+## Health / Control
+- `!health` (level >= 70)
+- `!cancel` (SUPERUSER)
+
+## Mandy AI (Gemini)
+- `!mandy <prompt>`: natural language + tools (GOD-only by default)
+- Mention `@Bot <prompt>`: GOD-only mention handler
+- `!mandy_model <flash-lite|flash|pro|model-name>`
+- `!mandy_limits`
+- `!mandy_queue`
+- `!mandy_cancel <job_id>`
+- `!mandy_power on|off|status`
+- `!mandyping`
+
+Natural-language examples (via `!mandy ...`):
+- `!mandy dm john hey`
+- `!mandy watch john after 5 say ping me`
+- `!mandy mirror #general to #backup`
+- `!mandy stats daily for john`
+
+---
+
+## Appendix B: Intelligent Command Processor Notes (Verbatim Snapshot)
+
+# Intelligent Command Processor (Fast Path) - Operator Notes
+
+Canonical operator manual: `docs/MANDY_MANUAL.md`
+
+This doc is a focused note on the "fast path" natural-language layer used by the `!mandy` command before Gemini is invoked.
+
+## What It Is
+
+The Intelligent Command Processor (ICP) is a rule-based interpreter that recognizes common operator intents (DMs, watchers, mirrors, stats, health, queue) using pattern matching and fuzzy extraction.
+
+It is designed to:
+- reduce Gemini calls for routine tasks,
+- ask clarification questions instead of failing when ambiguous,
+- fall back safely to the rest of Mandy's logic if it cannot handle the message.
+
+## Where It Lives
+
+- Core engine: `mandy/intelligent_command_processor.py`
+- Integration (executor bridge + wiring): `cogs/mandy_ai.py`
+  - Executor: `_ManydAICommandExecutor`
+  - Processor: `IntelligentCommandProcessor`
+
+## Command Flow (Simplified)
+
+```
+!mandy <text>
+  -> Fast path (ICP) attempts to handle
+     -> If handled: runs Mandy tools and returns
+     -> If not handled: other fast-path logic runs
+        -> If still not handled: Gemini router runs
+```
+
+## Supported Intents (Examples)
+
+These examples are typically written as `!mandy ...` prompts.
+
+1) Send DMs
+```
+dm @john hello
+message john "hello"
+tell john hi
+```
+
+2) Add watcher
+```
+watch john after 5 messages say hey
+monitor john and say hey every 5 messages
+```
+
+3) Remove watcher
+```
+stop watching john
+remove watcher john
+unwatch john
+```
+
+4) List watchers
+```
+show watchers
+list watchers
+what watchers are active
+```
+
+5) Mirror channels
+```
+mirror #general to #backup
+sync #a with #b
+```
+
+6) Show stats
+```
+show stats
+stats daily
+how much has john messaged today
+```
+
+7) Health check
+```
+health
+status
+check bot status
+```
+
+8) Queue status
+```
+queue
+show queue
+check jobs
+```
+
+## Notes / Limitations
+
+- ICP is best-effort: if it cannot confidently execute, it should clarify or fall back.
+- ICP does not replace prefix commands; it just makes `!mandy ...` feel like a terminal.
+- Exact patterns evolve over time; treat this doc as a behavior overview, not a spec.
+
+---
+
+## Appendix C: Feature Report (2026-01-27) (Verbatim Snapshot)
+
+# Mandy OS Feature Report (2026-01-27)
+
+Canonical operator manual: `docs/MANDY_MANUAL.md`
+
+This report summarizes the bot's current capabilities and parity against archived manuals/commands, based on a code + docs walk-through.
+
+## Core Control Plane
+- Prefix commands: `!menu`, `!godmenu`, `!setup`, `!watchers`, `!addtarget`, `!remove`, `!mirroradd`, `!mirroraddscope`, `!mirrorremove`, `!dmopen`, `!dmclose`, `!dmai`, `!mystats`, `!allstats`, `!livestats`, `!globalstats`, `!globallive`, `!movie`, `!volume`, `!clean`, `!nuke`, `!health`, `!leavevc`, `!ambient`, `!ark`, `!phoenix`, `!remember`, `!memory`.
+- Menus (UI): User menu (status/help/DM visibility/roast opt-in); God menu (perms, mirrors, watchers, DM bridges, logs, command routing, setup, gate tools, roast settings, live JSON editor).
+- Command routing: `database.json.command_channels` off/soft/hard with user/god channel targets and optional cleanup in hard mode.
+
+## State & Config
+- Primary store `database.json` with defaults in `mandy/app/store_defaults.py`.
+- Optional MySQL persistence for watchers, mirrors, audit logs, etc.
+- Autosave/reload loops keep JSON in sync; auto-setup/backfill are configurable.
+
+## RBAC
+- Numeric levels (Guest -> Staff -> Admin -> GOD -> SUPERUSER). Overrides via `permissions` map or role-level map `rbac.role_levels`.
+- Helpers in `mandy/app/main_rbac.py`.
+
+## AI + Intelligence (Gemini + Rules)
+- Cog: `cogs/mandy_ai.py`; client: `cogs/mandy_ai_gemini.py`.
+- Entry: `!mandy <prompt>` and bot mention (GOD-only).
+- Fast path intents + IntelligentCommandProcessor for natural language; falls back to the Gemini router if needed.
+- Queue + backoff; self-tuning cooldown/router model; limits and counters in `database.json.ai`.
+- Commands: `!mandy_model`, `!mandy_limits`, `!mandy_queue`, `!mandy_cancel`.
+- Router JSON actions validated against `mandy/capability_registry.py`; tools provided by `mandy/app/main_tools.py`.
+
+## Resolver + Clarify UI
+- Cross-server user/channel lookup with fuzzy ranking.
+- Clarification prompts when ambiguous (buttons/selects).
+
+## Memory + Notes
+- `!remember <note>` stores operator notes; `!memory [limit]` shows recent entries.
+- Lightweight sentiment logging on chat for long-term context.
+
+## Mirrors
+- Unified mirror rules (`mirror_rules`) with scopes: server/category/channel.
+- Integrity checks, failure thresholds, disable/delete after TTL (`mirror_fail_threshold`, `mirror_disable_ttl`).
+- Reactions on mirrored messages are propagated back to the source when permissions allow.
+- Interactive controls on mirrored messages (reply/DM/jump/mute) when enabled.
+
+## Watchers
+- JSON + optional MySQL "after N messages, reply" triggers (`targets`).
+- Menu and commands `!addtarget`, `!remove`, `!watchers`; AI can add/remove.
+
+## DM Bridges
+- Staff-visible DM channels in admin hub; auto-archive after 24h inactivity.
+- Commands: `!dmopen`, `!dmclose`, `!dmai on|off|status|list`.
+
+## Stats
+- Windows: daily/weekly/monthly/yearly/rolling24.
+- Local/global live panels with pinning and resume; backfill support.
+
+## Media + Voice
+- VIP auto-join clip for `SPECIAL_VOICE_USER_ID` (suppressed during movie playback).
+- Movie player (`!movie`, `!volume`): YouTube-only enforced in YTDL layer, queue, pause/resume/skip/stay/leave, DM control panel.
+
+## Roast Mode (Opt-in)
+- Regex trigger for "mandy" variants + roast intent keywords.
+- Per-user opt-in list, guild allowlist + auto-opt-in by guild, channel allow/block, cooldown, history length.
+- Gemini-generated roast (toggle `roast.use_ai`) with fallback generator.
+- Menu controls + Gemini diagnostic + live JSON editor.
+- Commands: `!roast_whitelist_guild` and `!roast_whitelist_users` for mass enablement.
+
+## Gate / Onboarding
+- Password gate with per-user private channel and 3 attempts; quarantine role handling.
+- Gate tools in God menu (approve, release, reset).
+
+## Ark / Phoenix
+- Ark snapshots (roles/channels/pins/log snippets); Phoenix rebuild with confirm key, simulate/run.
+- Owner DM reports on guild join and Phoenix completion.
+
+## Logging / Audit
+- Structured audit/log routing (`logs` config); logging menu to set targets.
+- Debug/system/mirror/AI/voice channels.
+
+## Maintenance Loops
+- Config reload, JSON autosave, mirror integrity check, server status update, presence controller, daily reflection, internal monologue, diagnostics board, manual upload, DM bridge archive.
+
+## Extension Development
+- Extensions loader (`extensions/*.py`) with permissive validator.
+- AI tool design/build flow via Gemini (design -> confirm -> write -> load).
+
+## Tests
+- `python -m pytest -q` passes (7 tests). Stubs for `discord` in `tests/conftest.py`. Coverage is minimal (AI happy-path + docs existence).
+
+## Parity Check (Archived Docs vs Current Code)
+- Commands/features listed in archived manuals (`archived/COMMANDS.md`, `archived/MANDY_MANUAL.md`) are present in the current codebase.
+- No missing features were identified during this pass.
+
+## Known Gaps / Risks
+- Many modified core files remain; they likely need review/integration before shipping.
+- Extensions validator is permissive; AI-generated tools are effectively trusted.
+- Minimal tests; no coverage for mirrors, stats, media, gate, sentience, or RBAC.
+- Discord, voice, MySQL, and Gemini integrations still need runtime smoke testing.
+
+## Recommendations
+- Decide fate of modified modules: align, delete, or commit.
+- Harden extension validator (restrict imports/IO/exec) before enabling AI tool creation broadly.
+- Add tests for mirrors/watchers/DM bridge flows and command routing.
+- Add config schema validation at startup and a `!diag config` report.
+
+---
+
+## Appendix D: Debug Report (2026-01-27) (Verbatim Snapshot)
+
+# Mandy OS Debug Report (2026-01-27)
+
+Canonical operator manual: `docs/MANDY_MANUAL.md`
+
+## Scope
+Static audit and debug pass with local tooling. Runtime integration (Discord API, voice, MySQL, Gemini) cannot be fully exercised in this environment.
+
+## Checks Run
+- `python -m pytest -q` -> **7 passed**
+- `python -m compileall -q .` -> **no errors**
+- Import audit across `mandy/`, `cogs/`, `extensions/` with Discord stubs -> **no errors**
+
+## Imports & Module Wiring
+Reviewed and validated module export hubs:
+- `mandy/app/core.py`
+- `mandy/app/db.py`
+- `mandy/app/logging.py`
+- `mandy/app/media.py`
+- `mandy/app/store.py`
+- `mandy/intelligence_layer.py`
+
+All re-export targets resolve to tracked files and compile cleanly.
+
+## Recent Hardening
+- YouTube-only guard enforced at YTDL layer (`mandy/app/media_ytdl.py`) with tests.
+- Discord stubs expanded for tests/import audit (`tests/conftest.py`).
+- Deprecation warnings for `datetime.utcnow()` removed in `cogs/mandy_ai.py`.
+
+## Known Limitations (cannot be fully validated locally)
+- Discord API actions: message send/delete, reactions, permissions, channels, embeds, voice.
+- Voice playback dependencies: `ffmpeg`, `yt-dlp` network calls.
+- Gemini and external HTTP calls.
+- MySQL operations (schema creation, migrations, runtime DB ops).
+
+## Remaining Risk Areas
+- Extension validator remains permissive (AI tool generation is effectively trusted code).
+- Limited test coverage for mirrors, watchers, DM bridges, gate, sentience, and stats.
+
+## Recommended Next Steps
+1. Run the bot in a staging Discord server and perform a manual smoke test of menus + commands.
+2. If MySQL is enabled, run a migration/test in a sandbox DB.
+3. Add integration tests for mirrors, watchers, and DM bridges.
