@@ -106,6 +106,7 @@ Mandy is menu-driven by design. The menus are your "terminal UI".
 - `!menu` (level >= 10): user menu panel (status/help/DM visibility/roast opt-in).
 - `!godmenu` (level >= 90): admin control panel (perms, mirrors, watchers, DM bridges, logs, routing, setup, gate tools, roast settings, live JSON editor).
 - `!servermenu` (level >= 90): server-only admin panel (includes Bot Interop/manual tests/macros).
+- `!owneronboard` (DM or any server): owner self-service onboarding. Confirms ownership, locks mirror on, lets you pick features, then shows the invite link (prefers `LINK=` in `passwords.txt`). Mandy auto-links the new guild to your satellite roles when she joins.
 
 ## 0x05 Clean Channels (Command Routing)
 

@@ -172,27 +172,27 @@ async def ensure_debug_channel() -> Optional[discord.TextChannel]:
             if ch:
                 return ch
         return None
-    ch = discord.utils.get(admin.text_channels, name="debug-logs")
+    ch = discord.utils.get(admin.text_channels, name="debug-log") or discord.utils.get(admin.text_channels, name="debug-logs")
     if ch:
         return ch
     ch = discord.utils.get(admin.text_channels, name="debug")
     if ch:
         return ch
     try:
-        cat = discord.utils.get(admin.categories, name="Engineering Core")
+        cat = discord.utils.get(admin.categories, name="ENGINEERING") or discord.utils.get(admin.categories, name="Engineering Core")
         if not cat:
-            cat = await admin.create_category("Engineering Core")
+            cat = await admin.create_category("ENGINEERING")
             from .setup import setup_pause
 
             await setup_pause()
-        ch = await admin.create_text_channel("debug-logs", category=cat)
+        ch = await admin.create_text_channel("debug-log", category=cat)
         from .setup import setup_pause
 
         await setup_pause()
         return ch
     except Exception:
         try:
-            ch = await admin.create_text_channel("debug-logs")
+            ch = await admin.create_text_channel("debug-log")
             from .setup import setup_pause
 
             await setup_pause()

@@ -131,5 +131,4 @@ def get_role(guild: discord.Guild, name: str) -> Optional[discord.Role]:
 
 
 def admin_category_name(guild: discord.Guild) -> str:
-    return f"{guild.name} Admin"
-
+    return f"SATELLITES / Active / {guild.name}"

@@ -29,7 +29,7 @@ DEFAULT_JSON: Dict[str, Any] = {
     "permissions": {},
     "gate": {},
     "gate_layout": {
-        "category": "Guest Access",
+        "category": "GUEST ACCESS",
         "guest_chat": "guest-chat",
         "guest_briefing": "guest-briefing",
         "quarantine": "quarantine",
@@ -37,7 +37,7 @@ DEFAULT_JSON: Dict[str, Any] = {
     "mirror_fail_threshold": config.MIRROR_FAIL_THRESHOLD,
     "mirror_disable_ttl": 7 * 24 * 3600,
     "logs": {"system": None, "audit": None, "debug": None, "mirror": None, "ai": None, "voice": None},
-    "command_channels": {"user": "command-requests", "god": "admin-chat", "mode": "off"},
+    "command_channels": {"user": "requests", "god": "admin-chat", "mode": "off"},
     "typing_delay_seconds": 5.0,
     "dm_bridge_history_limit": 50,
     "menu_messages": {},
@@ -87,6 +87,8 @@ DEFAULT_JSON: Dict[str, Any] = {
         "users": {},
         "tokens": {},
     },
+    "owner_onboarding": {"pending": {}, "history": {}, "feature_defaults": ["mirror", "logs", "stats", "dm_bridge", "ai_tools"]},
+    "satellite_features": {},
     "roast": {
         "enabled": False,
         "trigger_word": "mandy",
@@ -140,39 +142,41 @@ DEFAULT_JSON: Dict[str, Any] = {
     "chat_stats_global_live_message": {},
     "layout": {
         "categories": {
-            "Welcome & Information": ["rules-and-guidelines", "announcements", "guest-briefing", "manual-for-living"],
-            "Bot Control & Monitoring": ["bot-status", "command-requests", "error-reporting"],
-            "Research & Development": ["algorithm-discussion", "data-analysis"],
-            "Guest Access": ["guest-chat", "guest-feedback", "quarantine"],
-            "Engineering Core": ["core-chat", "system-logs", "audit-logs", "debug-logs", "mirror-logs"],
-            "Admin Backrooms": ["admin-chat", "server-management"],
-            "DM Bridges": [],
+            "WELCOME": ["rules", "announcements", "guest-briefing", "manual-for-living"],
+            "OPERATIONS": ["console", "requests", "reports"],
+            "SATELLITES": [],
+            "GUEST ACCESS": ["guest-chat", "guest-feedback", "quarantine"],
+            "ENGINEERING": ["system-log", "audit-log", "debug-log", "mirror-log", "data-lab", "dm-bridges"],
+            "GOD CORE": ["admin-chat", "server-management", "layout-control", "blueprint-export", "incident-room"],
         }
     },
     "channel_topics": {
-        "rules-and-guidelines": "Read these first. Required for all members.",
+        "rules": "Read these first. Required for all members.",
         "announcements": "Server announcements and updates.",
         "guest-briefing": "How to join and get approved.",
         "manual-for-living": "Latest SOC manual uploads and operator runbooks.",
         "guest-chat": "Guest chat (limited).",
         "guest-feedback": "Feedback and questions from guests.",
         "quarantine": "Restricted holding channel.",
-        "bot-status": "Bot status updates and presence controls.",
-        "command-requests": "User command requests. Commands outside this channel are removed.",
-        "error-reporting": "Report issues or errors with commands.",
-        "core-chat": "Core engineering discussion.",
-        "algorithm-discussion": "Research ideas, algorithms, and experiments.",
-        "data-analysis": "Data analysis, metrics, and reports.",
-        "system-logs": "System log stream (general).",
-        "audit-logs": "Audit trail for privileged actions.",
-        "debug-logs": "Debug output and diagnostics.",
-        "mirror-logs": "Mirror pipeline events and failures.",
+        "console": "Bot status updates and presence controls.",
+        "requests": "User command requests. Commands outside this channel are removed.",
+        "reports": "Report issues or errors with commands.",
+        "data-lab": "Core engineering, algorithms, and data analysis.",
+        "system-log": "System log stream (general).",
+        "audit-log": "Audit trail for privileged actions.",
+        "debug-log": "Debug output and diagnostics.",
+        "mirror-log": "Mirror pipeline events and failures.",
         "admin-chat": "GOD-only commands and admin coordination.",
         "server-management": "Server ops notes and maintenance.",
+        "layout-control": "Layout rebuild and setup coordination.",
+        "blueprint-export": "Blueprint export / backups.",
+        "incident-room": "High-severity incident response.",
+        "dm-bridges": "Active DM bridge channels live here.",
     },
     "pinned_text": {
-        "rules-and-guidelines": (
-            "dY\"O **Rules & Guidelines**\n"
+        "rules": (
+            "<!--PIN:rules-->\n"
+            "**Rules & Guidelines**\n"
             "- Be respectful.\n"
             "- No spam.\n"
             "- Follow staff instructions.\n\n"
@@ -181,22 +185,24 @@ DEFAULT_JSON: Dict[str, Any] = {
             "- `!godmenu`\n"
             "- `!setup fullsync`\n"
         ),
-        "bot-status": ("dY\"O **Bot Status & Help**\n" "Menus auto-populate in command channels.\n"),
-        "system-logs": ("dY\"O **System Logs**\n" "General system log stream.\n"),
-        "command-requests": ("dY\"O **Command Requests**\n" "Use the menu panel below for user tools.\n"),
-        "error-reporting": (
-            "dY\"O **Error Reporting**\n"
+        "console": ("<!--PIN:console-->\n**Bot Status & Help**\nMenus auto-populate in command channels.\n"),
+        "system-log": ("<!--PIN:system-log-->\n**System Logs**\nGeneral system log stream.\n"),
+        "requests": ("<!--PIN:requests-->\n**Command Requests**\nUse the menu panel below for user tools.\n"),
+        "reports": (
+            "<!--PIN:reports-->\n"
+            "**Error Reporting**\n"
             "Post issues with timestamps and screenshots if possible.\n"
         ),
-        "audit-logs": ("dY\"O **Audit Logs**\n" "Privileged actions and security events.\n"),
-        "debug-logs": ("dY\"O **Debug Logs**\n" "Diagnostic output and errors.\n"),
-        "mirror-logs": ("dY\"O **Mirror Logs**\n" "Mirror events, failures, and status.\n"),
+        "audit-log": ("<!--PIN:audit-log-->\n**Audit Logs**\nPrivileged actions and security events.\n"),
+        "debug-log": ("<!--PIN:debug-log-->\n**Debug Logs**\nDiagnostic output and errors.\n"),
+        "mirror-log": ("<!--PIN:mirror-log-->\n**Mirror Logs**\nMirror events, failures, and status.\n"),
         "guest-briefing": (
-            "dY\"O **Guest Briefing**\n"
-            "This server uses a password gate. Ask staff if youź?Tre stuck.\n"
+            "<!--PIN:guest-briefing-->\n"
+            "**Guest Briefing**\n"
+            "This server uses a password gate. Ask staff if you're stuck.\n"
         ),
-        "quarantine": ("dY\"O **Quarantine**\n" "Quarantined users wait here until staff releases them.\n"),
-        "admin-chat": ("dY\"O **Admin Chat**\n" "GOD-only command channel. Use the panel below.\n"),
+        "quarantine": ("<!--PIN:quarantine-->\n**Quarantine**\nQuarantined users wait here until staff releases them.\n"),
+        "admin-chat": ("<!--PIN:admin-chat-->\n**Admin Chat**\nGOD-only command channel. Use the panel below.\n"),
     },
 }
 

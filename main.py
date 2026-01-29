@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from contextvars import ContextVar
 import datetime
 import hashlib
-from typing import Optional, Dict, Any, List, Tuple, Set
+from typing import Optional, Dict, Any, List, Tuple, Set, Iterable
 import secrets
 from mandy.capability_registry import CapabilityRegistry
 from mandy.tool_plugin_manager import ToolPluginManager
@@ -247,6 +247,140 @@ def mirror_rules_for_message(message: discord.Message) -> List[Dict[str, Any]]:
         candidates.extend(MIRROR_RULE_INDEX["category"].get(channel.category.id, []))
     candidates.extend(MIRROR_RULE_INDEX["server"].get(message.guild.id, []))
     return candidates
+
+OWNER_ONBOARD_FEATURES: List[Dict[str, Any]] = [
+    {"key": "mirror", "label": "Mirror relay", "description": "Keep server mirror feed active", "locked": True},
+    {"key": "logs", "label": "Logging + server info", "description": "Create logging channels and info panel"},
+    {"key": "stats", "label": "Chat stats + health", "description": "Track message counts and health snapshot"},
+    {"key": "dm_bridge", "label": "DM bridge intake", "description": "Allow DM bridge for owner outreach"},
+    {"key": "ai_tools", "label": "AI helper", "description": "Allow Mandy AI tools if configured"},
+]
+
+def owner_onboarding_cfg() -> Dict[str, Any]:
+    data = cfg().setdefault("owner_onboarding", {})
+    if not isinstance(data.get("pending"), dict):
+        data["pending"] = {}
+    if not isinstance(data.get("history"), dict):
+        data["history"] = {}
+    defaults = data.get("feature_defaults")
+    if not isinstance(defaults, list):
+        defaults = ["mirror", "logs", "stats", "dm_bridge", "ai_tools"]
+        data["feature_defaults"] = defaults
+    if "mirror" not in defaults:
+        defaults.append("mirror")
+    return data
+
+def owner_onboarding_defaults() -> Set[str]:
+    defaults = owner_onboarding_cfg().get("feature_defaults") or []
+    if not isinstance(defaults, list):
+        defaults = []
+    normalized = {str(k) for k in defaults if str(k).strip()}
+    normalized.add("mirror")
+    return normalized
+
+def owner_onboarding_feature_map() -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for feat in OWNER_ONBOARD_FEATURES:
+        key = str(feat.get("key") or "").strip()
+        if key:
+            result[key] = feat
+    return result
+
+def owner_onboarding_locked_keys() -> Set[str]:
+    return {k for k, v in owner_onboarding_feature_map().items() if bool(v.get("locked"))}
+
+def normalize_owner_onboarding_features(selected: List[str]) -> List[str]:
+    catalog = owner_onboarding_feature_map()
+    locked = owner_onboarding_locked_keys()
+    chosen = {k for k in (selected or []) if k in catalog}
+    chosen |= locked
+    if "mirror" in catalog:
+        chosen.add("mirror")
+    if not chosen:
+        chosen = owner_onboarding_defaults()
+    return sorted(chosen)
+
+def owner_onboarding_pending() -> Dict[str, Any]:
+    data = owner_onboarding_cfg()
+    pending = data.get("pending")
+    if not isinstance(pending, dict):
+        data["pending"] = {}
+    return data.setdefault("pending", {})
+
+def owner_onboarding_history() -> Dict[str, Any]:
+    data = owner_onboarding_cfg()
+    hist = data.get("history")
+    if not isinstance(hist, dict):
+        data["history"] = {}
+    return data.setdefault("history", {})
+
+def owner_onboarding_invite_details() -> Tuple[str, str]:
+    for fname in ("passwords.txt",):
+        if not os.path.exists(fname):
+            continue
+        try:
+            with open(fname, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("LINK="):
+                        parts = line.split("=", 1)
+                        if len(parts) == 2:
+                            val = parts[1].strip()
+                            if val:
+                                return val, "passwords.txt"
+        except Exception:
+            continue
+    perms_int = int(soc_onboarding_cfg().get("bot_invite_permissions", 8) or 8)
+    if bot.user:
+        try:
+            link = discord.utils.oauth_url(
+                bot.user.id,
+                permissions=discord.Permissions(perms_int),
+                scopes=("bot", "applications.commands"),
+            )
+            return link, "generated"
+        except Exception:
+            return "", ""
+    return "", ""
+
+def owner_onboarding_invite_link() -> str:
+    link, _ = owner_onboarding_invite_details()
+    return link
+
+def satellite_features_cfg() -> Dict[str, Any]:
+    feats = cfg().get("satellite_features")
+    if not isinstance(feats, dict):
+        cfg()["satellite_features"] = {}
+    return cfg().setdefault("satellite_features", {})
+
+def owner_onboarding_feature_labels(keys: Iterable[str]) -> List[str]:
+    catalog = owner_onboarding_feature_map()
+    labels: List[str] = []
+    for key in keys:
+        if key in catalog:
+            labels.append(str(catalog[key].get("label", key)))
+    return labels
+
+def set_satellite_features(guild_id: int, features: List[str]) -> None:
+    feats_cfg = satellite_features_cfg()
+    feats_cfg[str(guild_id)] = {k: True for k in features}
+
+async def save_owner_onboarding_request(user_id: int, features: List[str], invite_link: str, owner_confirmed: bool, can_invite: bool) -> Dict[str, Any]:
+    record = {
+        "features": normalize_owner_onboarding_features(features),
+        "invite_link": invite_link,
+        "owner_confirmed": bool(owner_confirmed),
+        "can_invite": bool(can_invite),
+        "created_at": now_ts(),
+        "status": "pending",
+        "source": "self_service",
+    }
+    owner_onboarding_pending()[str(user_id)] = record
+    await STORE.mark_dirty()
+    try:
+        await audit(user_id, "Owner onboarding saved", {"features": record["features"]})
+    except Exception:
+        pass
+    return record
 
 async def _resolve_user_reference(ctx: commands.Context, text: str) -> Tuple[Optional[int], List[Tuple[int, str]]]:
     uid = parse_user_id(text)
@@ -2675,11 +2809,12 @@ async def ensure_dm_category(name: str) -> Optional[discord.CategoryChannel]:
     admin = bot.get_guild(ADMIN_GUILD_ID)
     if not admin:
         return None
-    cat = discord.utils.get(admin.categories, name=name)
+    target_name = "ENGINEERING" if name.lower().startswith("engineering") or "dm" in name.lower() else name
+    cat = discord.utils.get(admin.categories, name=target_name)
     if cat:
         return cat
     try:
-        cat = await admin.create_category(name)
+        cat = await admin.create_category(target_name)
         await setup_pause()
         return cat
     except Exception:
@@ -2726,7 +2861,7 @@ async def ensure_dm_bridge_channel(user_id: int, active: bool = True) -> Optiona
         ch = admin.get_channel(int(info["channel_id"]))
     if not ch:
         ch = discord.utils.get(admin.text_channels, name=f"dm-{user_id}")
-    cat_name = "DM Bridges" if active else "Archived DM Bridges"
+    cat_name = "ENGINEERING"
     cat = await ensure_dm_category(cat_name)
     if not ch:
         try:
@@ -3075,10 +3210,26 @@ async def soc_apply_core_permissions(guild: discord.Guild) -> None:
     docs_role = _soc_role(guild, _soc_section_role_name("docs", "SEC:DOCS"))
     guest_area_role = _soc_role(guild, _soc_section_role_name("guest_area", "SEC:GUEST-AREA"))
     guest_write_role = _soc_role(guild, _soc_section_role_name("guest_write", "SEC:GUEST-WRITE"))
+    access_viewer = _soc_role(guild, "ACCESS:Viewer")
+    access_engineer = _soc_role(guild, "ACCESS:Engineer")
+    access_admin = _soc_role(guild, "ACCESS:Admin")
+    for role_name in ("ACCESS:Viewer", "ACCESS:Engineer", "ACCESS:Admin"):
+        if not _soc_role(guild, role_name):
+            try:
+                created = await guild.create_role(name=role_name, reason="SOC access role bootstrap")
+                await setup_pause()
+                if role_name == "ACCESS:Viewer":
+                    access_viewer = created
+                elif role_name == "ACCESS:Engineer":
+                    access_engineer = created
+                else:
+                    access_admin = created
+            except Exception:
+                pass
 
     # Hide these channels from @everyone and expose via section roles.
     docs_channels = [
-        "rules-and-guidelines",
+        "rules",
         "announcements",
         "guest-briefing",
         "manual-for-living",
@@ -3096,6 +3247,8 @@ async def soc_apply_core_permissions(guild: discord.Guild) -> None:
             await ch.set_permissions(guild.default_role, view_channel=False)
             if docs_role:
                 await ch.set_permissions(docs_role, view_channel=True, send_messages=False, read_message_history=True)
+            if access_viewer:
+                await ch.set_permissions(access_viewer, view_channel=True, send_messages=False, read_message_history=True)
         except Exception:
             pass
 
@@ -3109,6 +3262,8 @@ async def soc_apply_core_permissions(guild: discord.Guild) -> None:
                 await ch.set_permissions(guest_area_role, view_channel=True, send_messages=False, read_message_history=True)
             if guest_write_role:
                 await ch.set_permissions(guest_write_role, view_channel=True, send_messages=True, read_message_history=True)
+            if access_viewer:
+                await ch.set_permissions(access_viewer, view_channel=True, send_messages=True, read_message_history=True)
         except Exception:
             pass
 
@@ -3121,6 +3276,39 @@ async def soc_apply_core_permissions(guild: discord.Guild) -> None:
         if qch and quarantine:
             await qch.set_permissions(guild.default_role, view_channel=False)
             await qch.set_permissions(quarantine, view_channel=True, send_messages=True, read_message_history=True)
+    except Exception:
+        pass
+
+    # ENGINEERING category visibility
+    try:
+        eng_cat = discord.utils.get(guild.categories, name="ENGINEERING")
+        if eng_cat:
+            await eng_cat.set_permissions(guild.default_role, view_channel=False)
+            allow_roles = [
+                access_engineer,
+                access_admin,
+                get_role(guild, GOD_ROLE_NAME),
+                get_role(guild, ADMIN_ROLE_NAME),
+            ]
+            for role in allow_roles:
+                if role:
+                    await eng_cat.set_permissions(role, view_channel=True, read_messages=True, send_messages=True, read_message_history=True)
+    except Exception:
+        pass
+
+    # GOD CORE category visibility
+    try:
+        god_cat = discord.utils.get(guild.categories, name="GOD CORE")
+        if god_cat:
+            await god_cat.set_permissions(guild.default_role, view_channel=False)
+            allow_roles = [
+                access_admin,
+                get_role(guild, GOD_ROLE_NAME),
+                get_role(guild, ADMIN_ROLE_NAME),
+            ]
+            for role in allow_roles:
+                if role:
+                    await god_cat.set_permissions(role, view_channel=True, read_messages=True, send_messages=True, read_message_history=True)
     except Exception:
         pass
 
@@ -3355,6 +3543,100 @@ async def soc_send_onboarding_dm(actor_id: int, target_user_id: int, guild_scope
     await audit(actor_id, "SOC onboard DM sent", {"user_id": target_user_id, "scope": sorted(list(guild_scope or []))})
     return "Onboarding DM sent."
 
+def _member_can_manage(member: Optional[discord.Member]) -> bool:
+    if not member:
+        return False
+    perms = getattr(member, "guild_permissions", None)
+    if not perms:
+        return False
+    return bool(perms.administrator or perms.manage_guild or perms.manage_roles)
+
+async def detect_bot_inviter_user_id(guild: discord.Guild) -> Optional[int]:
+    if not bot.user or not guild or not guild.me:
+        return None
+    perms = getattr(guild.me, "guild_permissions", None)
+    if not perms or not perms.view_audit_log:
+        return None
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.bot_add, limit=6):
+            target = getattr(entry, "target", None)
+            if target and getattr(target, "id", None) == bot.user.id:
+                user = getattr(entry, "user", None)
+                if user:
+                    return user.id
+    except Exception:
+        return None
+    return None
+
+async def maybe_complete_owner_onboarding(guild: discord.Guild) -> None:
+    pending = owner_onboarding_pending()
+    if not pending:
+        return
+    inviter_id = await detect_bot_inviter_user_id(guild)
+    matched_user_id: Optional[int] = None
+    if inviter_id and str(inviter_id) in pending:
+        matched_user_id = inviter_id
+    if not matched_user_id:
+        for uid_s in list(pending.keys()):
+            if not str(uid_s).isdigit():
+                continue
+            uid = int(uid_s)
+            member = guild.get_member(uid)
+            if _member_can_manage(member):
+                matched_user_id = uid
+                break
+    if not matched_user_id and inviter_id and str(inviter_id) in pending:
+        matched_user_id = inviter_id
+    if not matched_user_id and len(pending) == 1:
+        uid_s = next(iter(pending.keys()))
+        if str(uid_s).isdigit():
+            member = guild.get_member(int(uid_s))
+            if member:
+                matched_user_id = int(uid_s)
+    if not matched_user_id:
+        return
+    record = pending.pop(str(matched_user_id), None)
+    if not record:
+        return
+    features = normalize_owner_onboarding_features(record.get("features") or [])
+    set_satellite_features(guild.id, features)
+    history = owner_onboarding_history()
+    record["matched_guild_id"] = guild.id
+    record["completed_at"] = now_ts()
+    history[str(matched_user_id)] = record
+    ucfg = _soc_user_cfg(matched_user_id)
+    allowed_raw = ucfg.get("allowed_guilds", [])
+    if not isinstance(allowed_raw, list):
+        allowed_raw = []
+    allowed = {int(x) for x in allowed_raw if str(x).isdigit()}
+    allowed.add(guild.id)
+    ucfg["allowed_guilds"] = sorted(allowed)
+    await STORE.mark_dirty()
+    admin = bot.get_guild(ADMIN_GUILD_ID)
+    if admin:
+        member_admin = admin.get_member(matched_user_id)
+        if member_admin:
+            try:
+                await soc_sync_member_access(member_admin)
+            except Exception:
+                pass
+    try:
+        await audit(matched_user_id, "Owner onboarding completed", {"guild_id": guild.id, "features": features})
+    except Exception:
+        pass
+    try:
+        user = bot.get_user(matched_user_id) or await bot.fetch_user(matched_user_id)
+        if user:
+            summary = [
+                "Owner onboarding complete.",
+                f"Server: {guild.name} ({guild.id})",
+                "Features: " + ", ".join(owner_onboarding_feature_labels(features)),
+                "Mirror and satellite roles are active.",
+            ]
+            await user.send("\n".join(summary))
+    except Exception:
+        pass
+
 async def apply_guest_permissions(guild: discord.Guild):
     # Backwards compatible entrypoint: "guest permissions" now means applying SOC section perms.
     if guild.id != ADMIN_GUILD_ID:
@@ -3485,7 +3767,7 @@ async def start_gate(member: discord.Member):
 
     # Create a private gate channel
     gate_cfg = cfg().get("gate_layout", {})
-    guest_category_name = str(gate_cfg.get("category") or "Guest Access")
+    guest_category_name = str(gate_cfg.get("category") or "GUEST ACCESS")
     cat = discord.utils.get(member.guild.categories, name=guest_category_name)
     if not cat:
         cat = await member.guild.create_category(guest_category_name)
@@ -3583,6 +3865,23 @@ async def ensure_category(guild: discord.Guild, name: str) -> discord.CategoryCh
     cat = discord.utils.get(guild.categories, name=name)
     if cat:
         return cat
+    rename_map = {
+        "WELCOME": ["Welcome & Information"],
+        "OPERATIONS": ["Bot Control & Monitoring"],
+        "GUEST ACCESS": ["Guest Access"],
+        "ENGINEERING": ["Engineering Core", "DM Bridges", "Research & Development"],
+        "GOD CORE": ["Admin Backrooms"],
+    }
+    for old in rename_map.get(name, []):
+        old_cat = discord.utils.get(guild.categories, name=old)
+        if old_cat:
+            try:
+                await old_cat.edit(name=name)
+                await setup_pause()
+                return old_cat
+            except Exception as exc:
+                await _setup_pause_on_rate_limit(exc)
+                break
     try:
         cat = await guild.create_category(name)
         await setup_pause()
@@ -3597,7 +3896,30 @@ async def ensure_text_channel(
     category: discord.CategoryChannel,
     topic: Optional[str] = None,
 ) -> discord.TextChannel:
+    rename_map = {
+        "rules": ["rules-and-guidelines"],
+        "console": ["bot-status"],
+        "requests": ["command-requests"],
+        "reports": ["error-reporting"],
+        "system-log": ["system-logs"],
+        "audit-log": ["audit-logs"],
+        "debug-log": ["debug-logs"],
+        "mirror-log": ["mirror-logs"],
+        "data-lab": ["core-chat", "algorithm-discussion", "data-analysis"],
+    }
     ch = discord.utils.get(guild.text_channels, name=name)
+    if not ch and name in rename_map:
+        for old in rename_map[name]:
+            old_ch = discord.utils.get(guild.text_channels, name=old)
+            if old_ch:
+                try:
+                    await old_ch.edit(name=name, category=category)
+                    await setup_pause()
+                    ch = old_ch
+                    break
+                except Exception as exc:
+                    await _setup_pause_on_rate_limit(exc)
+                    break
     if ch:
         try:
             edits: Dict[str, Any] = {}
@@ -3620,11 +3942,22 @@ async def ensure_text_channel(
         raise
 
 async def ensure_pinned(channel: discord.TextChannel, content: str):
-    key = content.splitlines()[0][:60]
+    lines = content.splitlines()
+    sig = lines[0].strip() if lines else ""
+    has_sig = sig.startswith("<!--PIN:") and sig.endswith("-->")
     try:
         pins = [p async for p in channel.pins()]
         for p in pins:
-            if p.author.id == bot.user.id and (p.content or "").startswith(key):
+            if p.author.id != bot.user.id:
+                continue
+            p_lines = (p.content or "").splitlines()
+            p_sig = p_lines[0].strip() if p_lines else ""
+            if has_sig and p_sig == sig:
+                if p.content != content:
+                    await p.edit(content=content)
+                    await setup_pause()
+                return
+            if not has_sig and p.content.startswith(sig[:60]):
                 if p.content != content:
                     await p.edit(content=content)
                     await setup_pause()
@@ -3706,7 +4039,7 @@ async def repopulate_channel(channel: discord.TextChannel):
         pass
 
     channels_cfg = cfg().get("command_channels", {})
-    user_channel = channels_cfg.get("user", "command-requests")
+    user_channel = channels_cfg.get("user", "requests")
     god_channel = channels_cfg.get("god", "admin-chat")
     if channel.name == user_channel:
         await ensure_menu_panel(
@@ -3727,7 +4060,7 @@ async def repopulate_channel(channel: discord.TextChannel):
 
 async def ensure_menu_panels(guild: discord.Guild):
     channels_cfg = cfg().get("command_channels", {})
-    user_channel = channels_cfg.get("user", "command-requests")
+    user_channel = channels_cfg.get("user", "requests")
     god_channel = channels_cfg.get("god", "admin-chat")
     await ensure_menu_panel(
         guild,
@@ -3758,10 +4091,10 @@ async def ensure_log_channels(guild: discord.Guild):
         await STORE.mark_dirty()
         return
 
-    system = find_text_by_name(guild, "system-logs")
-    audit_ch = find_text_by_name(guild, "audit-logs") or system
-    debug_ch = find_text_by_name(guild, "debug-logs") or system
-    mirror_ch = find_text_by_name(guild, "mirror-logs") or system
+    system = find_text_by_name(guild, "system-log")
+    audit_ch = find_text_by_name(guild, "audit-log") or system
+    debug_ch = find_text_by_name(guild, "debug-log") or system
+    mirror_ch = find_text_by_name(guild, "mirror-log") or system
     if system:
         logs["system"] = system.id
     if audit_ch:
@@ -3781,9 +4114,18 @@ async def ensure_admin_server_channels(source_guild: discord.Guild):
 
     cat = admin.get_channel(entry.get("category_id")) if entry.get("category_id") else None
     if not isinstance(cat, discord.CategoryChannel):
-        cat = discord.utils.get(admin.categories, name=admin_category_name(source_guild))
+        desired_name = admin_category_name(source_guild)
+        legacy = discord.utils.get(admin.categories, name=f"{source_guild.name} Admin")
+        cat = discord.utils.get(admin.categories, name=desired_name) or legacy
+        if legacy and legacy.name != desired_name:
+            try:
+                await legacy.edit(name=desired_name)
+                await setup_pause()
+                cat = legacy
+            except Exception:
+                pass
         if not cat:
-            cat = await admin.create_category(admin_category_name(source_guild))
+            cat = await admin.create_category(desired_name)
             await setup_pause()
         entry["category_id"] = cat.id
     else:
@@ -3915,13 +4257,12 @@ async def ensure_layout_defaults() -> Dict[str, List[str]]:
     layout = cfg().setdefault("layout", {})
     cats = layout.setdefault("categories", {})
     required = {
-        "Welcome & Information": ["rules-and-guidelines", "announcements", "guest-briefing"],
-        "Bot Control & Monitoring": ["bot-status", "command-requests", "error-reporting"],
-        "Research & Development": ["algorithm-discussion", "data-analysis"],
-        "Guest Access": ["guest-chat", "guest-feedback", "quarantine"],
-        "Engineering Core": ["core-chat", "system-logs", "audit-logs", "debug-logs", "mirror-logs"],
-        "Admin Backrooms": ["admin-chat", "server-management"],
-        "DM Bridges": [],
+        "WELCOME": ["rules", "announcements", "guest-briefing", "manual-for-living"],
+        "OPERATIONS": ["console", "requests", "reports"],
+        "SATELLITES": [],
+        "GUEST ACCESS": ["guest-chat", "guest-feedback", "quarantine"],
+        "ENGINEERING": ["system-log", "audit-log", "debug-log", "mirror-log", "data-lab", "dm-bridges"],
+        "GOD CORE": ["admin-chat", "server-management", "layout-control", "blueprint-export", "incident-room"],
     }
     changed = False
     for cat, channels in required.items():
@@ -5638,6 +5979,93 @@ class SetupModeView(BaseView):
     async def destructive_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._start(interaction, "destructive")
 
+class OwnerOnboardingView(BaseView):
+    def __init__(self, author_id: int):
+        super().__init__(author_id, timeout=240)
+        self.owner_confirmed = False
+        self.can_invite = False
+        self.features: Set[str] = set(owner_onboarding_defaults())
+        self.invite_link, self.invite_source = owner_onboarding_invite_details()
+        options: List[discord.SelectOption] = []
+        for feat in OWNER_ONBOARD_FEATURES:
+            key = str(feat.get("key") or "").strip()
+            if key == "mirror":
+                continue
+            label = str(feat.get("label") or key)[:100]
+            desc = str(feat.get("description") or "")[:95]
+            options.append(discord.SelectOption(label=label, value=key, description=desc, default=key in self.features))
+        if options:
+            self.feature_select = discord.ui.Select(
+                placeholder="Select features (Mirror locked on)",
+                min_values=0,
+                max_values=len(options),
+                options=options,
+            )
+            self.feature_select.callback = self._on_features
+            self.add_item(self.feature_select)
+
+    def status_text(self) -> str:
+        feats = normalize_owner_onboarding_features(list(self.features))
+        labels = owner_onboarding_feature_labels(feats)
+        return "\n".join(
+            [
+                "**Owner Onboarding**",
+                f"Owner confirmed: {'yes' if self.owner_confirmed else 'no'}",
+                f"Can invite now: {'yes' if self.can_invite else 'no'}",
+                f"Invite source: {self.invite_source or 'generated'}",
+                "Mirror is always on.",
+                "Selected features: " + (", ".join(labels) if labels else "mirror"),
+            ]
+        )
+
+    async def _on_features(self, interaction: discord.Interaction):
+        picked = list(self.feature_select.values or [])
+        self.features = set(normalize_owner_onboarding_features(picked))
+        await interaction.response.edit_message(content=self.status_text(), view=self)
+
+    @discord.ui.button(label="I'm the server owner", style=discord.ButtonStyle.primary)
+    async def owner_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.owner_confirmed = not self.owner_confirmed
+        await interaction.response.edit_message(content=self.status_text(), view=self)
+
+    @discord.ui.button(label="I can invite now", style=discord.ButtonStyle.secondary)
+    async def invite_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.can_invite = not self.can_invite
+        await interaction.response.edit_message(content=self.status_text(), view=self)
+
+    @discord.ui.button(label="Save & Show Invite", style=discord.ButtonStyle.success)
+    async def save_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.owner_confirmed:
+            return await interaction.response.send_message("Confirm you are the server owner first.", ephemeral=True)
+        if not self.can_invite:
+            return await interaction.response.send_message("Confirm you can invite the bot.", ephemeral=True)
+        invite_link = self.invite_link or owner_onboarding_invite_link()
+        if not invite_link:
+            return await interaction.response.send_message("Invite link is missing. Add LINK=... to passwords.txt.", ephemeral=True)
+        feats = normalize_owner_onboarding_features(list(self.features))
+        record = await save_owner_onboarding_request(interaction.user.id, feats, invite_link, self.owner_confirmed, self.can_invite)
+        labels = owner_onboarding_feature_labels(feats)
+        lines = [
+            "**Owner Onboarding**",
+            "Mirror is locked on.",
+            "Selected features: " + (", ".join(labels) if labels else "mirror"),
+            "",
+            "Invite the bot to your server using this link:",
+            invite_link,
+            "",
+            "After I join, I'll auto-detect your invite and grant satellite access.",
+        ]
+        try:
+            await interaction.user.send("\n".join(lines))
+            await interaction.response.send_message("Saved. Check your DMs for the invite link.", ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("Saved. Invite link: " + invite_link, ephemeral=True)
+        self.features = set(record.get("features", feats))
+        try:
+            await interaction.message.edit(content=self.status_text(), view=self)
+        except Exception:
+            pass
+
 async def user_status_text(user: discord.abc.User) -> str:
     parts = []
     g = cfg().get("gate", {})
@@ -6773,7 +7201,7 @@ class CommandChannelModal(discord.ui.Modal):
         channels = cfg().get("command_channels", {})
         self.user_channel = discord.ui.TextInput(
             label="User command channel",
-            default=str(channels.get("user", "command-requests")),
+            default=str(channels.get("user", "requests")),
             max_length=80,
         )
         self.god_channel = discord.ui.TextInput(
@@ -6786,7 +7214,7 @@ class CommandChannelModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         channels = cfg().setdefault("command_channels", {})
-        channels["user"] = str(self.user_channel.value or "command-requests").strip()
+        channels["user"] = str(self.user_channel.value or "requests").strip()
         channels["god"] = str(self.god_channel.value or "admin-chat").strip()
         await STORE.mark_dirty()
         await audit(interaction.user.id, "Command channels updated", {"user": channels["user"], "god": channels["god"]})
@@ -6800,7 +7228,7 @@ class CommandChannelView(BaseView):
     def _summary(self) -> str:
         channels = cfg().get("command_channels", {})
         mode = channels.get("mode", "off")
-        user_ch = channels.get("user", "command-requests")
+        user_ch = channels.get("user", "requests")
         god_ch = channels.get("god", "admin-chat")
         desc = {
             "off": "Allow commands anywhere.",
@@ -7975,6 +8403,13 @@ async def menu(ctx: commands.Context):
     await safe_delete(ctx.message)
     view = UserMenuView(ctx.author.id)
     msg = await ctx.send("**Mandy Menu**", view=view)
+    view.message = msg
+
+@bot.command(name="owneronboard", aliases=["onboardme", "selfonboard"])
+async def owneronboard(ctx: commands.Context):
+    await safe_delete(ctx.message)
+    view = OwnerOnboardingView(ctx.author.id)
+    msg = await ctx.send(view.status_text(), view=view)
     view.message = msg
 
 @bot.command()
@@ -9195,6 +9630,7 @@ async def on_guild_join(guild: discord.Guild):
         if auto_backfill_enabled():
             spawn_task(backfill_chat_stats_for_guild(guild), "stats")
         spawn_task(send_owner_server_report(guild, reason="guild join (auto setup pending)"), "reports")
+        spawn_task(maybe_complete_owner_onboarding(guild), "owner_onboarding")
         return
     try:
         await ensure_admin_server_channels(guild)
@@ -9205,6 +9641,7 @@ async def on_guild_join(guild: discord.Guild):
     spawn_task(send_owner_server_report(guild, reason="guild join"), "reports")
     if auto_backfill_enabled():
         spawn_task(backfill_chat_stats_for_guild(guild), "stats")
+    spawn_task(maybe_complete_owner_onboarding(guild), "owner_onboarding")
 
 @tasks.loop(seconds=5)
 async def config_reload():
@@ -9506,7 +9943,7 @@ async def enforce_command_channels(message: discord.Message) -> bool:
     mode = channels_cfg.get("mode", "off")
     if mode == "off":
         return False
-    user_channel = channels_cfg.get("user", "command-requests")
+    user_channel = channels_cfg.get("user", "requests")
     god_channel = channels_cfg.get("god", "admin-chat")
     try:
         lvl = await effective_level(message.author)
