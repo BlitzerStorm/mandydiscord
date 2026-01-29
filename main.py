@@ -4234,8 +4234,10 @@ async def setup_fullsync(guild: discord.Guild):
     await setup_log("Phase 1/4: build categories and channels")
     for cat_name, chans in layout.items():
         cat = await ensure_category(guild, cat_name)
+        await setup_pause()
         for ch_name in chans:
             await ensure_text_channel(guild, ch_name, cat, topic=topics.get(ch_name))
+            await setup_pause()
 
     await setup_log("Phase 1/4: populate pinned text")
     for ch_name, content in pins.items():
@@ -4246,6 +4248,7 @@ async def setup_fullsync(guild: discord.Guild):
     await setup_log("Phase 1/4: command menus + log routing")
     await ensure_menu_panels(guild)
     await ensure_log_channels(guild)
+    await setup_pause()
 
     missing = await verify_layout(guild)
     if missing:
@@ -4260,8 +4263,10 @@ async def setup_fullsync(guild: discord.Guild):
         await ensure_roles(guild)
         await apply_guest_permissions(guild)
         await apply_quarantine_permissions(guild)
+        await setup_pause()
 
     await ensure_log_channels(guild)
+    await setup_pause()
     await setup_log("Phase 3/4: setup complete for this server")
 
 class SetupAiRateLimitError(Exception):
@@ -4578,8 +4583,10 @@ async def _apply_ai_layout(guild: discord.Guild, layout_payload: Dict[str, Any])
 
     for cat_name, chans in layout.items():
         cat = await ensure_category(guild, cat_name)
+        await setup_pause()
         for ch_name in chans:
             await ensure_text_channel(guild, ch_name, cat, topic=topics.get(ch_name))
+            await setup_pause()
 
     cfg().setdefault("layout", {})["categories"] = layout
     cfg()["channel_topics"] = dict(topics)
@@ -4608,10 +4615,13 @@ async def _apply_ai_layout(guild: discord.Guild, layout_payload: Dict[str, Any])
 
     await ensure_menu_panels(guild)
     await ensure_log_channels(guild)
+    await setup_pause()
     for ch_name, content in pins.items():
         ch = find_text_by_name(guild, ch_name)
         if ch:
             await ensure_pinned(ch, content)
+            await setup_pause()
+            await setup_pause()
 
 async def setup_destructive_ai(guild: discord.Guild, actor_id: int = 0) -> bool:
     if guild.id != ADMIN_GUILD_ID:
@@ -4640,6 +4650,7 @@ async def setup_destructive_ai(guild: discord.Guild, actor_id: int = 0) -> bool:
         await ensure_roles(guild)
         await apply_guest_permissions(guild)
         await apply_quarantine_permissions(guild)
+        await setup_pause()
 
     await setup_log("Phase 3/4: AI setup complete for this server")
     return True
@@ -4704,8 +4715,11 @@ BIO_LAYOUT = {
 async def _ensure_recovery_anchor(guild: discord.Guild) -> Optional[Tuple[discord.CategoryChannel, discord.TextChannel, discord.TextChannel]]:
     try:
         recovery = await ensure_category(guild, "RECOVERY")
+        await setup_pause()
         cmd_line = await ensure_text_channel(guild, "command-line", recovery)
+        await setup_pause()
         system_log = await ensure_text_channel(guild, "system-log", recovery)
+        await setup_pause()
         return recovery, cmd_line, system_log
     except Exception:
         return None
@@ -4728,6 +4742,7 @@ async def _setup_bio_preflight(guild: discord.Guild) -> Optional[discord.TextCha
     await STORE.mark_dirty()
     try:
         await system_log.send("BIO-GENESIS starting. Recovery anchor online.")
+        await setup_pause()
     except Exception:
         return None
     return system_log
@@ -4780,9 +4795,11 @@ async def _setup_bio_build_layout(guild: discord.Guild) -> Dict[str, discord.Tex
     created: Dict[str, discord.TextChannel] = {}
     for cat_name, channels in BIO_LAYOUT.items():
         cat = await ensure_category(guild, cat_name)
+        await setup_pause()
         for ch_name in channels:
             ch = await ensure_text_channel(guild, ch_name, cat)
             created[ch_name] = ch
+            await setup_pause()
     return created
 
 def _sanitize_topic(text: str) -> str:
@@ -4919,6 +4936,7 @@ async def _apply_bio_ai_updates(guild: discord.Guild, updates: Dict[str, Dict[st
             continue
         pins_cfg[name] = text
         await ensure_pinned(ch, text)
+        await setup_pause()
     await STORE.mark_dirty()
 
 async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord.TextChannel]) -> None:
@@ -4960,12 +4978,16 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
     if guild.id == ADMIN_GUILD_ID:
         try:
             await ensure_roles(guild)
+            await setup_pause()
             await apply_guest_permissions(guild)
+            await setup_pause()
             await apply_quarantine_permissions(guild)
+            await setup_pause()
         except Exception:
             pass
 
     await ensure_menu_panels(guild)
+    await setup_pause()
     menu_hub = created.get("menu-hub")
     if menu_hub:
         await ensure_menu_panel(
@@ -4975,6 +4997,7 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
             "**Mandy Menu**\nUse the buttons below.",
             UserMenuView(0, timeout=None),
         )
+        await setup_pause()
         await ensure_menu_panel(
             guild,
             "menu-hub",
@@ -4982,12 +5005,14 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
             "**GOD MENU**\nGOD-only controls.",
             GodMenuView(0, timeout=None),
         )
+        await setup_pause()
 
     for g in bot.guilds:
         if g.id == ADMIN_GUILD_ID:
             continue
         try:
             await ensure_admin_server_channels(g)
+            await setup_pause()
         except Exception:
             continue
 
@@ -5014,6 +5039,7 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
             mirror_feed = None
         if mirror_feed:
             await mirror_rule_update(rule, target_channel=mirror_feed.id)
+            await setup_pause()
 
     if auto_backfill_enabled():
         for g in bot.guilds:
@@ -5024,6 +5050,7 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
                 continue
             try:
                 await backfill_mirror_for_guild(g, rule, force=False)
+                await setup_pause()
             except Exception:
                 continue
 
@@ -5034,6 +5061,7 @@ async def _setup_bio_reseed_ops(guild: discord.Guild, created: Dict[str, discord
         ch = await ensure_dm_bridge_channel(uid, active=True)
         if ch:
             await dm_bridge_set(uid, ch.id, active=True, last_activity=int(bridge.get("last_activity", 0) or now_ts()))
+            await setup_pause()
 
     await log_to("mirror", "Mirror sync complete", subsystem="SENSORY", severity="INFO")
 
