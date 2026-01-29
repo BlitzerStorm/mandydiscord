@@ -945,6 +945,8 @@ async def run_boot_orchestrator() -> List[SetupPhaseResult]:
         return "SKIPPED", "auto setup disabled"
 
     async def phase_backfill():
+        if not chat_stats_enabled():
+            return "SKIPPED", "chat stats disabled"
         if auto_backfill_enabled():
             spawn_task(backfill_chat_stats_all_guilds(), "stats")
             return "QUEUED", "backfill queued"
@@ -1251,6 +1253,12 @@ CHAT_STATS_WINDOWS = ("daily", "rolling24", "weekly", "monthly", "yearly", "all"
 def chat_stats_state() -> Dict[str, Any]:
     return cfg().setdefault("chat_stats", {})
 
+
+def chat_stats_enabled() -> bool:
+    # Feature toggle: disable chat stats collection/commands unless explicitly enabled.
+    return bool(cfg().get("chat_stats_enabled", False))
+
+
 def chat_stats_backfill_done() -> Dict[str, Any]:
     return cfg().setdefault("chat_stats_backfill_done", {})
 
@@ -1399,6 +1407,8 @@ def update_word_freq(freq: Dict[str, int], words: List[str]) -> None:
     trim_word_freq(freq, 200)
 
 async def chat_stats_increment(message: discord.Message, mark_dirty: bool = True):
+    if not chat_stats_enabled():
+        return
     if not message.guild:
         return
     if message.author.bot:
@@ -1586,6 +1596,8 @@ async def stop_live_stats_panel(guild_id: int, delete_message: bool = True):
     await STORE.mark_dirty()
 
 async def live_stats_loop(guild_id: int, channel_id: int, message_id: int, window: str):
+    if not chat_stats_enabled():
+        return
     try:
         ch: Optional[discord.TextChannel] = None
         msg: Optional[discord.Message] = None
@@ -1622,6 +1634,8 @@ async def live_stats_loop(guild_id: int, channel_id: int, message_id: int, windo
         state.LIVE_STATS_TASKS.pop(guild_id, None)
 
 async def resume_live_stats_panels():
+    if not chat_stats_enabled():
+        return
     for gid_str, info in list(chat_stats_live_message().items()):
         try:
             gid = int(gid_str)
@@ -1758,6 +1772,8 @@ async def stop_global_live_panel(delete_message: bool = True):
     await STORE.mark_dirty()
 
 async def global_live_stats_loop(channel_id: int, message_id: int, window: str):
+    if not chat_stats_enabled():
+        return
     try:
         ch: Optional[discord.TextChannel] = None
         msg: Optional[discord.Message] = None
@@ -1792,6 +1808,8 @@ async def global_live_stats_loop(channel_id: int, message_id: int, window: str):
         state.LIVE_STATS_TASKS.pop("GLOBAL", None)
 
 async def resume_global_live_panel():
+    if not chat_stats_enabled():
+        return
     info = chat_stats_global_live_message()
     if not info:
         return
@@ -2137,6 +2155,8 @@ async def backfill_mirror_for_guild(guild: discord.Guild, rule: Dict[str, Any], 
         await setup_log(f"Backfill error for {guild.name}: {err}")
 
 async def backfill_chat_stats_for_guild(guild: discord.Guild):
+    if not chat_stats_enabled():
+        return
     if not guild:
         return
     done = chat_stats_backfill_done()
@@ -2186,6 +2206,8 @@ async def backfill_chat_stats_for_guild(guild: discord.Guild):
         )
 
 async def backfill_chat_stats_all_guilds():
+    if not chat_stats_enabled():
+        return
     for g in bot.guilds:
         await backfill_chat_stats_for_guild(g)
 
@@ -8094,6 +8116,8 @@ async def setlogs(ctx: commands.Context, which: str, channel_id: int):
 
 @bot.command(name="mystats")
 async def cmd_mystats(ctx: commands.Context, window: str = None):
+    if not chat_stats_enabled():
+        return await ctx.send("Chat stats are disabled.", delete_after=8)
     await safe_delete(ctx.message)
     window = normalize_stats_window(window, "daily")
     now_dt = datetime.datetime.now(datetime.timezone.utc)
@@ -8114,6 +8138,8 @@ async def cmd_mystats(ctx: commands.Context, window: str = None):
 
 @bot.command(name="allstats")
 async def cmd_allstats(ctx: commands.Context, window: str = None):
+    if not chat_stats_enabled():
+        return await ctx.send("Chat stats are disabled.", delete_after=8)
     await safe_delete(ctx.message)
     window = normalize_stats_window(window, "daily")
     window_state = chat_stats_window_state(ctx.guild, window)
@@ -8144,6 +8170,8 @@ async def cmd_allstats(ctx: commands.Context, window: str = None):
 
 @bot.command(name="livestats")
 async def cmd_livestats(ctx: commands.Context, window: str = None):
+    if not chat_stats_enabled():
+        return await ctx.send("Chat stats are disabled.", delete_after=8)
     await safe_delete(ctx.message)
     if await effective_level(ctx.author) < 50:
         return
@@ -8167,6 +8195,8 @@ async def cmd_livestats(ctx: commands.Context, window: str = None):
 
 @bot.command(name="globalstats")
 async def cmd_globalstats(ctx: commands.Context, window: str = None):
+    if not chat_stats_enabled():
+        return await ctx.send("Chat stats are disabled.", delete_after=8)
     await safe_delete(ctx.message)
     window = normalize_stats_window(window, "rolling24")
     emb, changed = await chat_stats_build_global_embed(window)
