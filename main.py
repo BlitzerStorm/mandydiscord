@@ -4455,10 +4455,17 @@ async def run_full_setup(guild: discord.Guild, mode: str, actor_id: int = 0):
     if guild.id != ADMIN_GUILD_ID:
         return
     await setup_log(f"Full setup requested: {mode} by {actor_id}")
+    prev_adaptive = state.SETUP_ADAPTIVE_ACTIVE
+    prev_override = state.SETUP_DELAY_OVERRIDE
+    paused_state: Optional[Dict[str, Any]] = None
     try:
         await _purge_setup_dms(SUPER_USER_ID)
         await _setup_snapshot_inventory(guild, reason=f"setup_start:{mode}")
         async with state.AUTO_SETUP_LOCK:
+            state.SETUP_ADAPTIVE_ACTIVE = True
+            if state.SETUP_DELAY_OVERRIDE is None:
+                state.SETUP_DELAY_OVERRIDE = setup_delay_base()
+            paused_state = await _pause_background_tasks_for_setup()
             if mode in ("destructive", "destructive_ai", "fullsync"):
                 if mode == "destructive_ai":
                     ai_ok = True
@@ -4513,15 +4520,32 @@ async def run_full_setup(guild: discord.Guild, mode: str, actor_id: int = 0):
                 pass
     except Exception as e:
         await setup_log(f"Full setup failed: {e}")
+    finally:
+        if paused_state is not None:
+            await _resume_background_tasks_after_setup(paused_state)
+        state.SETUP_ADAPTIVE_ACTIVE = prev_adaptive
+        state.SETUP_DELAY_OVERRIDE = prev_override
 
 async def run_auto_setup_with_debrief(actor_id: int = 0):
     await setup_log(f"Auto setup requested by {actor_id}")
+    prev_adaptive = state.SETUP_ADAPTIVE_ACTIVE
+    prev_override = state.SETUP_DELAY_OVERRIDE
+    paused_state: Optional[Dict[str, Any]] = None
     try:
+        state.SETUP_ADAPTIVE_ACTIVE = True
+        if state.SETUP_DELAY_OVERRIDE is None:
+            state.SETUP_DELAY_OVERRIDE = setup_delay_base()
+        paused_state = await _pause_background_tasks_for_setup()
         await auto_setup_all_guilds(do_backfill=True, force_backfill=True, include_admin=True)
         await send_setup_debrief(trigger="auto")
         await setup_log("Auto setup completed")
     except Exception as e:
         await setup_log(f"Auto setup failed: {e}")
+    finally:
+        if paused_state is not None:
+            await _resume_background_tasks_after_setup(paused_state)
+        state.SETUP_ADAPTIVE_ACTIVE = prev_adaptive
+        state.SETUP_DELAY_OVERRIDE = prev_override
 
 async def _purge_all_channels(guild: discord.Guild) -> bool:
     passes = 3
@@ -5059,6 +5083,7 @@ async def _pause_background_tasks_for_setup() -> Dict[str, Any]:
         "maintenance": sentience_maintenance_loop,
         "diagnostics": diagnostics_loop,
         "manual_upload": manual_upload_loop,
+        "soc_access": soc_access_sync_loop,
     }
     for name, loop_task in loops.items():
         running = loop_task.is_running()
@@ -5096,6 +5121,7 @@ async def _resume_background_tasks_after_setup(state: Dict[str, Any]) -> None:
         "maintenance": sentience_maintenance_loop,
         "diagnostics": diagnostics_loop,
         "manual_upload": manual_upload_loop,
+        "soc_access": soc_access_sync_loop,
     }
     for name, loop_task in loop_map.items():
         if loops.get(name) and not loop_task.is_running():
