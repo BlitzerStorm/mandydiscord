@@ -51,6 +51,11 @@ Edit these constants in `main.py` to match your IDs:
 python main.py
 ```
 
+Optional speed + persistence toggles:
+- `MANDY_FAST_MODE=1` (or `FAST_MODE=1`): disables typing delay, send delay, and setup pacing.
+- `MYSQL_PURGE_ON_STARTUP=0`: keep MySQL data between restarts (default is purge-on-start).
+- `MANDY_DB_BACKUP_INTERVAL_SECONDS=0`: disable JSON backup creation (default 3600s).
+
 ### 5) Bootstrap the admin hub (admin hub only)
 - `!setup bootstrap` (safe sync).
 - `!setup fullsync` / `!setup destructive` (SUPERUSER-only; rebuilds layout).
@@ -81,6 +86,10 @@ Mandy uses `database.json` as the live state/config store. If MySQL is configure
 Good habits:
 - Back up `database.json` periodically.
 - If you enable MySQL, back up the database too.
+
+Note:
+- By default, Mandy purges MySQL tables on startup (fresh boot each run). Set `MYSQL_PURGE_ON_STARTUP=0` to keep DB state.
+- JSON backups are throttled (1 per hour by default). You can change the interval with `MANDY_DB_BACKUP_INTERVAL_SECONDS`.
 
 ## 0x03 Access Control (RBAC)
 
@@ -377,6 +386,9 @@ Common keys you will edit:
 - `dm_bridges`: DM bridge state.
 - `ark_snapshots`, `phoenix_keys`, `memory`, `onboarding`.
 - `layout`, `channel_topics`, `pinned_text`: what `!setup` creates and pins.
+- `tuning.fast_mode`: if true, disables typing delay, send delay, and setup pacing.
+- `mysql_purge_on_startup`: if true, MySQL is truncated on each restart (default true).
+- `server_info_invites`: internal cache for server-info invite URLs (rate-limit guard).
 
 Note: Mandy reloads `database.json` automatically and autosaves when she changes state.
 
