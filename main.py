@@ -211,6 +211,177 @@ MIRROR_RULE_INDEX: Dict[str, Dict[int, List[Dict[str, Any]]]] = {
 MIRROR_RULE_INDEX_DIRTY = True
 MIRROR_RULE_INDEX_MTIME = 0.0
 
+SETUP_GUILD_LOCKS: Dict[int, asyncio.Lock] = {}
+
+MIRROR_BATCH_QUEUES: Dict[int, List[Dict[str, Any]]] = {}
+MIRROR_BATCH_TASKS: Dict[int, asyncio.Task] = {}
+MIRROR_BATCH_LAST_SEND: Dict[int, float] = {}
+MIRROR_BATCH_LOCK = asyncio.Lock()
+
+
+def _setup_guild_lock(guild_id: int) -> asyncio.Lock:
+    lock = SETUP_GUILD_LOCKS.get(guild_id)
+    if not lock:
+        lock = asyncio.Lock()
+        SETUP_GUILD_LOCKS[guild_id] = lock
+    return lock
+
+
+def _mirror_batch_cfg() -> Tuple[bool, float, int, int, float, bool]:
+    raw = cfg().get("mirror_batch", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    enabled = bool(raw.get("enabled", True))
+    window = float(raw.get("window_seconds", 0.8))
+    max_items = int(raw.get("max_items", 10))
+    max_chars = int(raw.get("max_chars", 1800))
+    burst_window = float(raw.get("burst_window_seconds", 1.2))
+    text_only = bool(raw.get("text_only", True))
+    window = max(0.0, min(5.0, window))
+    max_items = max(2, min(50, max_items))
+    max_chars = max(200, min(4000, max_chars))
+    burst_window = max(0.0, min(10.0, burst_window))
+    return enabled, window, max_items, max_chars, burst_window, text_only
+
+
+def _mirror_batch_line(message: discord.Message) -> str:
+    content = " ".join((message.content or "").split())
+    if not content:
+        content = "(no text)"
+    extras = []
+    if message.attachments:
+        extras.append(f"attachments:{len(message.attachments)}")
+    if message.stickers:
+        extras.append(f"stickers:{len(message.stickers)}")
+    if message.embeds:
+        extras.append(f"embeds:{len(message.embeds)}")
+    if extras:
+        content = f"{content} [{' '.join(extras)}]"
+    content = truncate(content, 160)
+    src = f"{message.guild.name}/#{message.channel.name}"
+    return f"{src} | {message.author}: {content} | {message.jump_url}"
+
+
+async def _mirror_batch_flush(dst_id: int) -> None:
+    async with MIRROR_BATCH_LOCK:
+        items = MIRROR_BATCH_QUEUES.pop(dst_id, [])
+        MIRROR_BATCH_TASKS.pop(dst_id, None)
+    if not items:
+        return
+    ch = bot.get_channel(dst_id)
+    if not ch:
+        try:
+            ch = await bot.fetch_channel(dst_id)
+        except Exception:
+            ch = None
+    if not isinstance(ch, discord.TextChannel):
+        by_rule: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            rid = item.get("rule_id") or ""
+            if rid and rid not in by_rule:
+                by_rule[rid] = item
+        for rid in by_rule:
+            rule = mirror_rules_dict().get(rid)
+            if rule:
+                await mirror_rule_record_failure(rule, "batch target missing")
+        return
+    lines = ["- " + item["line"] for item in items if item.get("line")]
+    header = f"Mirror batch ({len(lines)})"
+    chunks = chunk_lines(lines, header, limit=1900)
+    try:
+        for chunk in chunks:
+            await ch.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as exc:
+        by_rule: Dict[str, Dict[str, Any]] = {}
+        for item in items:
+            rid = item.get("rule_id") or ""
+            if rid and rid not in by_rule:
+                by_rule[rid] = item
+        for rid in by_rule:
+            rule = mirror_rules_dict().get(rid)
+            if rule:
+                await mirror_rule_record_failure(rule, f"batch send error: {exc}")
+        return
+    MIRROR_BATCH_LAST_SEND[dst_id] = time.time()
+    by_rule: Dict[str, Dict[str, Any]] = {}
+    by_guild: Dict[int, Dict[str, Any]] = {}
+    for item in items:
+        rid = item.get("rule_id") or ""
+        if rid:
+            by_rule[rid] = item
+        gid = item.get("src_guild_id")
+        if isinstance(gid, int):
+            by_guild[gid] = item
+    for rid, item in by_rule.items():
+        rule = mirror_rules_dict().get(rid)
+        if rule:
+            await mirror_rule_mark_success(rule, item.get("content") or "(no text)")
+    status = cfg().setdefault("mirror_status", {})
+    for gid, item in by_guild.items():
+        status[str(gid)] = {
+            "last_mirror_ts": now_ts(),
+            "last_mirror_author": item.get("author") or "",
+            "last_mirror_channel": item.get("src_channel_name") or "",
+            "last_mirror_msg": truncate(item.get("content") or "", 180),
+        }
+    await STORE.mark_dirty()
+    await log_to(
+        "mirror",
+        "Mirror relay batch delivered",
+        subsystem="SENSORY",
+        severity="INFO",
+        details={"count": len(items), "target": dst_id},
+    )
+
+
+async def _mirror_batch_flush_after(dst_id: int, delay: float) -> None:
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+    await _mirror_batch_flush(dst_id)
+
+
+async def _mirror_batch_enqueue(
+    dst: discord.TextChannel,
+    rule: Dict[str, Any],
+    message: discord.Message,
+    perms: discord.Permissions,
+) -> bool:
+    enabled, window, max_items, max_chars, burst_window, text_only = _mirror_batch_cfg()
+    if not enabled:
+        return False
+    if text_only and (message.attachments or message.embeds or message.stickers):
+        return False
+    if not perms.send_messages:
+        return False
+    now = time.time()
+    async with MIRROR_BATCH_LOCK:
+        queue = MIRROR_BATCH_QUEUES.get(dst.id, [])
+        last_send = MIRROR_BATCH_LAST_SEND.get(dst.id, 0.0)
+        if not queue and now - last_send > burst_window:
+            return False
+        line = _mirror_batch_line(message)
+        item = {
+            "line": line,
+            "rule_id": rule.get("rule_id"),
+            "src_guild_id": message.guild.id,
+            "src_channel_id": message.channel.id,
+            "src_channel_name": message.channel.name,
+            "author": str(message.author),
+            "content": message.content or "",
+        }
+        queue.append(item)
+        MIRROR_BATCH_QUEUES[dst.id] = queue
+        size = sum(len(i.get("line", "")) + 2 for i in queue) + len("Mirror batch (99)")
+        flush_now = len(queue) >= max_items or size >= max_chars
+        task = MIRROR_BATCH_TASKS.get(dst.id)
+        if not task or task.done():
+            MIRROR_BATCH_TASKS[dst.id] = asyncio.create_task(_mirror_batch_flush_after(dst.id, window))
+    if flush_now:
+        await _mirror_batch_flush(dst.id)
+    return True
+
 def mark_mirror_rule_index_dirty() -> None:
     global MIRROR_RULE_INDEX_DIRTY
     MIRROR_RULE_INDEX_DIRTY = True
@@ -450,6 +621,34 @@ def presence_config() -> Dict[str, Any]:
 def presence_bio() -> str:
     return str(presence_config().get("bio") or "").strip()
 
+def fast_mode_enabled() -> bool:
+    env = os.getenv("MANDY_FAST_MODE") or os.getenv("FAST_MODE") or ""
+    if env:
+        val = env.strip().lower()
+        if val in ("1", "true", "yes", "y", "on"):
+            return True
+        if val in ("0", "false", "no", "n", "off"):
+            return False
+    tuning = cfg().get("tuning", {})
+    if not isinstance(tuning, dict):
+        return False
+    return bool(tuning.get("fast_mode", False))
+
+def mysql_purge_on_startup_enabled() -> bool:
+    env = os.getenv("MYSQL_PURGE_ON_STARTUP") or ""
+    if env:
+        val = env.strip().lower()
+        if val in ("1", "true", "yes", "y", "on"):
+            return True
+        if val in ("0", "false", "no", "n", "off"):
+            return False
+    val = cfg().get("mysql_purge_on_startup", None)
+    if val is None:
+        cfg()["mysql_purge_on_startup"] = True
+        spawn_task(STORE.mark_dirty(), "store")
+        return True
+    return bool(val)
+
 def autopresence_enabled() -> bool:
     return bool(presence_config().get("autopresence_enabled", False))
 
@@ -464,12 +663,16 @@ COMMAND_CONTEXT = ContextVar("mandy_command_context", default=False)
 COMMAND_CONTEXT = ContextVar("mandy_command_context", default=False)
 
 def typing_delay_seconds() -> float:
+    if fast_mode_enabled():
+        return 0.0
     try:
         return max(0.0, float(cfg().get("typing_delay_seconds", 5.0)))
     except Exception:
         return 5.0
 
 def discord_send_delay_base() -> float:
+    if fast_mode_enabled():
+        return 0.0
     try:
         tuning = cfg().get("tuning", {})
         if not isinstance(tuning, dict):
@@ -1018,6 +1221,12 @@ async def run_boot_orchestrator() -> List[SetupPhaseResult]:
     async def phase_db():
         try:
             await db_init()
+            if mysql_purge_on_startup_enabled():
+                ok = await db_purge_all()
+                if ok:
+                    return "OK", "mysql purged + bootstrapped"
+                state.POOL = None
+                return "FALLBACK", "mysql purge failed, using JSON"
             await db_bootstrap()
             return "OK", "mysql ready"
         except Exception:
@@ -2675,6 +2884,9 @@ async def mirror_send_to_rule(message: discord.Message, rule: Dict[str, Any]):
         await mirror_rule_record_failure(rule, "missing send_messages")
         return
 
+    if await _mirror_batch_enqueue(dst, rule, message, perms):
+        return
+
     try:
         content, embeds, files = await build_mirror_payload(message, perms)
         view = MirrorControls() if mirror_controls_enabled() else None
@@ -2694,6 +2906,8 @@ async def mirror_send_to_rule(message: discord.Message, rule: Dict[str, Any]):
     except Exception as e:
         await mirror_rule_record_failure(rule, f"send error: {e}")
         return
+
+    MIRROR_BATCH_LAST_SEND[dst.id] = time.time()
 
     await log_to(
         "mirror",
@@ -2812,13 +3026,8 @@ async def ensure_dm_category(name: str) -> Optional[discord.CategoryChannel]:
     if not admin:
         return None
     target_name = "ENGINEERING" if name.lower().startswith("engineering") or "dm" in name.lower() else name
-    cat = discord.utils.get(admin.categories, name=target_name)
-    if cat:
-        return cat
     try:
-        cat = await admin.create_category(target_name)
-        await setup_pause()
-        return cat
+        return await ensure_category(admin, target_name)
     except Exception:
         return None
 
@@ -2857,38 +3066,54 @@ async def ensure_dm_bridge_channel(user_id: int, active: bool = True) -> Optiona
     admin = bot.get_guild(ADMIN_GUILD_ID)
     if not admin:
         return None
-    info = await dm_bridge_get(user_id)
-    ch = None
-    if info and info.get("channel_id"):
-        ch = admin.get_channel(int(info["channel_id"]))
-    if not ch:
-        ch = discord.utils.get(admin.text_channels, name=f"dm-{user_id}")
-    cat_name = "ENGINEERING"
-    cat = await ensure_dm_category(cat_name)
-    if not ch:
+    async with _setup_guild_lock(admin.id):
+        info = await dm_bridge_get(user_id)
+        ch = None
+        if info and info.get("channel_id"):
+            ch = admin.get_channel(int(info["channel_id"]))
+        if not ch:
+            matches = [c for c in admin.text_channels if c.name in (f"dm-{user_id}", f"archived-dm-{user_id}")]
+            if matches:
+                ch = sorted(matches, key=lambda c: c.id)[0]
+                if len(matches) > 1:
+                    await debug(f"Duplicate DM bridge channels for {user_id}: {len(matches)}")
+        if not ch:
+            try:
+                fetched = await admin.fetch_channels()
+                fetched_matches = [
+                    c for c in fetched
+                    if isinstance(c, discord.TextChannel) and c.name in (f"dm-{user_id}", f"archived-dm-{user_id}")
+                ]
+                if fetched_matches:
+                    ch = sorted(fetched_matches, key=lambda c: c.id)[0]
+            except Exception:
+                pass
+        cat_name = "ENGINEERING"
+        cat = await ensure_dm_category(cat_name)
+        if not ch:
+            try:
+                ch = await admin.create_text_channel(f"dm-{user_id}", category=cat)
+                await setup_pause()
+            except Exception:
+                return None
+        if cat and ch.category_id != cat.id:
+            try:
+                await ch.edit(category=cat)
+                await setup_pause()
+            except Exception:
+                pass
+        desired_name = f"dm-{user_id}" if active else f"archived-dm-{user_id}"
+        if ch.name != desired_name:
+            try:
+                await ch.edit(name=desired_name)
+                await setup_pause()
+            except Exception:
+                pass
         try:
-            ch = await admin.create_text_channel(f"dm-{user_id}", category=cat)
-            await setup_pause()
-        except Exception:
-            return None
-    if cat and ch.category_id != cat.id:
-        try:
-            await ch.edit(category=cat)
-            await setup_pause()
+            await ensure_dm_bridge_controls(user_id, ch)
         except Exception:
             pass
-    desired_name = f"dm-{user_id}" if active else f"archived-dm-{user_id}"
-    if ch.name != desired_name:
-        try:
-            await ch.edit(name=desired_name)
-            await setup_pause()
-        except Exception:
-            pass
-    try:
-        await ensure_dm_bridge_controls(user_id, ch)
-    except Exception:
-        pass
-    return ch
+        return ch
 
 async def ensure_dm_bridge_active(user_id: int, reason: str = "auto") -> Optional[int]:
     info = await dm_bridge_get(user_id)
@@ -3770,9 +3995,12 @@ async def start_gate(member: discord.Member):
     # Create a private gate channel
     gate_cfg = cfg().get("gate_layout", {})
     guest_category_name = str(gate_cfg.get("category") or "GUEST ACCESS")
-    cat = discord.utils.get(member.guild.categories, name=guest_category_name)
-    if not cat:
-        cat = await member.guild.create_category(guest_category_name)
+    try:
+        cat = await ensure_category(member.guild, guest_category_name)
+    except Exception:
+        cat = discord.utils.get(member.guild.categories, name=guest_category_name)
+        if not cat:
+            cat = await member.guild.create_category(guest_category_name)
 
     overwrites = {
         member.guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -3784,7 +4012,29 @@ async def start_gate(member: discord.Member):
         if role:
             overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
-    ch = await member.guild.create_text_channel(f"gate-{member.name}", category=cat, overwrites=overwrites)
+    gate_name = f"gate-{member.name}"
+    async with _setup_guild_lock(member.guild.id):
+        ch = discord.utils.get(cat.text_channels, name=gate_name) if cat else None
+        if not ch:
+            try:
+                fetched = await member.guild.fetch_channels()
+                fetched_matches = [
+                    c for c in fetched
+                    if isinstance(c, discord.TextChannel)
+                    and c.name == gate_name
+                    and (not cat or c.category_id == cat.id)
+                ]
+                if fetched_matches:
+                    ch = sorted(fetched_matches, key=lambda c: c.id)[0]
+            except Exception:
+                pass
+        if not ch:
+            ch = await member.guild.create_text_channel(gate_name, category=cat, overwrites=overwrites)
+        else:
+            try:
+                await ch.edit(overwrites=overwrites, category=cat)
+            except Exception:
+                pass
 
     cfg().setdefault("gate", {})[str(member.id)] = {"channel": ch.id, "tries": 0}
     await STORE.mark_dirty()
@@ -3864,33 +4114,42 @@ async def handle_gate_attempt(message: discord.Message) -> bool:
 # Auto-populate server + pins
 # -----------------------------
 async def ensure_category(guild: discord.Guild, name: str) -> discord.CategoryChannel:
-    cat = discord.utils.get(guild.categories, name=name)
-    if cat:
-        return cat
-    rename_map = {
-        "WELCOME": ["Welcome & Information"],
-        "OPERATIONS": ["Bot Control & Monitoring"],
-        "GUEST ACCESS": ["Guest Access"],
-        "ENGINEERING": ["Engineering Core", "DM Bridges", "Research & Development"],
-        "GOD CORE": ["Admin Backrooms"],
-    }
-    for old in rename_map.get(name, []):
-        old_cat = discord.utils.get(guild.categories, name=old)
-        if old_cat:
-            try:
-                await old_cat.edit(name=name)
-                await setup_pause()
-                return old_cat
-            except Exception as exc:
-                await _setup_pause_on_rate_limit(exc)
-                break
-    try:
-        cat = await guild.create_category(name)
-        await setup_pause()
-        return cat
-    except Exception as exc:
-        await _setup_pause_on_rate_limit(exc)
-        raise
+    async with _setup_guild_lock(guild.id):
+        matches = [c for c in guild.categories if c.name == name]
+        cat = matches[0] if matches else None
+        if cat:
+            return cat
+        rename_map = {
+            "WELCOME": ["Welcome & Information"],
+            "OPERATIONS": ["Bot Control & Monitoring"],
+            "GUEST ACCESS": ["Guest Access"],
+            "ENGINEERING": ["Engineering Core", "DM Bridges", "Research & Development"],
+            "GOD CORE": ["Admin Backrooms"],
+        }
+        for old in rename_map.get(name, []):
+            old_cat = discord.utils.get(guild.categories, name=old)
+            if old_cat:
+                try:
+                    await old_cat.edit(name=name)
+                    await setup_pause()
+                    return old_cat
+                except Exception as exc:
+                    await _setup_pause_on_rate_limit(exc)
+                    break
+        try:
+            fetched = await guild.fetch_channels()
+            fetched_matches = [c for c in fetched if isinstance(c, discord.CategoryChannel) and c.name == name]
+            if fetched_matches:
+                return fetched_matches[0]
+        except Exception:
+            pass
+        try:
+            cat = await guild.create_category(name)
+            await setup_pause()
+            return cat
+        except Exception as exc:
+            await _setup_pause_on_rate_limit(exc)
+            raise
 
 async def ensure_text_channel(
     guild: discord.Guild,
@@ -3898,50 +4157,66 @@ async def ensure_text_channel(
     category: discord.CategoryChannel,
     topic: Optional[str] = None,
 ) -> discord.TextChannel:
-    rename_map = {
-        "rules": ["rules-and-guidelines"],
-        "console": ["bot-status"],
-        "requests": ["command-requests"],
-        "reports": ["error-reporting"],
-        "system-log": ["system-logs"],
-        "audit-log": ["audit-logs"],
-        "debug-log": ["debug-logs"],
-        "mirror-log": ["mirror-logs"],
-        "data-lab": ["core-chat", "algorithm-discussion", "data-analysis"],
-    }
-    ch = discord.utils.get(guild.text_channels, name=name)
-    if not ch and name in rename_map:
-        for old in rename_map[name]:
-            old_ch = discord.utils.get(guild.text_channels, name=old)
-            if old_ch:
-                try:
-                    await old_ch.edit(name=name, category=category)
+    async with _setup_guild_lock(guild.id):
+        rename_map = {
+            "rules": ["rules-and-guidelines"],
+            "console": ["bot-status"],
+            "requests": ["command-requests"],
+            "reports": ["error-reporting"],
+            "system-log": ["system-logs"],
+            "audit-log": ["audit-logs"],
+            "debug-log": ["debug-logs"],
+            "mirror-log": ["mirror-logs"],
+            "data-lab": ["core-chat", "algorithm-discussion", "data-analysis"],
+        }
+        ch = None
+        if category:
+            ch = discord.utils.get(category.text_channels, name=name)
+        if not ch:
+            ch = discord.utils.get(guild.text_channels, name=name)
+        if not ch and name in rename_map:
+            for old in rename_map[name]:
+                old_ch = discord.utils.get(guild.text_channels, name=old)
+                if old_ch:
+                    try:
+                        await old_ch.edit(name=name, category=category)
+                        await setup_pause()
+                        ch = old_ch
+                        break
+                    except Exception as exc:
+                        await _setup_pause_on_rate_limit(exc)
+                        break
+        if not ch:
+            try:
+                fetched = await guild.fetch_channels()
+                fetched_ch = [
+                    c for c in fetched
+                    if isinstance(c, discord.TextChannel) and c.name == name
+                ]
+                if fetched_ch:
+                    ch = fetched_ch[0]
+            except Exception:
+                pass
+        if ch:
+            try:
+                edits: Dict[str, Any] = {}
+                if category and ch.category != category:
+                    edits["category"] = category
+                if topic is not None and (ch.topic or "") != topic:
+                    edits["topic"] = topic
+                if edits:
+                    await ch.edit(**edits)
                     await setup_pause()
-                    ch = old_ch
-                    break
-                except Exception as exc:
-                    await _setup_pause_on_rate_limit(exc)
-                    break
-    if ch:
+            except Exception as exc:
+                await _setup_pause_on_rate_limit(exc)
+            return ch
         try:
-            edits: Dict[str, Any] = {}
-            if category and ch.category != category:
-                edits["category"] = category
-            if topic is not None and (ch.topic or "") != topic:
-                edits["topic"] = topic
-            if edits:
-                await ch.edit(**edits)
-                await setup_pause()
+            ch = await guild.create_text_channel(name, category=category, topic=topic or None)
+            await setup_pause()
+            return ch
         except Exception as exc:
             await _setup_pause_on_rate_limit(exc)
-        return ch
-    try:
-        ch = await guild.create_text_channel(name, category=category, topic=topic or None)
-        await setup_pause()
-        return ch
-    except Exception as exc:
-        await _setup_pause_on_rate_limit(exc)
-        raise
+            raise
 
 async def ensure_pinned(channel: discord.TextChannel, content: str):
     lines = content.splitlines()
@@ -4111,69 +4386,133 @@ async def ensure_admin_server_channels(source_guild: discord.Guild):
     admin = bot.get_guild(ADMIN_GUILD_ID)
     if not admin:
         return None, None
-    state = cfg().setdefault("admin_servers", {})
-    entry = state.setdefault(str(source_guild.id), {})
+    if source_guild.id == ADMIN_GUILD_ID:
+        state = cfg().setdefault("admin_servers", {})
+        if str(source_guild.id) in state:
+            state.pop(str(source_guild.id), None)
+            await STORE.mark_dirty()
+        return None, None
+    async with _setup_guild_lock(admin.id):
+        state = cfg().setdefault("admin_servers", {})
+        entry = state.setdefault(str(source_guild.id), {})
 
-    cat = admin.get_channel(entry.get("category_id")) if entry.get("category_id") else None
-    if not isinstance(cat, discord.CategoryChannel):
-        desired_name = admin_category_name(source_guild)
-        legacy = discord.utils.get(admin.categories, name=f"{source_guild.name} Admin")
-        cat = discord.utils.get(admin.categories, name=desired_name) or legacy
-        if legacy and legacy.name != desired_name:
-            try:
-                await legacy.edit(name=desired_name)
+        def _pick_oldest_category(categories: List[discord.CategoryChannel]) -> discord.CategoryChannel:
+            return sorted(categories, key=lambda c: c.id)[0]
+
+        def _pick_oldest_channel(channels: List[discord.TextChannel]) -> discord.TextChannel:
+            return sorted(channels, key=lambda c: c.id)[0]
+
+        cat = admin.get_channel(entry.get("category_id")) if entry.get("category_id") else None
+        if not isinstance(cat, discord.CategoryChannel):
+            desired_name = admin_category_name(source_guild)
+            legacy_name = f"{source_guild.name} Admin"
+            matches = [c for c in admin.categories if c.name == desired_name]
+            legacy_matches = [c for c in admin.categories if c.name == legacy_name]
+            if matches:
+                cat = _pick_oldest_category(matches)
+                if len(matches) > 1:
+                    await debug(f"Duplicate satellite categories found for {desired_name}: {len(matches)}")
+            elif legacy_matches:
+                cat = _pick_oldest_category(legacy_matches)
+                if len(legacy_matches) > 1:
+                    await debug(f"Duplicate legacy satellite categories found for {legacy_name}: {len(legacy_matches)}")
+            if cat and cat.name != desired_name:
+                try:
+                    await cat.edit(name=desired_name)
+                    await setup_pause()
+                except Exception:
+                    pass
+            if not cat:
+                try:
+                    fetched = await admin.fetch_channels()
+                    fetched_matches = [
+                        c for c in fetched
+                        if isinstance(c, discord.CategoryChannel) and c.name == desired_name
+                    ]
+                    if fetched_matches:
+                        cat = _pick_oldest_category(fetched_matches)
+                except Exception:
+                    pass
+            if not cat:
+                cat = await admin.create_category(desired_name)
                 await setup_pause()
-                cat = legacy
-            except Exception:
-                pass
-        if not cat:
-            cat = await admin.create_category(desired_name)
-            await setup_pause()
-        entry["category_id"] = cat.id
-    else:
-        desired = admin_category_name(source_guild)
-        if cat.name != desired:
-            try:
-                await cat.edit(name=desired)
-                await setup_pause()
-            except Exception:
-                pass
-
-    mirror_feed = admin.get_channel(entry.get("mirror_feed")) if entry.get("mirror_feed") else None
-    if not isinstance(mirror_feed, discord.TextChannel):
-        mirror_feed = discord.utils.get(cat.text_channels, name="mirror-feed")
-        if not mirror_feed:
-            mirror_feed = await admin.create_text_channel("mirror-feed", category=cat)
-            await setup_pause()
-        entry["mirror_feed"] = mirror_feed.id
-
-    info_ch = admin.get_channel(entry.get("server_info")) if entry.get("server_info") else None
-    if not isinstance(info_ch, discord.TextChannel):
-        legacy_id = entry.get("server_status")
-        info_ch = admin.get_channel(legacy_id) if legacy_id else None
-    if not isinstance(info_ch, discord.TextChannel):
-        info_ch = discord.utils.get(cat.text_channels, name="server-info")
-    if not isinstance(info_ch, discord.TextChannel):
-        legacy = discord.utils.get(cat.text_channels, name="server-status")
-        if legacy:
-            info_ch = legacy
-            try:
-                await info_ch.edit(name="server-info")
-            except Exception:
-                pass
+            entry["category_id"] = cat.id
         else:
+            desired = admin_category_name(source_guild)
+            if cat.name != desired:
+                try:
+                    await cat.edit(name=desired)
+                    await setup_pause()
+                except Exception:
+                    pass
+
+        mirror_feed = admin.get_channel(entry.get("mirror_feed")) if entry.get("mirror_feed") else None
+        if not isinstance(mirror_feed, discord.TextChannel):
+            mf_matches = [c for c in cat.text_channels if c.name == "mirror-feed"]
+            if mf_matches:
+                mirror_feed = _pick_oldest_channel(mf_matches)
+                if len(mf_matches) > 1:
+                    await debug(f"Duplicate mirror-feed channels in {cat.name}: {len(mf_matches)}")
+            else:
+                try:
+                    fetched = await admin.fetch_channels()
+                    fetched_matches = [
+                        c for c in fetched
+                        if isinstance(c, discord.TextChannel) and c.category_id == cat.id and c.name == "mirror-feed"
+                    ]
+                    if fetched_matches:
+                        mirror_feed = _pick_oldest_channel(fetched_matches)
+                except Exception:
+                    pass
+            if not mirror_feed:
+                mirror_feed = await admin.create_text_channel("mirror-feed", category=cat)
+                await setup_pause()
+            entry["mirror_feed"] = mirror_feed.id
+
+        info_ch = admin.get_channel(entry.get("server_info")) if entry.get("server_info") else None
+        if not isinstance(info_ch, discord.TextChannel):
+            legacy_id = entry.get("server_status")
+            info_ch = admin.get_channel(legacy_id) if legacy_id else None
+        if not isinstance(info_ch, discord.TextChannel):
+            info_matches = [c for c in cat.text_channels if c.name == "server-info"]
+            if info_matches:
+                info_ch = _pick_oldest_channel(info_matches)
+                if len(info_matches) > 1:
+                    await debug(f"Duplicate server-info channels in {cat.name}: {len(info_matches)}")
+            else:
+                legacy_matches = [c for c in cat.text_channels if c.name == "server-status"]
+                if legacy_matches:
+                    info_ch = _pick_oldest_channel(legacy_matches)
+                    if len(legacy_matches) > 1:
+                        await debug(f"Duplicate server-status channels in {cat.name}: {len(legacy_matches)}")
+                    try:
+                        await info_ch.edit(name="server-info")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        fetched = await admin.fetch_channels()
+                        fetched_matches = [
+                            c for c in fetched
+                            if isinstance(c, discord.TextChannel) and c.category_id == cat.id and c.name == "server-info"
+                        ]
+                        if fetched_matches:
+                            info_ch = _pick_oldest_channel(fetched_matches)
+                    except Exception:
+                        pass
+        if not isinstance(info_ch, discord.TextChannel):
             info_ch = await admin.create_text_channel("server-info", category=cat)
             await setup_pause()
 
-    if info_ch:
-        entry["server_info"] = info_ch.id
+        if info_ch:
+            entry["server_info"] = info_ch.id
 
-    await STORE.mark_dirty()
-    try:
-        await soc_apply_admin_server_permissions()
-    except Exception:
-        pass
-    return mirror_feed, info_ch
+        await STORE.mark_dirty()
+        try:
+            await soc_apply_admin_server_permissions()
+        except Exception:
+            pass
+        return mirror_feed, info_ch
 
 def find_category_by_name(guild: discord.Guild, name: str) -> Optional[discord.CategoryChannel]:
     return discord.utils.get(guild.categories, name=name)
@@ -4193,6 +4532,39 @@ def check_layout_missing(guild: discord.Guild) -> List[str]:
             if not ch:
                 missing.append(f"channel:{cat_name}/{ch_name}")
     return missing
+
+
+def _dedup_category_groups(guild: discord.Guild) -> Dict[str, List[discord.CategoryChannel]]:
+    groups: Dict[str, List[discord.CategoryChannel]] = {}
+    for cat in guild.categories:
+        groups.setdefault(cat.name, []).append(cat)
+    return {name: sorted(cats, key=lambda c: c.id) for name, cats in groups.items() if len(cats) > 1}
+
+
+def _dedup_channel_groups(guild: discord.Guild) -> Dict[Tuple[int, str], List[discord.TextChannel]]:
+    groups: Dict[Tuple[int, str], List[discord.TextChannel]] = {}
+    for ch in guild.text_channels:
+        key = (ch.category_id or 0, ch.name)
+        groups.setdefault(key, []).append(ch)
+    return {key: sorted(chs, key=lambda c: c.id) for key, chs in groups.items() if len(chs) > 1}
+
+
+def _dedup_channel_name(base: str, ch_id: int) -> str:
+    suffix = f"-dup-{str(ch_id)[-4:]}"
+    trimmed = base
+    max_len = 100
+    if len(trimmed) + len(suffix) > max_len:
+        trimmed = trimmed[: max(1, max_len - len(suffix))]
+    return trimmed + suffix
+
+
+def _dedup_category_name(base: str, cat_id: int) -> str:
+    suffix = f" [dup-{str(cat_id)[-4:]}]"
+    trimmed = base
+    max_len = 100
+    if len(trimmed) + len(suffix) > max_len:
+        trimmed = trimmed[: max(1, max_len - len(suffix))]
+    return trimmed + suffix
 
 async def setup_audit_report() -> List[str]:
     lines: List[str] = []
@@ -4894,6 +5266,27 @@ async def run_auto_setup_with_debrief(actor_id: int = 0):
     finally:
         if paused_state is not None:
             await _resume_background_tasks_after_setup(paused_state)
+        state.SETUP_ADAPTIVE_ACTIVE = prev_adaptive
+        state.SETUP_DELAY_OVERRIDE = prev_override
+
+async def run_backfill_only(actor_id: int = 0, force_backfill: bool = False):
+    await setup_log(f"Backfill-only requested by {actor_id}")
+    prev_adaptive = state.SETUP_ADAPTIVE_ACTIVE
+    prev_override = state.SETUP_DELAY_OVERRIDE
+    try:
+        state.SETUP_ADAPTIVE_ACTIVE = True
+        if state.SETUP_DELAY_OVERRIDE is None:
+            state.SETUP_DELAY_OVERRIDE = setup_delay_base()
+        await auto_setup_all_guilds(do_backfill=True, force_backfill=force_backfill, include_admin=False)
+        await backfill_chat_stats_all_guilds()
+        try:
+            await send_setup_debrief(trigger="backfill")
+        except Exception:
+            pass
+        await setup_log("Backfill-only completed")
+    except Exception as e:
+        await setup_log(f"Backfill-only failed: {e}")
+    finally:
         state.SETUP_ADAPTIVE_ACTIVE = prev_adaptive
         state.SETUP_DELAY_OVERRIDE = prev_override
 
@@ -5661,16 +6054,73 @@ async def bot_permissions_text(guild: discord.Guild) -> str:
         return "ok"
     return "missing: " + ", ".join(missing)
 
+def _server_info_invite_cache() -> Dict[str, Dict[str, Any]]:
+    cache = cfg().get("server_info_invites")
+    if not isinstance(cache, dict):
+        cfg()["server_info_invites"] = {}
+    return cfg().setdefault("server_info_invites", {})
+
+
+def _server_info_invite_cache_settings() -> Tuple[int, int]:
+    ttl = int(cfg().get("server_info_invite_ttl_seconds", 6 * 3600) or 6 * 3600)
+    cooldown = int(cfg().get("server_info_invite_cooldown_seconds", 15 * 60) or 15 * 60)
+    ttl = max(300, min(7 * 24 * 3600, ttl))
+    cooldown = max(60, min(2 * 3600, cooldown))
+    return ttl, cooldown
+
+
 async def ensure_permanent_invite(guild: discord.Guild) -> Optional[str]:
     if not guild.me or not guild.me.guild_permissions.create_instant_invite:
         return None
+
+    cache = _server_info_invite_cache()
+    ttl, cooldown = _server_info_invite_cache_settings()
+    now = now_ts()
+    gid = str(guild.id)
+    entry = cache.get(gid) if isinstance(cache.get(gid), dict) else {}
+    cached_url = str(entry.get("url") or "").strip() if isinstance(entry, dict) else ""
+    cached_ts = int(entry.get("ts", 0) or 0) if isinstance(entry, dict) else 0
+    cooldown_until = int(entry.get("cooldown_until", 0) or 0) if isinstance(entry, dict) else 0
+
+    if cached_url and (now - cached_ts) < ttl:
+        return cached_url
+    if cooldown_until and now < cooldown_until:
+        return cached_url or None
+
+    def _update_cache(url: Optional[str] = None, ts: Optional[int] = None, cooldown_until_val: Optional[int] = None, error: Optional[str] = None) -> None:
+        current = cache.get(gid)
+        if not isinstance(current, dict):
+            current = {}
+        if url is not None:
+            current["url"] = url
+        if ts is not None:
+            current["ts"] = ts
+        if cooldown_until_val is not None:
+            current["cooldown_until"] = cooldown_until_val
+        if error:
+            current["last_error"] = str(error)[:200]
+            current["last_error_ts"] = now
+        cache[gid] = current
+
+    rate_limited = False
     try:
         invites = await guild.invites()
         for inv in invites:
             if inv.max_age == 0 and inv.max_uses == 0:
+                _update_cache(url=inv.url, ts=now, cooldown_until_val=0, error=None)
+                await STORE.mark_dirty()
                 return inv.url
+    except discord.HTTPException as exc:
+        if getattr(exc, "status", None) == 429:
+            rate_limited = True
+            _update_cache(cooldown_until_val=now + cooldown, error="rate_limited")
+            await STORE.mark_dirty()
+            return cached_url or None
     except Exception:
         pass
+
+    if rate_limited:
+        return cached_url or None
 
     channel = guild.system_channel
     if not channel:
@@ -5678,12 +6128,22 @@ async def ensure_permanent_invite(guild: discord.Guild) -> Optional[str]:
             channel = ch
             break
     if not channel:
-        return None
+        return cached_url or None
     try:
         inv = await channel.create_invite(max_age=0, max_uses=0, unique=True, reason="Mandy server info")
-        return inv.url
+        url = str(getattr(inv, "url", None) or str(inv))
+        if url:
+            _update_cache(url=url, ts=now, cooldown_until_val=0, error=None)
+            await STORE.mark_dirty()
+        return url or None
+    except discord.HTTPException as exc:
+        if getattr(exc, "status", None) == 429:
+            _update_cache(cooldown_until_val=now + cooldown, error="rate_limited")
+            await STORE.mark_dirty()
+            return cached_url or None
+        return cached_url or None
     except Exception:
-        return None
+        return cached_url or None
 
 async def update_server_info_for_guild(source_guild: discord.Guild):
     _, info_ch = await ensure_admin_server_channels(source_guild)
@@ -7321,6 +7781,17 @@ class SetupMenuView(BaseView):
         await audit(interaction.user.id, "Auto setup start", {"guild_id": interaction.guild.id})
         spawn_task(run_auto_setup_with_debrief(actor_id=interaction.user.id), "setup")
 
+    @discord.ui.button(label="Backfill Only", style=discord.ButtonStyle.secondary)
+    async def backfill_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild or interaction.guild.id != ADMIN_GUILD_ID:
+            return await interaction.response.send_message("Admin server only.", ephemeral=True)
+        await interaction.response.send_message(
+            "Backfill-only starting (no layout reset). You'll get a DM when it's done.",
+            ephemeral=True
+        )
+        await audit(interaction.user.id, "Backfill only", {"guild_id": interaction.guild.id})
+        spawn_task(run_backfill_only(actor_id=interaction.user.id), "setup")
+
     @discord.ui.button(label="Setup Audit", style=discord.ButtonStyle.primary)
     async def audit_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.guild or interaction.guild.id != ADMIN_GUILD_ID:
@@ -8555,6 +9026,7 @@ async def prompt_setup_menu(ctx: commands.Context) -> None:
         "**Fullsync**: Destructive rebuild of the legacy admin layout (managed categories) + mirror sync.",
         "**Destructive**: Same as fullsync, plus AI/default choice prompt for the wipe.",
         "**Bio-Genesis**: Use `!setup_bio` for the Sentient Core rebuild + aggressive backfill.",
+        "**Backfill-only**: Use `!backfill` to ingest mirrors/stats without layout changes.",
         "Backfill: legacy setup backfills only if `database.json.auto.backfill` is enabled.",
         "DM bridges, stats, watchers are preserved. Use `!dmclose` to archive DM bridges.",
     ]
@@ -8625,6 +9097,120 @@ async def setup_bio(ctx: commands.Context):
     spawn_task(run_setup_bio(ctx.guild, actor_id=ctx.author.id), "setup")
     await audit(ctx.author.id, "Setup BIO run", {})
     await safe_ctx_send(ctx, "BIO-GENESIS started. You'll get a DM when it's done.", delete_after=10)
+
+@bot.command(name="backfill")
+async def backfill(ctx: commands.Context, mode: str = ""):
+    if not ctx.guild or ctx.guild.id != ADMIN_GUILD_ID:
+        await safe_delete(ctx.message)
+        return
+    if not await require_level_ctx(ctx, 70):
+        return
+    await safe_delete(ctx.message)
+    token = (mode or "").strip().lower()
+    force = token in ("force", "f", "true", "1", "yes", "y")
+    spawn_task(run_backfill_only(actor_id=ctx.author.id, force_backfill=force), "setup")
+    await audit(ctx.author.id, "Backfill only", {"force": force})
+    suffix = " (force)" if force else ""
+    await safe_ctx_send(ctx, f"Backfill-only started{suffix}. You'll get a DM when it's done.", delete_after=10)
+
+@bot.command(name="dedup", aliases=["dedupe", "dedupe_channels"])
+async def dedup(ctx: commands.Context, *args: str):
+    if not ctx.guild or ctx.guild.id != ADMIN_GUILD_ID:
+        await safe_delete(ctx.message)
+        return
+    if not await require_level_ctx(ctx, 70):
+        return
+    await safe_delete(ctx.message)
+    tokens = {str(t).lower() for t in args if t}
+    action = "list"
+    if "rename" in tokens:
+        action = "rename"
+    elif "delete" in tokens or "remove" in tokens:
+        action = "delete"
+    scope = "all"
+    if {"cats", "cat", "categories"} & tokens:
+        scope = "categories"
+    elif {"channels", "channel", "ch", "text"} & tokens:
+        scope = "channels"
+    confirm = bool({"confirm", "force", "yes", "y"} & tokens)
+    if action in ("rename", "delete") and not is_super(ctx.author.id):
+        return await ctx.send("SUPERUSER only.", delete_after=6)
+
+    async with _setup_guild_lock(ctx.guild.id):
+        cat_dups = _dedup_category_groups(ctx.guild) if scope in ("all", "categories") else {}
+        ch_dups = _dedup_channel_groups(ctx.guild) if scope in ("all", "channels") else {}
+
+        if action == "list":
+            lines: List[str] = []
+            if scope in ("all", "categories"):
+                if not cat_dups:
+                    lines.append("Category duplicates: none")
+                else:
+                    for name, cats in cat_dups.items():
+                        keep = cats[0].id
+                        lines.append(f"Category dup: {name} ({len(cats)}) keep={keep}")
+            if scope in ("all", "channels"):
+                if not ch_dups:
+                    lines.append("Channel duplicates: none")
+                else:
+                    for (cat_id, name), chans in ch_dups.items():
+                        cat_name = "UNCATEGORIZED"
+                        if cat_id:
+                            cat = ctx.guild.get_channel(cat_id)
+                            if isinstance(cat, discord.CategoryChannel):
+                                cat_name = cat.name
+                        keep = chans[0].id
+                        lines.append(f"Channel dup: #{name} in {cat_name} ({len(chans)}) keep={keep}")
+            for chunk in chunk_lines(lines, "**Dedup Report**", limit=1900):
+                await ctx.send(chunk, delete_after=20)
+            return
+
+        if action == "delete" and not confirm:
+            return await ctx.send("Add `confirm` to delete duplicates (e.g. `!dedup delete confirm`).", delete_after=8)
+
+        renamed = 0
+        deleted = 0
+        skipped = 0
+
+        if scope in ("all", "channels"):
+            for (cat_id, name), chans in ch_dups.items():
+                for ch in chans[1:]:
+                    try:
+                        if action == "rename":
+                            new_name = _dedup_channel_name(name, ch.id)
+                            if ch.name != new_name:
+                                await ch.edit(name=new_name)
+                                renamed += 1
+                                await setup_pause()
+                        else:
+                            await ch.delete()
+                            deleted += 1
+                            await setup_pause()
+                    except Exception:
+                        skipped += 1
+
+        if scope in ("all", "categories"):
+            for name, cats in cat_dups.items():
+                for cat in cats[1:]:
+                    try:
+                        if action == "rename":
+                            new_name = _dedup_category_name(name, cat.id)
+                            if cat.name != new_name:
+                                await cat.edit(name=new_name)
+                                renamed += 1
+                                await setup_pause()
+                        else:
+                            if cat.channels and not confirm:
+                                skipped += 1
+                                continue
+                            await cat.delete()
+                            deleted += 1
+                            await setup_pause()
+                    except Exception:
+                        skipped += 1
+
+        msg = f"Dedup {action} complete. renamed={renamed} deleted={deleted} skipped={skipped}"
+        await ctx.send(msg, delete_after=12)
 
 @bot.command()
 async def addtarget(ctx: commands.Context, user_id: int, count: int, *, text: str):

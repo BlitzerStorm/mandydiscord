@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Optional, Tuple
 
 from . import state
@@ -6,6 +7,17 @@ from .store import cfg
 
 
 def setup_delay_base() -> float:
+    env = os.getenv("MANDY_FAST_MODE") or os.getenv("FAST_MODE") or ""
+    if env:
+        val = env.strip().lower()
+        if val in ("1", "true", "yes", "y", "on"):
+            return 0.0
+    try:
+        tuning = cfg().get("tuning", {})
+        if isinstance(tuning, dict) and bool(tuning.get("fast_mode", False)):
+            return 0.0
+    except Exception:
+        pass
     try:
         return max(0.0, float(cfg().get("tuning", {}).get("setup_delay", 1.0)))
     except Exception:
