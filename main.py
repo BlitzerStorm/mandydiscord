@@ -7610,12 +7610,13 @@ class DmBridgeMenuView(BaseView):
             return await interaction.response.send_message("Select a user.", ephemeral=True)
         if not interaction.guild or interaction.guild.id != ADMIN_GUILD_ID:
             return await interaction.response.send_message("Run in admin server.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         ch_id = await ensure_dm_bridge_active(self.target, reason="manual")
         if not ch_id:
-            return await interaction.response.send_message("Failed to open bridge.", ephemeral=True)
+            return await interaction.followup.send("Failed to open bridge.", ephemeral=True)
         await audit(interaction.user.id, "DM bridge open", {"user_id": self.target, "channel_id": ch_id})
         ch = bot.get_channel(ch_id)
-        await interaction.response.send_message(f"Opened: {ch.mention if ch else ch_id}", ephemeral=True)
+        await interaction.followup.send(f"Opened: {ch.mention if ch else ch_id}", ephemeral=True)
 
     @discord.ui.button(label="Close Bridge", style=discord.ButtonStyle.danger)
     async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -10849,7 +10850,23 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 attach_mandy_context(
     bot,
     dm_ai_is_enabled=dm_ai_is_enabled,
-    dm_bridge_user_for_channel=dm_bridge_user_for_channel,
+    dm_bridge_user_for_channel_fn=dm_bridge_user_for_channel,
+    dm_bridge_get_fn=dm_bridge_get,
+    dm_bridge_close_fn=dm_bridge_close,
+    ensure_dm_bridge_active_fn=ensure_dm_bridge_active,
+    set_bot_status_fn=set_bot_status,
+    remove_watcher_fn=remove_watcher,
+    mirror_rules_dict_fn=mirror_rules_dict,
+    mirror_rule_save_fn=mirror_rule_save,
+    rule_summary_fn=rule_summary,
+    mirror_rule_disable_fn=mirror_rule_disable,
+    make_rule_id_fn=make_rule_id,
+    normalize_stats_window_fn=normalize_stats_window,
+    default_user_stats_fn=default_user_stats,
+    chat_stats_get_user_entry_fn=chat_stats_get_user_entry,
+    aggregate_global_stats_fn=aggregate_global_stats,
+    format_top_words_fn=format_top_words,
+    global_user_label_fn=global_user_label,
     mandy_power_mode_enabled=mandy_power_mode_enabled,
     effective_level=effective_level,
     require_level_ctx=require_level_ctx,

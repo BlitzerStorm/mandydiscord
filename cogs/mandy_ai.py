@@ -1216,7 +1216,10 @@ class MandyAI(commands.Cog):
             results = await self._execute_actions(user.id, actions, guild=guild, channel=channel)
             ok_count = sum(1 for r in results if "OK" in r)
             err_lines = [r for r in results if "ERROR" in r]
+            bridge_opened = sum(1 for r in results if "dm_bridge_opened" in r)
             summary = f"DMs opened/sent: {ok_count}/{len(results)}."
+            if bridge_opened:
+                summary += f"\nOpened {bridge_opened} DM bridge(s) because DMs were blocked."
             if err_lines:
                 summary += "\nErrors:\n" + "\n".join(err_lines[:5])
             await self._send_chunks(channel, summary)
@@ -1989,6 +1992,7 @@ class MandyAI(commands.Cog):
             "list_mirror_rules",
             "disable_mirror_rule",
             "close_dm_bridge",
+            "open_dm_bridge",
         }
         for action in actions:
             tool = action.get("tool")

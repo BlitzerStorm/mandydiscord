@@ -196,6 +196,19 @@ CAPABILITY_DEFS: Dict[str, Dict[str, Any]] = {
         "cost_tier": "cheap",
         "pass_actor": True,
     },
+    "open_dm_bridge": {
+        "description": "Open or repair a DM bridge for a user.",
+        "required": ["user_id"],
+        "optional": ["reason"],
+        "args": {
+            "user_id": {"type": "int", "min": 1},
+            "reason": {"type": "str", "min_len": 0, "max_len": 80},
+        },
+        "permissions": "GOD",
+        "side_effects": "state-changing",
+        "cost_tier": "cheap",
+        "pass_actor": True,
+    },
     "list_capabilities": {
         "description": "Summarize available tools, extensions, models, and queue status.",
         "required": [],

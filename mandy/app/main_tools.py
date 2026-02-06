@@ -1,18 +1,47 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import datetime
+import re
+from typing import Any, Dict, List, Optional, Set
 
 import discord
 from discord.ext import commands
 
 from mandy.capability_registry import CapabilityRegistry
+from mandy.resolver import parse_channel_id
 from mandy.tool_plugin_manager import ToolPluginManager
 
 from . import state
 from .config import GEMINI_API_KEY, AGENT_ROUTER_TOKEN, AGENT_ROUTER_BASE_URL
 from .core import request_elevation
+from .core_text import truncate
 from .logging import audit, debug, log_to
 from .store import STORE, ai_cfg, cfg
+
+
+def _missing_dep(name: str):
+    def _missing(*_args, **_kwargs):
+        raise ValueError(f"{name} not configured")
+    return _missing
+
+
+dm_bridge_get = _missing_dep("dm_bridge_get")
+dm_bridge_user_for_channel = _missing_dep("dm_bridge_user_for_channel")
+dm_bridge_close = _missing_dep("dm_bridge_close")
+ensure_dm_bridge_active = _missing_dep("ensure_dm_bridge_active")
+set_bot_status = _missing_dep("set_bot_status")
+remove_watcher = _missing_dep("remove_watcher")
+mirror_rules_dict = _missing_dep("mirror_rules_dict")
+mirror_rule_save = _missing_dep("mirror_rule_save")
+rule_summary = _missing_dep("rule_summary")
+mirror_rule_disable = _missing_dep("mirror_rule_disable")
+make_rule_id = _missing_dep("make_rule_id")
+normalize_stats_window = _missing_dep("normalize_stats_window")
+default_user_stats = _missing_dep("default_user_stats")
+chat_stats_get_user_entry = _missing_dep("chat_stats_get_user_entry")
+aggregate_global_stats = _missing_dep("aggregate_global_stats")
+format_top_words = _missing_dep("format_top_words")
+global_user_label = _missing_dep("global_user_label")
 
 
 class ToolRegistry:
@@ -108,6 +137,17 @@ class ToolRegistry:
             msg = await user.send(content)
             return {"message_id": msg.id}
         except discord.Forbidden as exc:
+            try:
+                ch_id = await ensure_dm_bridge_active(uid, reason="dm_failed")
+            except Exception:
+                ch_id = None
+            if ch_id:
+                return {"message_id": 0, "dm_bridge_channel_id": ch_id, "status": "dm_bridge_opened"}
+            await request_elevation(
+                "dm_bridge_open",
+                f"failed to open DM bridge for {uid}",
+                {"user_id": uid},
+            )
             raise ValueError("user blocked DMs") from exc
         except Exception as exc:
             raise ValueError(f"dm failed: {exc}") from exc
@@ -257,6 +297,21 @@ class ToolRegistry:
             await audit(actor_id, "DM bridge close", {"user_id": uid})
         return {"user_id": uid, "status": "closed"}
 
+    async def open_dm_bridge(self, user_id: int, reason: str = "manual", actor_id: int = 0):
+        uid = self._as_int(user_id, "user_id")
+        reason_text = self._as_text(reason or "manual", "reason", 80).strip() or "manual"
+        ch_id = await ensure_dm_bridge_active(uid, reason=reason_text)
+        if not ch_id:
+            await request_elevation(
+                "dm_bridge_open",
+                f"failed to open DM bridge for {uid}",
+                {"user_id": uid, "reason": reason_text},
+            )
+            raise ValueError("dm bridge open failed")
+        if actor_id:
+            await audit(actor_id, "DM bridge open", {"user_id": uid, "channel_id": ch_id, "reason": reason_text})
+        return {"user_id": uid, "channel_id": ch_id, "status": "open"}
+
     async def set_bot_status(self, state: str, text: str):
         st = self._as_text(state, "state", 16)
         msg = self._as_text(text, "text", 120)
@@ -271,7 +326,25 @@ class ToolRegistry:
             try:
                 ch = await self.bot.fetch_channel(ch_id)
             except Exception as exc:
-                raise ValueError("channel not found") from exc
+                uid = None
+                try:
+                    uid = await dm_bridge_user_for_channel(ch_id)
+                except Exception:
+                    uid = None
+                if uid:
+                    try:
+                        new_ch_id = await ensure_dm_bridge_active(int(uid), reason="auto_repair")
+                    except Exception:
+                        new_ch_id = None
+                    if new_ch_id:
+                        ch = self.bot.get_channel(new_ch_id)
+                        if not ch:
+                            try:
+                                ch = await self.bot.fetch_channel(new_ch_id)
+                            except Exception:
+                                ch = None
+                if not ch:
+                    raise ValueError("channel not found") from exc
         if isinstance(ch, discord.TextChannel):
             perms = ch.permissions_for(ch.guild.me)
             if not perms.view_channel or not perms.read_message_history:
@@ -471,11 +544,63 @@ def attach_mandy_context(
     bot: commands.Bot,
     *,
     dm_ai_is_enabled,
-    dm_bridge_user_for_channel,
+    dm_bridge_user_for_channel_fn,
+    dm_bridge_get_fn,
+    dm_bridge_close_fn,
+    ensure_dm_bridge_active_fn,
+    set_bot_status_fn,
+    remove_watcher_fn,
+    mirror_rules_dict_fn,
+    mirror_rule_save_fn,
+    rule_summary_fn,
+    mirror_rule_disable_fn,
+    make_rule_id_fn,
+    normalize_stats_window_fn,
+    default_user_stats_fn,
+    chat_stats_get_user_entry_fn,
+    aggregate_global_stats_fn,
+    format_top_words_fn,
+    global_user_label_fn,
     mandy_power_mode_enabled,
     effective_level,
     require_level_ctx,
 ):
+    global dm_bridge_get
+    global dm_bridge_user_for_channel
+    global dm_bridge_close
+    global ensure_dm_bridge_active
+    global set_bot_status
+    global remove_watcher
+    global mirror_rules_dict
+    global mirror_rule_save
+    global rule_summary
+    global mirror_rule_disable
+    global make_rule_id
+    global normalize_stats_window
+    global default_user_stats
+    global chat_stats_get_user_entry
+    global aggregate_global_stats
+    global format_top_words
+    global global_user_label
+
+    dm_bridge_get = dm_bridge_get_fn
+    dm_bridge_user_for_channel = dm_bridge_user_for_channel_fn
+    dm_bridge_close = dm_bridge_close_fn
+    ensure_dm_bridge_active = ensure_dm_bridge_active_fn
+    set_bot_status = set_bot_status_fn
+    remove_watcher = remove_watcher_fn
+    mirror_rules_dict = mirror_rules_dict_fn
+    mirror_rule_save = mirror_rule_save_fn
+    rule_summary = rule_summary_fn
+    mirror_rule_disable = mirror_rule_disable_fn
+    make_rule_id = make_rule_id_fn
+    normalize_stats_window = normalize_stats_window_fn
+    default_user_stats = default_user_stats_fn
+    chat_stats_get_user_entry = chat_stats_get_user_entry_fn
+    aggregate_global_stats = aggregate_global_stats_fn
+    format_top_words = format_top_words_fn
+    global_user_label = global_user_label_fn
+
     bot.mandy_tools = ToolRegistry(bot)
     bot.mandy_registry = CapabilityRegistry(bot.mandy_tools)
     bot.mandy_runtime = {"counters": {}, "last_actions": [], "last_rate_limit": None}
@@ -489,7 +614,7 @@ def attach_mandy_context(
     bot.mandy_audit = audit
     bot.mandy_log_to = log_to
     bot.mandy_dm_ai_is_enabled = dm_ai_is_enabled
-    bot.mandy_dm_bridge_user_for_channel = dm_bridge_user_for_channel
+    bot.mandy_dm_bridge_user_for_channel = dm_bridge_user_for_channel_fn
     bot.mandy_power_mode_enabled = mandy_power_mode_enabled
     bot.mandy_effective_level = effective_level
     bot.mandy_require_level_ctx = require_level_ctx
