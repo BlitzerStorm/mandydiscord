@@ -47,6 +47,80 @@ BOT_ACTION_COOLDOWN_SEC = 9
 BOT_REPLY_CONTINUE_WINDOW_SEC = 90
 USER_BURST_WINDOW_SEC = 35
 USER_REPLY_MIN_GAP_SEC = 12
+LONG_TERM_MEMORY_MAX_ROWS = 220
+LONG_TERM_RECENT_FLOOR = 50
+LONG_TERM_DECAY_PER_DAY = 0.03
+LONG_TERM_RELEVANCE_BONUS_PER_TERM = 0.08
+FACT_MEMORY_MAX_ROWS_PER_USER = 18
+FACT_MEMORY_RECENT_FLOOR = 5
+FACT_MEMORY_MIN_TEXT_LEN = 6
+
+MEMORY_STOPWORDS = {
+    "about",
+    "after",
+    "again",
+    "also",
+    "and",
+    "been",
+    "before",
+    "but",
+    "cant",
+    "did",
+    "does",
+    "dont",
+    "from",
+    "have",
+    "here",
+    "just",
+    "like",
+    "make",
+    "more",
+    "need",
+    "really",
+    "same",
+    "that",
+    "their",
+    "them",
+    "then",
+    "there",
+    "they",
+    "this",
+    "want",
+    "what",
+    "when",
+    "where",
+    "with",
+    "would",
+    "your",
+}
+
+EPHEMERAL_SELF_TERMS = {
+    "angry",
+    "annoyed",
+    "bored",
+    "fine",
+    "good",
+    "hungry",
+    "mad",
+    "ok",
+    "okay",
+    "sad",
+    "sleepy",
+    "stressed",
+    "tired",
+    "upset",
+}
+
+NON_STABLE_SELF_PREFIXES = {
+    "about",
+    "being",
+    "doing",
+    "feeling",
+    "getting",
+    "gonna",
+    "going",
+    "trying",
+}
 
 
 @dataclass
@@ -117,6 +191,24 @@ class AIService:
         row = warmup.get(str(guild_id))
         return row if isinstance(row, dict) else None
 
+    def memory_stats(self, guild_id: int) -> dict[str, int]:
+        root = self._ai_root()
+        long_rows = root.setdefault("long_term_memory", {}).get(str(guild_id), [])
+        facts_root = root.setdefault("memory_facts", {})
+        guild_facts = facts_root.get(str(guild_id), {})
+        fact_users = 0
+        fact_rows = 0
+        if isinstance(guild_facts, dict):
+            for rows in guild_facts.values():
+                if isinstance(rows, list) and rows:
+                    fact_users += 1
+                    fact_rows += len(rows)
+        return {
+            "long_term_rows": len(long_rows) if isinstance(long_rows, list) else 0,
+            "fact_users": fact_users,
+            "fact_rows": fact_rows,
+        }
+
     async def warmup_guild(self, guild: discord.Guild) -> dict[str, int]:
         scanned_channels = 0
         scanned_messages = 0
@@ -172,6 +264,7 @@ class AIService:
         )
         self._update_turn_state(message.channel.id, message.author.id, now)
         self._update_profile(message, touch=touch)
+        self._remember_user_facts(message, touch=touch)
 
     def should_chat(self, message: discord.Message, bot_user_id: int) -> bool:
         return self._mentions_mandy(message, bot_user_id)
@@ -311,7 +404,8 @@ class AIService:
         burst_lines: list[str] | None = None,
     ) -> str:
         recent = self.recent_context(message.channel.id, limit=6)
-        memory = self._long_term_recent(message.guild.id if message.guild else 0, limit=4)
+        memory = self._long_term_relevant(message, limit=5)
+        facts = self._user_fact_lines(message.guild.id if message.guild else 0, message.author.id, limit=4)
         profile = self._profile_summary(message.guild.id if message.guild else 0, message.author.id)
         burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
         image_urls = self._extract_image_urls(message, max_images=2)
@@ -324,6 +418,7 @@ class AIService:
             f"Still talking: {still_talking}\n"
             f"User: {message.author.display_name} ({message.author.id})\n"
             f"User profile: {profile}\n"
+            f"Pinned user facts:\n{self._format_lines(facts)}\n"
             f"Message: {message.clean_content[:500]}\n"
             f"Recent same-user burst:\n{self._format_lines(burst)}\n"
             f"Recent channel context:\n{self._format_lines(recent)}\n"
@@ -350,6 +445,8 @@ class AIService:
 
     async def generate_roast_reply(self, message: discord.Message) -> str:
         recent = self.recent_context(message.channel.id, limit=5)
+        memory = self._long_term_relevant(message, limit=3)
+        facts = self._user_fact_lines(message.guild.id if message.guild else 0, message.author.id, limit=2)
         profile = self._profile_summary(message.guild.id if message.guild else 0, message.author.id)
         prompt = (
             "You are Mandy. Reply with a short reverse-psychology roast. "
@@ -358,8 +455,10 @@ class AIService:
         user_prompt = (
             f"Target user: {message.author.display_name} ({message.author.id})\n"
             f"User profile: {profile}\n"
+            f"Pinned facts:\n{self._format_lines(facts)}\n"
             f"Offending line: {message.clean_content[:500]}\n"
-            f"Recent context:\n{self._format_lines(recent)}"
+            f"Recent context:\n{self._format_lines(recent)}\n"
+            f"Relevant memory:\n{self._format_lines(memory)}"
         )
         generated = await self._try_completion(prompt, user_prompt, max_tokens=140)
         if not generated:
@@ -565,16 +664,20 @@ class AIService:
         root = self._ai_root()
         memories = root.setdefault("long_term_memory", {})
         rows = memories.setdefault(str(message.guild.id), [])
+        user_text = message.clean_content[:280]
+        score = self._score_exchange_memory(user_text, bot_reply)
+        tags = self._exchange_tags(user_text)
         rows.append(
             {
                 "ts": datetime.now(tz=timezone.utc).isoformat(),
                 "user_id": message.author.id,
-                "user_text": message.clean_content[:280],
+                "user_text": user_text,
                 "bot_text": bot_reply[:280],
+                "score": score,
+                "tags": tags,
             }
         )
-        if len(rows) > 200:
-            del rows[: len(rows) - 200]
+        self._prune_long_term_rows(rows)
         self.store.touch()
 
     def _long_term_recent(self, guild_id: int, limit: int = 3) -> list[str]:
@@ -584,6 +687,51 @@ class AIService:
         last = rows[-max(1, limit) :]
         out: list[str] = []
         for row in last:
+            user_text = str(row.get("user_text", "")).strip()
+            bot_text = str(row.get("bot_text", "")).strip()
+            if user_text or bot_text:
+                out.append(f"user: {user_text} | mandy: {bot_text}")
+        return out
+
+    def _long_term_relevant(self, message: discord.Message, limit: int = 4) -> list[str]:
+        if not message.guild:
+            return []
+        rows = self._ai_root().setdefault("long_term_memory", {}).get(str(message.guild.id), [])
+        if not isinstance(rows, list) or not rows:
+            return []
+
+        query_terms = self._memory_terms(message.clean_content)
+        now = time.time()
+        scored: list[tuple[float, float, dict[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            user_text = str(row.get("user_text", "")).strip()
+            bot_text = str(row.get("bot_text", "")).strip()
+            if not user_text and not bot_text:
+                continue
+            base = float(row.get("score", 0.35) or 0.35)
+            ts = self._parse_ts(row.get("ts"))
+            age_days = max(0.0, (now - ts) / 86400.0) if ts > 0 else 999.0
+            freshness = max(0.0, 0.35 - (age_days * LONG_TERM_DECAY_PER_DAY))
+
+            relevance = 0.0
+            row_terms = self._memory_terms(f"{user_text} {bot_text}")
+            overlap = len(query_terms.intersection(row_terms))
+            if overlap:
+                relevance += min(0.5, overlap * LONG_TERM_RELEVANCE_BONUS_PER_TERM)
+            if int(row.get("user_id", 0) or 0) == message.author.id:
+                relevance += 0.3
+
+            scored.append((base + freshness + relevance, ts, row))
+
+        if not scored:
+            return []
+
+        chosen = sorted(scored, key=lambda item: (item[0], item[1]), reverse=True)[: max(1, limit)]
+        chosen.sort(key=lambda item: item[1])
+        out: list[str] = []
+        for _score, _ts, row in chosen:
             user_text = str(row.get("user_text", "")).strip()
             bot_text = str(row.get("bot_text", "")).strip()
             if user_text or bot_text:
@@ -661,6 +809,270 @@ class AIService:
         row["samples"] = samples
         if touch:
             self.store.touch()
+
+    def _remember_user_facts(self, message: discord.Message, *, touch: bool) -> None:
+        if not message.guild:
+            return
+        text = " ".join(message.clean_content.split())
+        if len(text) < FACT_MEMORY_MIN_TEXT_LEN:
+            return
+        candidates = self._extract_fact_candidates(text)
+        if not candidates:
+            return
+
+        root = self._ai_root()
+        memory_facts = root.setdefault("memory_facts", {})
+        guild_rows = memory_facts.setdefault(str(message.guild.id), {})
+        user_key = str(message.author.id)
+        rows = guild_rows.get(user_key)
+        if not isinstance(rows, list):
+            rows = []
+            guild_rows[user_key] = rows
+
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        changed = False
+        for fact_text, boost, kind in candidates:
+            norm = self._normalize_memory_text(fact_text)
+            if not norm:
+                continue
+            existing = next((row for row in rows if str(row.get("norm", "")) == norm), None)
+            if existing:
+                previous = float(existing.get("score", 0.4) or 0.4)
+                existing["score"] = round(min(2.5, previous + (boost * 0.35)), 3)
+                existing["mentions"] = int(existing.get("mentions", 1) or 1) + 1
+                existing["ts"] = now_iso
+                existing["fact"] = fact_text[:140]
+                existing["kind"] = kind
+            else:
+                rows.append(
+                    {
+                        "fact": fact_text[:140],
+                        "norm": norm,
+                        "kind": kind,
+                        "score": round(max(0.1, boost), 3),
+                        "mentions": 1,
+                        "ts": now_iso,
+                    }
+                )
+            changed = True
+
+        if not changed:
+            return
+
+        self._prune_user_fact_rows(rows)
+        if touch:
+            self.store.touch()
+
+    def _extract_fact_candidates(self, text: str) -> list[tuple[str, float, str]]:
+        clean = " ".join(text.split())
+        lowered = clean.lower()
+        if len(clean) < FACT_MEMORY_MIN_TEXT_LEN:
+            return []
+        if "http://" in lowered or "https://" in lowered:
+            return []
+
+        out: list[tuple[str, float, str]] = []
+
+        def add_fact(kind: str, value: str, boost: float) -> None:
+            body = value.strip(" .,!?:;")
+            body = " ".join(body.split())
+            if len(body) < 2:
+                return
+            if len(body) > 110:
+                body = body[:110].rstrip()
+            out.append((body, boost, kind))
+
+        match = re.search(r"\bmy name is ([a-z0-9][a-z0-9 _'\-]{1,31})\b", clean, re.IGNORECASE)
+        if match:
+            add_fact("identity", f"name: {match.group(1)}", 1.25)
+
+        match = re.search(r"\bcall me ([a-z0-9][a-z0-9 _'\-]{1,31})\b", clean, re.IGNORECASE)
+        if match:
+            add_fact("identity", f"preferred name: {match.group(1)}", 1.1)
+
+        for fav in re.finditer(r"\bmy favorite ([a-z][a-z0-9 \-]{1,20}) is ([^.!?\n]{2,60})", clean, re.IGNORECASE):
+            add_fact("preference", f"favorite {fav.group(1)}: {fav.group(2)}", 1.05)
+
+        match = re.search(r"\bi (?:really )?(?:like|love|enjoy|prefer)\s+([^.!?\n]{2,80})", clean, re.IGNORECASE)
+        if match:
+            add_fact("preference", f"likes: {match.group(1)}", 0.9)
+
+        match = re.search(r"\bi (?:really )?(?:hate|dislike)\s+([^.!?\n]{2,80})", clean, re.IGNORECASE)
+        if match:
+            add_fact("preference", f"dislikes: {match.group(1)}", 0.85)
+
+        match = re.search(r"\bi work (?:at|as)\s+([^.!?\n]{2,60})", clean, re.IGNORECASE)
+        if match:
+            add_fact("background", f"work: {match.group(1)}", 0.95)
+
+        match = re.search(r"\bi live in\s+([^.!?\n]{2,60})", clean, re.IGNORECASE)
+        if match:
+            add_fact("background", f"location: {match.group(1)}", 0.9)
+
+        match = re.search(r"\bmy timezone is\s+([a-z0-9_/\-+:]{2,40})", clean, re.IGNORECASE)
+        if match:
+            add_fact("background", f"timezone: {match.group(1)}", 1.0)
+
+        match = re.search(r"\bi(?: am|'m)\s+([a-z][a-z0-9 \-]{1,40})", clean, re.IGNORECASE)
+        if match:
+            raw_trait = " ".join(match.group(1).split())
+            trait_tokens = [token for token in re.findall(r"[a-z]+", raw_trait.lower())]
+            if trait_tokens and trait_tokens[0] in NON_STABLE_SELF_PREFIXES:
+                trait_tokens = []
+            if trait_tokens and all(token in EPHEMERAL_SELF_TERMS for token in trait_tokens):
+                trait_tokens = []
+            if trait_tokens:
+                if len(trait_tokens) <= 4:
+                    add_fact("self", f"self: {raw_trait}", 0.72)
+
+        deduped: dict[str, tuple[str, float, str]] = {}
+        for fact, boost, kind in out:
+            key = self._normalize_memory_text(fact)
+            if not key:
+                continue
+            prev = deduped.get(key)
+            if prev is None or boost > prev[1]:
+                deduped[key] = (fact, boost, kind)
+        return list(deduped.values())
+
+    def _user_fact_lines(self, guild_id: int, user_id: int, limit: int = 3) -> list[str]:
+        if guild_id <= 0:
+            return []
+        memory_facts = self._ai_root().setdefault("memory_facts", {})
+        guild_rows = memory_facts.get(str(guild_id), {})
+        if not isinstance(guild_rows, dict):
+            return []
+        rows = guild_rows.get(str(user_id), [])
+        if not isinstance(rows, list) or not rows:
+            return []
+        now = time.time()
+        scored: list[tuple[float, str]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            fact = str(row.get("fact", "")).strip()
+            if not fact:
+                continue
+            strength = self._fact_row_strength(row, now)
+            scored.append((strength, fact))
+        if not scored:
+            return []
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [fact for _strength, fact in scored[: max(1, limit)]]
+
+    def _prune_user_fact_rows(self, rows: list[dict[str, Any]]) -> None:
+        if len(rows) <= FACT_MEMORY_MAX_ROWS_PER_USER:
+            return
+        rows.sort(key=lambda row: self._parse_ts(row.get("ts")))
+        recent = rows[-FACT_MEMORY_RECENT_FLOOR:]
+        older = rows[:-FACT_MEMORY_RECENT_FLOOR]
+        slots = max(0, FACT_MEMORY_MAX_ROWS_PER_USER - len(recent))
+        if slots > 0 and older:
+            now = time.time()
+            older = sorted(older, key=lambda row: self._fact_row_strength(row, now), reverse=True)[:slots]
+        rows[:] = sorted(recent + older, key=lambda row: self._parse_ts(row.get("ts")))
+
+    def _fact_row_strength(self, row: dict[str, Any], now: float) -> float:
+        base = float(row.get("score", 0.5) or 0.5)
+        mentions = max(1, int(row.get("mentions", 1) or 1))
+        mention_bonus = min(0.35, 0.05 * mentions)
+        ts = self._parse_ts(row.get("ts"))
+        age_days = max(0.0, (now - ts) / 86400.0) if ts > 0 else 3650.0
+        decay = age_days * 0.025
+        return base + mention_bonus - decay
+
+    def _score_exchange_memory(self, user_text: str, bot_text: str) -> float:
+        clean_user = " ".join(user_text.split())
+        score = 0.2
+        size = len(clean_user)
+        if 20 <= size <= 220:
+            score += 0.18
+        elif size > 220:
+            score += 0.08
+        if "?" in clean_user:
+            score += 0.16
+        if self._is_direct_request(clean_user):
+            score += 0.22
+        if self._alias_regex.search(clean_user):
+            score += 0.08
+        if self._negative_regex.search(clean_user):
+            score += 0.06
+        if any(char.isdigit() for char in clean_user):
+            score += 0.06
+        if any(token in clean_user.lower() for token in ("remember", "always", "never", "favorite", "call me", "my name")):
+            score += 0.2
+        if len(bot_text.strip()) > 90:
+            score += 0.05
+        return round(max(0.1, min(2.5, score)), 3)
+
+    def _exchange_tags(self, user_text: str) -> list[str]:
+        text = user_text.lower()
+        tags: list[str] = []
+        if "?" in text:
+            tags.append("question")
+        if self._is_direct_request(user_text):
+            tags.append("request")
+        if self._negative_regex.search(user_text):
+            tags.append("conflict")
+        if self._extract_fact_candidates(user_text):
+            tags.append("fact")
+        if len(user_text.strip()) > 180:
+            tags.append("long-form")
+        if self._alias_regex.search(user_text):
+            tags.append("mention")
+        return tags[:6]
+
+    def _prune_long_term_rows(self, rows: list[dict[str, Any]]) -> None:
+        if len(rows) <= LONG_TERM_MEMORY_MAX_ROWS:
+            return
+        rows.sort(key=lambda row: self._parse_ts(row.get("ts")))
+        recent = rows[-LONG_TERM_RECENT_FLOOR:]
+        older = rows[:-LONG_TERM_RECENT_FLOOR]
+        slots = max(0, LONG_TERM_MEMORY_MAX_ROWS - len(recent))
+        if slots > 0 and older:
+            now = time.time()
+            older = sorted(older, key=lambda row: self._long_term_row_strength(row, now), reverse=True)[:slots]
+        rows[:] = sorted(recent + older, key=lambda row: self._parse_ts(row.get("ts")))
+
+    def _long_term_row_strength(self, row: dict[str, Any], now: float) -> float:
+        base = float(row.get("score", 0.35) or 0.35)
+        tags = row.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+        bonus = 0.0
+        if "fact" in tags:
+            bonus += 0.16
+        if "request" in tags:
+            bonus += 0.07
+        if "question" in tags:
+            bonus += 0.04
+        if "long-form" in tags:
+            bonus += 0.03
+        ts = self._parse_ts(row.get("ts"))
+        age_days = max(0.0, (now - ts) / 86400.0) if ts > 0 else 3650.0
+        decay = age_days * LONG_TERM_DECAY_PER_DAY
+        return base + bonus - decay
+
+    def _normalize_memory_text(self, text: str) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+
+    def _memory_terms(self, text: str) -> set[str]:
+        tokens = re.findall(r"[a-z0-9]{3,}", text.lower())
+        return {token for token in tokens if token not in MEMORY_STOPWORDS}
+
+    def _parse_ts(self, value: Any) -> float:
+        if not value:
+            return 0.0
+        raw = str(value).strip()
+        if not raw:
+            return 0.0
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            return 0.0
 
     def _update_turn_state(self, channel_id: int, user_id: int, now: float) -> None:
         prev = self._last_turn_by_channel.get(channel_id)
@@ -799,5 +1211,6 @@ class AIService:
         root.setdefault("auto_model", "")
         root.setdefault("auto_vision_model", "")
         root.setdefault("profiles", {})
+        root.setdefault("memory_facts", {})
         root.setdefault("warmup", {})
         return root

@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import discord
@@ -22,6 +23,29 @@ from mandy_v1.storage import MessagePackStore
 from mandy_v1.ui.global_menu import GlobalMenuView
 from mandy_v1.ui.mirror_actions import MirrorActionContext, MirrorActionView
 from mandy_v1.ui.satellite_debug import PermissionRequestApprovalView, PermissionRequestPromptView, SatelliteDebugView
+
+
+HOUSEKEEPING_INTERVAL_SEC = 15 * 60
+HOUSEKEEPING_SCAN_LIMIT = 1600
+HOUSEKEEPING_ADMIN_POLICIES: dict[str, tuple[int, int]] = {
+    "debug-log": (260, 14),
+    "system-log": (260, 14),
+    "audit-log": (260, 21),
+    "mirror-log": (260, 14),
+    "diagnostics": (120, 10),
+    "menu": (80, 30),
+}
+HOUSEKEEPING_SATELLITE_DEBUG_POLICY = (180, 14)
+HOUSEKEEPING_SATELLITE_MIRROR_POLICY = (420, 21)
+
+
+@dataclass(frozen=True)
+class ChannelCleanupTarget:
+    channel: discord.TextChannel
+    keep_messages: int
+    max_age_days: int
+    bot_only: bool = False
+    keep_message_ids: tuple[int, ...] = ()
 
 
 class OnboardingSelect(discord.ui.Select):
@@ -76,6 +100,7 @@ class MandyBot(commands.Bot):
         self.started_at = datetime.now(tz=timezone.utc)
         self._autosave_task: asyncio.Task | None = None
         self._ai_warmup_task: asyncio.Task | None = None
+        self._housekeeping_task: asyncio.Task | None = None
         self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._typing_rng = random.Random()
         self._ready_once = False
@@ -98,12 +123,14 @@ class MandyBot(commands.Bot):
         @self._tier_check(50)
         async def health(ctx: commands.Context) -> None:
             uptime = datetime.now(tz=timezone.utc) - self.started_at
+            housekeeping_active = bool(self._housekeeping_task and not self._housekeeping_task.done())
             payload = (
                 f"Uptime: `{uptime}`\n"
                 f"Guilds: `{len(self.guilds)}`\n"
                 f"Watchers: `{len(self.store.data['watchers'])}`\n"
                 f"Mirror servers: `{len(self.store.data['mirrors']['servers'])}`\n"
-                f"DM bridges: `{len(self.store.data['dm_bridges'])}`"
+                f"DM bridges: `{len(self.store.data['dm_bridges'])}`\n"
+                f"Housekeeping active: `{housekeeping_active}`"
             )
             await ctx.send(payload)
 
@@ -211,6 +238,18 @@ class MandyBot(commands.Bot):
             await self._ensure_satellite_debug_panel(ctx.guild, force_invite_refresh=True)
             await ctx.send("Satellite debug panel refreshed.")
 
+        @self.command(name="housekeep")
+        @self._tier_check(70)
+        async def housekeep(ctx: commands.Context) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or ctx.guild.id != self.settings.admin_guild_id:
+                await ctx.send("Run this in the Admin Hub.")
+                return
+            summary = await self._run_housekeeping_once()
+            await ctx.send(
+                "Housekeeping complete. "
+                f"channels=`{summary['channels']}` scanned=`{summary['scanned']}` deleted=`{summary['deleted']}`"
+            )
+
         @self.command(name="setguestpass")
         @self._tier_check(90)
         async def setguestpass(ctx: commands.Context, *, password: str) -> None:
@@ -289,7 +328,7 @@ class MandyBot(commands.Bot):
         embed.add_field(
             name="Core Commands",
             value=(
-                "`!health` `!setup` `!menupanel` `!debugpanel`\n"
+                "`!health` `!setup` `!menupanel` `!debugpanel` `!housekeep`\n"
                 "`!watchers` `!watchers add/remove/reset`\n"
                 "`!onboarding` `!syncaccess` `!socset`\n"
                 "`!setguestpass` `!guestpass`"
@@ -332,6 +371,193 @@ class MandyBot(commands.Bot):
         state["global_menu_message_id"] = posted.id
         self.store.touch()
 
+    async def _run_housekeeping_loop(self) -> None:
+        await asyncio.sleep(20)
+        while True:
+            try:
+                summary = await self._run_housekeeping_once()
+                if summary["deleted"] > 0:
+                    self.logger.log(
+                        "housekeeping.trimmed",
+                        channels=summary["channels"],
+                        scanned=summary["scanned"],
+                        deleted=summary["deleted"],
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("housekeeping.failed", error=str(exc)[:300])
+            await asyncio.sleep(HOUSEKEEPING_INTERVAL_SEC)
+
+    async def _run_housekeeping_once(self) -> dict[str, int]:
+        targets = self._housekeeping_targets()
+        total_deleted = 0
+        total_scanned = 0
+        touched = 0
+        for target in targets:
+            scanned, deleted = await self._trim_channel(target)
+            if scanned <= 0:
+                continue
+            touched += 1
+            total_scanned += scanned
+            total_deleted += deleted
+        return {"channels": touched, "scanned": total_scanned, "deleted": total_deleted}
+
+    def _housekeeping_targets(self) -> list[ChannelCleanupTarget]:
+        targets: list[ChannelCleanupTarget] = []
+        seen_ids: set[int] = set()
+
+        admin_guild = self.get_guild(self.settings.admin_guild_id)
+        if admin_guild:
+            ui_state = self._ui_state()
+            menu_message_id = int(ui_state.get("global_menu_message_id", 0) or 0)
+            for channel_name, policy in HOUSEKEEPING_ADMIN_POLICIES.items():
+                channel = discord.utils.get(admin_guild.text_channels, name=channel_name)
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                keep_ids: tuple[int, ...] = ()
+                if channel_name == "menu" and menu_message_id > 0:
+                    keep_ids = (menu_message_id,)
+                self._add_cleanup_target(
+                    targets,
+                    seen_ids,
+                    ChannelCleanupTarget(
+                        channel=channel,
+                        keep_messages=policy[0],
+                        max_age_days=policy[1],
+                        keep_message_ids=keep_ids,
+                    ),
+                )
+
+        for guild_id, server_cfg in self.store.data.get("mirrors", {}).get("servers", {}).items():
+            if not isinstance(server_cfg, dict):
+                continue
+            try:
+                satellite_id = int(guild_id)
+            except (TypeError, ValueError):
+                continue
+            if satellite_id == self.settings.admin_guild_id:
+                continue
+
+            debug_channel = self.get_channel(int(server_cfg.get("debug_channel_id", 0) or 0))
+            if isinstance(debug_channel, discord.TextChannel):
+                dashboard_id = int(server_cfg.get("debug_dashboard_message_id", 0) or 0)
+                keep_ids = (dashboard_id,) if dashboard_id > 0 else ()
+                self._add_cleanup_target(
+                    targets,
+                    seen_ids,
+                    ChannelCleanupTarget(
+                        channel=debug_channel,
+                        keep_messages=HOUSEKEEPING_SATELLITE_DEBUG_POLICY[0],
+                        max_age_days=HOUSEKEEPING_SATELLITE_DEBUG_POLICY[1],
+                        keep_message_ids=keep_ids,
+                    ),
+                )
+
+            mirror_feed = self.get_channel(int(server_cfg.get("mirror_feed_id", 0) or 0))
+            if isinstance(mirror_feed, discord.TextChannel):
+                self._add_cleanup_target(
+                    targets,
+                    seen_ids,
+                    ChannelCleanupTarget(
+                        channel=mirror_feed,
+                        keep_messages=HOUSEKEEPING_SATELLITE_MIRROR_POLICY[0],
+                        max_age_days=HOUSEKEEPING_SATELLITE_MIRROR_POLICY[1],
+                    ),
+                )
+
+        return targets
+
+    def _add_cleanup_target(
+        self,
+        targets: list[ChannelCleanupTarget],
+        seen_ids: set[int],
+        target: ChannelCleanupTarget,
+    ) -> None:
+        channel_id = int(target.channel.id)
+        if channel_id in seen_ids:
+            return
+        seen_ids.add(channel_id)
+        targets.append(target)
+
+    async def _trim_channel(self, target: ChannelCleanupTarget) -> tuple[int, int]:
+        bot_id = self.user.id if self.user else 0
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max(0, target.max_age_days))
+        keep_ids = {mid for mid in target.keep_message_ids if mid > 0}
+        scan_limit = min(HOUSEKEEPING_SCAN_LIMIT, max(250, target.keep_messages + 1000))
+
+        try:
+            history = [msg async for msg in target.channel.history(limit=scan_limit, oldest_first=False)]
+        except discord.HTTPException:
+            return 0, 0
+        if not history:
+            return 0, 0
+
+        kept_recent = 0
+        to_delete: list[discord.Message] = []
+        for msg in history:
+            if msg.id in keep_ids or msg.pinned:
+                continue
+            if target.bot_only and (not bot_id or msg.author.id != bot_id):
+                continue
+            created_at = msg.created_at if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
+            is_old = created_at < cutoff
+            if kept_recent < max(0, target.keep_messages) and not is_old:
+                kept_recent += 1
+                continue
+            to_delete.append(msg)
+
+        if not to_delete:
+            return len(history), 0
+
+        two_weeks_ago = datetime.now(tz=timezone.utc) - timedelta(days=14)
+        deleted = 0
+        bulk_batch: list[discord.Message] = []
+        for msg in to_delete:
+            created_at = msg.created_at if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
+            if created_at > two_weeks_ago:
+                bulk_batch.append(msg)
+                if len(bulk_batch) >= 100:
+                    deleted += await self._delete_bulk_batch(target.channel, bulk_batch)
+                    bulk_batch = []
+                continue
+            try:
+                await msg.delete()
+                deleted += 1
+            except discord.HTTPException:
+                continue
+            except discord.Forbidden:
+                break
+        if bulk_batch:
+            deleted += await self._delete_bulk_batch(target.channel, bulk_batch)
+        return len(history), deleted
+
+    async def _delete_bulk_batch(self, channel: discord.TextChannel, batch: list[discord.Message]) -> int:
+        if not batch:
+            return 0
+        if len(batch) == 1:
+            try:
+                await batch[0].delete()
+                return 1
+            except discord.HTTPException:
+                return 0
+            except discord.Forbidden:
+                return 0
+        try:
+            await channel.delete_messages(batch)
+            return len(batch)
+        except discord.HTTPException:
+            deleted = 0
+            for msg in batch:
+                try:
+                    await msg.delete()
+                    deleted += 1
+                except discord.HTTPException:
+                    continue
+                except discord.Forbidden:
+                    break
+            return deleted
+        except discord.Forbidden:
+            return 0
+
     async def global_menu_list_satellites(self) -> str:
         rows: list[str] = []
         for guild_id in sorted(self.store.data["mirrors"]["servers"].keys(), key=lambda x: int(x)):
@@ -351,12 +577,14 @@ class MandyBot(commands.Bot):
         api_status = "none"
         if isinstance(last_api, dict) and last_api:
             api_status = "ok" if bool(last_api.get("ok")) else "fail"
+        housekeeping_active = bool(self._housekeeping_task and not self._housekeeping_task.done())
         payload = (
             f"Uptime: `{uptime}`\n"
             f"Guilds: `{len(self.guilds)}`\n"
             f"Satellites: `{len(self.store.data['mirrors']['servers'])}`\n"
             f"Watchers: `{len(self.store.data['watchers'])}`\n"
             f"Logs buffered: `{len(self.store.data['logs'])}`\n"
+            f"Housekeeping active: `{housekeeping_active}`\n"
             f"AI last API test: `{api_status}`"
         )
         return payload
@@ -437,6 +665,8 @@ class MandyBot(commands.Bot):
                 self.logger.log("mirror.ensure_failed", guild_id=guild.id)
         if self._ai_warmup_task is None or self._ai_warmup_task.done():
             self._ai_warmup_task = asyncio.create_task(self._run_ai_startup_scan(), name="ai-startup-scan")
+        if self._housekeeping_task is None or self._housekeeping_task.done():
+            self._housekeeping_task = asyncio.create_task(self._run_housekeeping_loop(), name="channel-housekeeping")
         print(f"Connected as {self.user} ({self.user.id if self.user else '?'})")
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -782,6 +1012,7 @@ class MandyBot(commands.Bot):
 
         chat_enabled = self.ai.is_chat_enabled(satellite_guild.id)
         roast_enabled = self.ai.is_roast_enabled(satellite_guild.id)
+        memory_stats = self.ai.memory_stats(satellite_guild.id)
         warmup = self.ai.warmup_status(satellite_guild.id) or {}
         warmup_line = "not run"
         if warmup:
@@ -821,6 +1052,8 @@ class MandyBot(commands.Bot):
                 f"AI chat mode: `{chat_enabled}`\n"
                 f"AI roast mode: `{roast_enabled}`\n"
                 f"Alibaba key configured: `{self.ai.has_api_key()}`\n"
+                f"Memory rows: long-term={memory_stats['long_term_rows']} "
+                f"facts={memory_stats['fact_rows']} users={memory_stats['fact_users']}\n"
                 f"Startup memory scan: {warmup_line}\n"
                 f"Last API test: {last_test_line}"
             )[:1024],

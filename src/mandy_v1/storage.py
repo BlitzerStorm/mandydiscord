@@ -48,6 +48,7 @@ DEFAULT_STORE: dict[str, Any] = {
         "auto_model": "",
         "auto_vision_model": "",
         "profiles": {},
+        "memory_facts": {},
         "warmup": {},
     },
     "ui": {

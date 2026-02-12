@@ -16,8 +16,10 @@ This build is intentionally lean and optimized for reliable v1 operations.
 - In AI chat mode, performs startup memory scan and adaptive live decisioning (ignore/react/reply).
 - In AI chat mode, debounces burst prompts so rapid multi-message asks are merged into fewer smarter replies.
 - In AI chat mode, Mandy can respond without wake-word and can do quick image analysis on image attachments.
+- In AI chat mode, memory is weighted: stable user facts/preferences are pinned, while low-signal chatter decays out.
 - Before watcher, roast, and AI chat replies, Mandy shows a random typing delay (2-10s).
 - If a Mandy response exceeds Discord text limits, it auto-continues in follow-up messages.
+- Auto-trims debug/log and mirror channels on a schedule so control channels stay readable.
 - Stores runtime state in MessagePack only (no JSON DB, no SQL).
 
 ## 2) v1 architecture
@@ -144,6 +146,7 @@ Health/setup:
 - `!health` (tier >= 50)
 - `!setup` (tier >= 90, Admin Hub)
 - `!menupanel` (tier >= 50, Admin Hub)
+- `!housekeep` (tier >= 70, Admin Hub; run cleanup immediately)
 - `!syncaccess` (tier >= 90, Admin Hub)
 
 SOC:
@@ -216,6 +219,7 @@ Mandy records structured runtime events in store and stdout, including:
 
 Runtime events are also pushed into debug channels (excluding `mirror.*` events) and into Admin Hub `debug-log` (fallback `diagnostics`).
 AI warmup events include startup scan summaries per satellite (`ai.warmup_*`).
+Housekeeping trims old messages in debug/log and mirror channels while preserving pinned/menu/dashboard panels.
 
 ## 12) Discord permission notes
 
