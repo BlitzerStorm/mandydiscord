@@ -68,6 +68,13 @@ Optional keys:
 - `ALIBABA_BASE_URL` (default `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`)
 - `ALIBABA_MODEL` (default `qwen-plus`)
 
+AI key auto-probing:
+- API test and AI calls probe these sources automatically in order:
+  1) `ALIBABA_API_KEY` from settings
+  2) environment vars (`ALIBABA_API_KEY`, `DASHSCOPE_API_KEY`, `QWEN_API_KEY`, `AI_API_KEY`)
+  3) `passwords.txt` keys (`ALIBABA_API_KEY`, `DASHSCOPE_API_KEY`, `QWEN_API_KEY`, `AI_API_KEY`, `API_KEY`)
+- Model is auto-selected from available candidates and cached after successful API test.
+
 Example:
 
 ```txt

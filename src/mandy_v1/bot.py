@@ -971,10 +971,17 @@ class MandyBot(commands.Bot):
         view: discord.ui.View | None = None,
         embed: discord.Embed | None = None,
     ) -> None:
+        payload: dict[str, object] = {"ephemeral": ephemeral}
+        if content is not None:
+            payload["content"] = content
+        if embed is not None:
+            payload["embed"] = embed
+        if view is not None:
+            payload["view"] = view
         if interaction.response.is_done():
-            await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral, view=view)
+            await interaction.followup.send(**payload)
             return
-        await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral, view=view)
+        await interaction.response.send_message(**payload)
 
     def _action_label(self, action: str) -> str:
         labels = {

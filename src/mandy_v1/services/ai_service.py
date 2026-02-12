@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -31,6 +33,11 @@ NEGATIVE_TERMS = (
     "moron",
 )
 
+DEFAULT_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+DEFAULT_MODELS = ("qwen-plus", "qwen-max", "qwen-turbo")
+ENV_KEY_NAMES = ("ALIBABA_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY", "AI_API_KEY")
+PASSWORDS_KEY_NAMES = ("ALIBABA_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY", "AI_API_KEY", "API_KEY")
+
 
 @dataclass
 class ApiTestResult:
@@ -46,9 +53,11 @@ class AIService:
         self._recent_by_channel: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=20))
         self._alias_regex = re.compile(r"\b(?:mandy|mandi|mndy|mdy|mandee)\b", re.IGNORECASE)
         self._negative_regex = re.compile("|".join(re.escape(term) for term in NEGATIVE_TERMS), re.IGNORECASE)
+        self._passwords_cache: dict[str, str] | None = None
 
     def has_api_key(self) -> bool:
-        return bool(self.settings.alibaba_api_key.strip())
+        key, _source = self._resolve_api_key()
+        return bool(key)
 
     def is_chat_enabled(self, guild_id: int) -> bool:
         return bool(self._mode_row(guild_id).get("chat_enabled", False))
@@ -98,8 +107,8 @@ class AIService:
         recent = self.recent_context(message.channel.id, limit=5)
         memory = self._long_term_recent(message.guild.id if message.guild else 0, limit=3)
         prompt = (
-            "You are Mandy, a concise Discord assistant. "
-            "Reply naturally, keep it short, and avoid roleplay fluff."
+            "You are Mandy, a Mafia boss "
+            "Reply naturally,"
         )
         user_prompt = (
             f"User: {message.author.display_name} ({message.author.id})\n"
@@ -135,28 +144,58 @@ class AIService:
 
     async def test_api(self) -> ApiTestResult:
         started = time.perf_counter()
-        if not self.has_api_key():
-            result = ApiTestResult(ok=False, detail="ALIBABA_API_KEY is missing in passwords.txt.", latency_ms=None)
-            self._save_api_test(result)
-            return result
-        try:
-            output = await self._chat_completion(
-                [
-                    {"role": "system", "content": "You are a health check endpoint. Reply with exactly: OK"},
-                    {"role": "user", "content": "health-check"},
-                ],
-                max_tokens=16,
-                temperature=0.0,
+        api_key, key_source = self._resolve_api_key()
+        if not api_key:
+            result = ApiTestResult(
+                ok=False,
+                detail=(
+                    "No API key found. Probed sources: "
+                    "1) settings(ALIBABA_API_KEY) "
+                    "2) environment(ALIBABA_API_KEY/DASHSCOPE_API_KEY/QWEN_API_KEY/AI_API_KEY) "
+                    "3) passwords.txt(ALIBABA_API_KEY/DASHSCOPE_API_KEY/QWEN_API_KEY/AI_API_KEY/API_KEY)."
+                ),
+                latency_ms=None,
             )
-            latency = int((time.perf_counter() - started) * 1000)
-            result = ApiTestResult(ok=True, detail=f"API reachable. Model response: {output[:120]}", latency_ms=latency)
             self._save_api_test(result)
             return result
-        except Exception as exc:  # noqa: BLE001
-            latency = int((time.perf_counter() - started) * 1000)
-            result = ApiTestResult(ok=False, detail=f"API test failed: {exc}", latency_ms=latency)
-            self._save_api_test(result)
-            return result
+        models_tried: list[str] = []
+        last_error = "unknown error"
+        for model in self._model_candidates():
+            models_tried.append(model)
+            try:
+                output = await self._chat_completion(
+                    [
+                        {"role": "system", "content": "You are a health check endpoint. Reply with exactly: OK"},
+                        {"role": "user", "content": "health-check"},
+                    ],
+                    max_tokens=16,
+                    temperature=0.0,
+                    api_key=api_key,
+                    model=model,
+                )
+                self._ai_root()["auto_model"] = model
+                self.store.touch()
+                latency = int((time.perf_counter() - started) * 1000)
+                result = ApiTestResult(
+                    ok=True,
+                    detail=f"API reachable via `{key_source}` using model `{model}`. Response: {output[:120]}",
+                    latency_ms=latency,
+                )
+                self._save_api_test(result)
+                return result
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                continue
+
+        latency = int((time.perf_counter() - started) * 1000)
+        models_line = ",".join(models_tried) if models_tried else "(none)"
+        result = ApiTestResult(
+            ok=False,
+            detail=f"API test failed via `{key_source}`. models={models_line}. last_error={last_error[:220]}",
+            latency_ms=latency,
+        )
+        self._save_api_test(result)
+        return result
 
     def recent_context(self, channel_id: int, limit: int = 5) -> list[str]:
         rows = list(self._recent_by_channel.get(channel_id, []))
@@ -171,41 +210,53 @@ class AIService:
         return bool(self._alias_regex.search(message.content))
 
     async def _try_completion(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str | None:
-        if not self.has_api_key():
+        api_key, _source = self._resolve_api_key()
+        if not api_key:
             return None
-        try:
-            return await self._chat_completion(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=max_tokens,
-                temperature=0.7,
-            )
-        except Exception:  # noqa: BLE001
-            return None
+        for model in self._model_candidates():
+            try:
+                output = await self._chat_completion(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=0.7,
+                    api_key=api_key,
+                    model=model,
+                )
+                self._ai_root()["auto_model"] = model
+                self.store.touch()
+                return output
+            except Exception:  # noqa: BLE001
+                continue
+        return None
 
     async def _chat_completion(
         self,
         messages: list[dict[str, str]],
         max_tokens: int = 180,
         temperature: float = 0.7,
+        *,
+        api_key: str,
+        model: str,
     ) -> str:
-        if not self.has_api_key():
+        if not api_key.strip():
             raise RuntimeError("Alibaba API key is not configured.")
-        base = self.settings.alibaba_base_url.rstrip("/")
+        base = self.settings.alibaba_base_url.strip() or DEFAULT_BASE_URL
+        base = base.rstrip("/")
         if base.endswith("/chat/completions"):
             url = base
         else:
             url = f"{base}/chat/completions"
         payload = {
-            "model": self.settings.alibaba_model,
+            "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
         headers = {
-            "Authorization": f"Bearer {self.settings.alibaba_api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         timeout = aiohttp.ClientTimeout(total=30)
@@ -280,6 +331,59 @@ class AIService:
             return "(none)"
         return "\n".join(f"- {line[:300]}" for line in lines)
 
+    def _resolve_api_key(self) -> tuple[str, str]:
+        direct = self.settings.alibaba_api_key.strip()
+        if direct:
+            return direct, "settings.ALIBABA_API_KEY"
+
+        for name in ENV_KEY_NAMES:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return value, f"env.{name}"
+
+        values = self._load_passwords_values()
+        for name in PASSWORDS_KEY_NAMES:
+            value = values.get(name, "").strip()
+            if value:
+                return value, f"passwords.txt:{name}"
+
+        return "", "none"
+
+    def _model_candidates(self) -> list[str]:
+        candidates: list[str] = []
+        configured = self.settings.alibaba_model.strip()
+        auto_model = str(self._ai_root().get("auto_model", "")).strip()
+
+        for model in (configured, auto_model, *DEFAULT_MODELS):
+            if model and model not in candidates:
+                candidates.append(model)
+        return candidates
+
+    def _load_passwords_values(self) -> dict[str, str]:
+        if self._passwords_cache is not None:
+            return self._passwords_cache
+        path = Path("passwords.txt")
+        values: dict[str, str] = {}
+        if not path.exists():
+            self._passwords_cache = values
+            return values
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            self._passwords_cache = values
+            return values
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("["):
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            k = key.strip().upper().replace("-", "_").replace(".", "_")
+            values[k] = value.strip()
+        self._passwords_cache = values
+        return values
+
     def _mode_row(self, guild_id: int) -> dict[str, Any]:
         root = self._ai_root()
         modes = root.setdefault("guild_modes", {})
@@ -301,4 +405,5 @@ class AIService:
         root.setdefault("guild_modes", {})
         root.setdefault("long_term_memory", {})
         root.setdefault("last_api_test", {})
+        root.setdefault("auto_model", "")
         return root
