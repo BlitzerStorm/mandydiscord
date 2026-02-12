@@ -13,6 +13,7 @@ from discord.ext import commands
 from mandy_v1.config import Settings
 from mandy_v1.services.admin_layout_service import AdminLayoutService
 from mandy_v1.services.ai_service import AIService
+from mandy_v1.services.autonomy_service import AutonomyService
 from mandy_v1.services.dm_bridge_service import DMBridgeService
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.mirror_service import MirrorService
@@ -97,6 +98,7 @@ class MandyBot(commands.Bot):
         self.onboarding = OnboardingService(settings, self.store, self.logger)
         self.dm_bridges = DMBridgeService(settings, self.store, self.logger)
         self.ai = AIService(settings, self.store)
+        self.autonomy = AutonomyService(settings, self.store, self.logger, self.ai)
         self.started_at = datetime.now(tz=timezone.utc)
         self._autosave_task: asyncio.Task | None = None
         self._ai_warmup_task: asyncio.Task | None = None
@@ -130,7 +132,8 @@ class MandyBot(commands.Bot):
                 f"Watchers: `{len(self.store.data['watchers'])}`\n"
                 f"Mirror servers: `{len(self.store.data['mirrors']['servers'])}`\n"
                 f"DM bridges: `{len(self.store.data['dm_bridges'])}`\n"
-                f"Housekeeping active: `{housekeeping_active}`"
+                f"Housekeeping active: `{housekeeping_active}`\n"
+                f"Autonomy enabled: `{self.autonomy.is_enabled()}`"
             )
             await ctx.send(payload)
 
@@ -283,6 +286,45 @@ class MandyBot(commands.Bot):
             self.logger.log("guestpass.verified", user_id=ctx.author.id)
             await ctx.send("Access granted.")
 
+        @self.group(name="autonomy", invoke_without_command=True)
+        @self._tier_check(90)
+        async def autonomy_group(ctx: commands.Context) -> None:
+            await ctx.send(self.autonomy.status_snapshot(self))
+
+        @autonomy_group.command(name="status")
+        @self._tier_check(90)
+        async def autonomy_status(ctx: commands.Context) -> None:
+            await ctx.send(self.autonomy.status_snapshot(self))
+
+        @autonomy_group.command(name="on")
+        @self._tier_check(90)
+        async def autonomy_on(ctx: commands.Context) -> None:
+            self.autonomy.set_enabled(True)
+            self.logger.log("autonomy.enabled", actor_id=ctx.author.id)
+            await ctx.send("Autonomy enabled.")
+
+        @autonomy_group.command(name="off")
+        @self._tier_check(90)
+        async def autonomy_off(ctx: commands.Context) -> None:
+            self.autonomy.set_enabled(False)
+            self.logger.log("autonomy.disabled", actor_id=ctx.author.id)
+            await ctx.send("Autonomy disabled.")
+
+        @autonomy_group.command(name="run")
+        @self._tier_check(90)
+        async def autonomy_run(ctx: commands.Context, *, prompt: str) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or ctx.guild.id != self.settings.admin_guild_id:
+                await ctx.send("Run this in the Admin Hub.")
+                return
+            acted = await self.autonomy.run_with_text(
+                bot=self,
+                guild=ctx.guild,
+                channel=ctx.channel,
+                actor=ctx.author,
+                prompt_text=prompt,
+            )
+            await ctx.send(f"Autonomy run executed: `{acted}`")
+
     def _collect_onboard_candidates(self) -> list[discord.User | discord.Member]:
         users: dict[int, discord.User | discord.Member] = {}
         for guild in self.guilds:
@@ -331,7 +373,7 @@ class MandyBot(commands.Bot):
                 "`!health` `!setup` `!menupanel` `!debugpanel` `!housekeep`\n"
                 "`!watchers` `!watchers add/remove/reset`\n"
                 "`!onboarding` `!syncaccess` `!socset`\n"
-                "`!setguestpass` `!guestpass`"
+                "`!setguestpass` `!guestpass` `!autonomy`"
             )[:1024],
             inline=False,
         )
@@ -725,6 +767,7 @@ class MandyBot(commands.Bot):
             return
 
         self.ai.capture_message(message)
+        self.autonomy.observe_message(message)
 
         # Mirror first; watcher and AI consume the same live event to avoid extra fetches.
         await self.mirrors.mirror_message(self, message, self._build_mirror_view)
@@ -744,7 +787,9 @@ class MandyBot(commands.Bot):
             )
 
         if message.guild and not message.content.startswith(self.settings.command_prefix):
-            await self._maybe_handle_ai_message(message)
+            autonomy_acted = await self.autonomy.maybe_run_from_message(self, message)
+            if not autonomy_acted:
+                await self._maybe_handle_ai_message(message)
 
         if message.guild and message.guild.id == self.settings.admin_guild_id:
             if isinstance(message.channel, discord.TextChannel) and message.channel.name.startswith("dm-"):

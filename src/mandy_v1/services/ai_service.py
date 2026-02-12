@@ -571,6 +571,21 @@ class AIService:
         return bool(self._alias_regex.search(message.content))
 
     async def _try_completion(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str | None:
+        return await self.complete_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=max_tokens,
+            temperature=0.7,
+        )
+
+    async def complete_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 220,
+        temperature: float = 0.7,
+    ) -> str | None:
         api_key, _source = self._resolve_api_key()
         if not api_key:
             return None
@@ -582,7 +597,7 @@ class AIService:
                         {"role": "user", "content": user_prompt},
                     ],
                     max_tokens=max_tokens,
-                    temperature=0.7,
+                    temperature=temperature,
                     api_key=api_key,
                     model=model,
                 )

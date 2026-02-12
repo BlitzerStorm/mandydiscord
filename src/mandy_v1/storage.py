@@ -51,6 +51,18 @@ DEFAULT_STORE: dict[str, Any] = {
         "memory_facts": {},
         "warmup": {},
     },
+    "autonomy": {
+        "enabled": True,
+        "write_guild_id": 0,
+        "observe_other_guilds": True,
+        "allow_file_tools": True,
+        "max_actions_per_cycle": 6,
+        "last_run_ts": 0.0,
+        "protected_user_ids": [],
+        "protected_role_names": ["ACCESS:SOC"],
+        "observations": [],
+        "journal": [],
+    },
     "ui": {
         "global_menu_message_id": 0,
     },
