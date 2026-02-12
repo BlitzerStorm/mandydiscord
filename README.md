@@ -15,8 +15,9 @@ This build is intentionally lean and optimized for reliable v1 operations.
 - Relays user DMs into staff-visible bridge channels and supports outbound relay.
 - In AI chat mode, performs startup memory scan and adaptive live decisioning (ignore/react/reply).
 - In AI chat mode, debounces burst prompts so rapid multi-message asks are merged into fewer smarter replies.
-- In AI chat mode, Mandy can respond without wake-word and can do quick image analysis on image attachments.
+- In AI chat mode, Mandy can respond without wake-word and use image understanding internally; visual breakdown is only exposed when explicitly requested.
 - In AI chat mode, memory is weighted: stable user facts/preferences are pinned, while low-signal chatter decays out.
+- In AI chat mode, Mandy tracks relationship tone and preferred aliases to adapt replies more naturally per user.
 - Before watcher, roast, and AI chat replies, Mandy shows a random typing delay (2-10s).
 - If a Mandy response exceeds Discord text limits, it auto-continues in follow-up messages.
 - Auto-trims debug/log and mirror channels on a schedule so control channels stay readable.

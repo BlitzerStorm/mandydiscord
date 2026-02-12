@@ -34,6 +34,18 @@ NEGATIVE_TERMS = (
     "moron",
 )
 
+POSITIVE_TERMS = (
+    "thanks",
+    "thank you",
+    "good job",
+    "nice",
+    "great",
+    "awesome",
+    "love this",
+    "appreciate",
+    "well done",
+)
+
 DEFAULT_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODELS = ("qwen-plus", "qwen-max", "qwen-turbo")
 DEFAULT_VISION_MODELS = ("qwen-vl-plus", "qwen-vl-max", "qwen2.5-vl-72b-instruct")
@@ -150,9 +162,14 @@ class AIService:
         self._last_bot_reply_to_user_in_channel: dict[tuple[int, int], float] = {}
         self._alias_regex = re.compile(r"\b(?:mandy|mandi|mndy|mdy|mandee)\b", re.IGNORECASE)
         self._negative_regex = re.compile("|".join(re.escape(term) for term in NEGATIVE_TERMS), re.IGNORECASE)
+        self._positive_regex = re.compile("|".join(re.escape(term) for term in POSITIVE_TERMS), re.IGNORECASE)
         self._emotional_regex = re.compile(r"\b(?:lol|lmao|omg|wow|damn|nice|thanks|wtf|bro|bruh)\b", re.IGNORECASE)
         self._direct_request_regex = re.compile(
             r"\b(?:can you|could you|would you|you should|you think|help me|tell me|rate this|analyze this|what do you think)\b",
+            re.IGNORECASE,
+        )
+        self._image_request_regex = re.compile(
+            r"\b(?:what do you see|what(?:'s| is) in (?:this|the) (?:image|pic|picture|photo)|describe (?:this|the) (?:image|pic|picture|photo)|analy[sz]e (?:this|the) (?:image|pic|picture|photo)|rate (?:this|the) (?:image|pic|picture|photo)|caption (?:this|the) (?:image|pic|picture|photo))\b",
             re.IGNORECASE,
         )
         self._passwords_cache: dict[str, str] | None = None
@@ -403,21 +420,27 @@ class AIService:
         still_talking: bool = False,
         burst_lines: list[str] | None = None,
     ) -> str:
+        guild_id = message.guild.id if message.guild else 0
         recent = self.recent_context(message.channel.id, limit=6)
         memory = self._long_term_relevant(message, limit=5)
-        facts = self._user_fact_lines(message.guild.id if message.guild else 0, message.author.id, limit=4)
-        profile = self._profile_summary(message.guild.id if message.guild else 0, message.author.id)
+        facts = self._user_fact_lines(guild_id, message.author.id, limit=4)
+        profile = self._profile_summary(guild_id, message.author.id)
+        relationship = self._relationship_summary(guild_id, message.author.id)
+        preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
         burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
         image_urls = self._extract_image_urls(message, max_images=2)
         prompt = (
             "You are Mandy: a sharp, adaptive female teen with a mafia-boss vibe. "
-            "Confident, witty, in control. Respond naturally, concise by default, and context-aware."
+            "Confident, witty, in control. Respond naturally, concise by default, and context-aware. "
+            "Read social context like a human, adapt tone by relationship history, and keep continuity."
         )
         user_prompt = (
             f"Trigger reason: {reason or 'chat'}\n"
             f"Still talking: {still_talking}\n"
             f"User: {message.author.display_name} ({message.author.id})\n"
+            f"Preferred alias: {preferred_alias}\n"
             f"User profile: {profile}\n"
+            f"Relationship state: {relationship}\n"
             f"Pinned user facts:\n{self._format_lines(facts)}\n"
             f"Message: {message.clean_content[:500]}\n"
             f"Recent same-user burst:\n{self._format_lines(burst)}\n"
@@ -426,9 +449,14 @@ class AIService:
         )
         generated: str | None = None
         if image_urls:
+            explicit_image_request = self._is_image_explicit_request(message.clean_content)
             user_prompt = (
                 f"{user_prompt}\n"
-                "The user sent image(s). Give a quick visual analysis first, then your short reply."
+                f"Image attachment detected: yes (count={len(image_urls)})\n"
+                f"Image request explicit: {explicit_image_request}\n"
+                "If explicit request is false: use image understanding silently for context only. "
+                "Do not mention scanning/analyzing, and do not dump visual details.\n"
+                "If explicit request is true: you may briefly discuss relevant visual details."
             )
             generated = await self._try_vision_completion(
                 system_prompt=prompt,
@@ -444,10 +472,12 @@ class AIService:
         return generated
 
     async def generate_roast_reply(self, message: discord.Message) -> str:
+        guild_id = message.guild.id if message.guild else 0
         recent = self.recent_context(message.channel.id, limit=5)
         memory = self._long_term_relevant(message, limit=3)
-        facts = self._user_fact_lines(message.guild.id if message.guild else 0, message.author.id, limit=2)
-        profile = self._profile_summary(message.guild.id if message.guild else 0, message.author.id)
+        facts = self._user_fact_lines(guild_id, message.author.id, limit=2)
+        profile = self._profile_summary(guild_id, message.author.id)
+        relationship = self._relationship_summary(guild_id, message.author.id)
         prompt = (
             "You are Mandy. Reply with a short reverse-psychology roast. "
             "Keep it non-hateful, no slurs, no threats, and no protected-class attacks."
@@ -455,6 +485,7 @@ class AIService:
         user_prompt = (
             f"Target user: {message.author.display_name} ({message.author.id})\n"
             f"User profile: {profile}\n"
+            f"Relationship state: {relationship}\n"
             f"Pinned facts:\n{self._format_lines(facts)}\n"
             f"Offending line: {message.clean_content[:500]}\n"
             f"Recent context:\n{self._format_lines(recent)}\n"
@@ -749,11 +780,12 @@ class AIService:
         tags = ",".join(profile.get("style_tags", []))
         count = int(profile.get("message_count", 0))
         avg_len = int(profile.get("avg_len", 0))
+        rapport = float(profile.get("rapport_score", 0.0) or 0.0)
         samples = profile.get("samples", [])
         sample_text = ""
         if isinstance(samples, list) and samples:
             sample_text = str(samples[-1])[:120]
-        return f"messages={count} avg_len={avg_len} tags=[{tags}] sample={sample_text}"
+        return f"messages={count} avg_len={avg_len} rapport={rapport:.2f} tags=[{tags}] sample={sample_text}"
 
     def _update_profile(self, message: discord.Message, *, touch: bool) -> None:
         if not message.guild:
@@ -769,6 +801,9 @@ class AIService:
                 "message_count": 0,
                 "avg_len": 0,
                 "question_count": 0,
+                "positive_count": 0,
+                "negative_count": 0,
+                "rapport_score": 0.0,
                 "style_tags": [],
                 "samples": [],
                 "last_seen_ts": "",
@@ -784,6 +819,12 @@ class AIService:
         row["avg_len"] = int(((old_avg * (count - 1)) + size) / max(1, count))
         if "?" in text:
             row["question_count"] = int(row.get("question_count", 0)) + 1
+        if self._positive_regex.search(text):
+            row["positive_count"] = int(row.get("positive_count", 0)) + 1
+            row["rapport_score"] = round(min(5.0, float(row.get("rapport_score", 0.0) or 0.0) + 0.14), 3)
+        if self._negative_regex.search(text):
+            row["negative_count"] = int(row.get("negative_count", 0)) + 1
+            row["rapport_score"] = round(max(-5.0, float(row.get("rapport_score", 0.0) or 0.0) - 0.20), 3)
         row["last_seen_ts"] = datetime.now(tz=timezone.utc).isoformat()
 
         tags = set(str(tag) for tag in row.get("style_tags", []))
@@ -795,6 +836,8 @@ class AIService:
             tags.add("high-energy")
         if "?" in text:
             tags.add("curious")
+        if self._positive_regex.search(text):
+            tags.add("friendly-tone")
         if self._negative_regex.search(text):
             tags.add("hostile-tone")
         row["style_tags"] = sorted(tags)[:8]
@@ -960,6 +1003,79 @@ class AIService:
         scored.sort(key=lambda item: item[0], reverse=True)
         return [fact for _strength, fact in scored[: max(1, limit)]]
 
+    def _preferred_alias(self, guild_id: int, user_id: int) -> str:
+        if guild_id <= 0:
+            return ""
+        memory_facts = self._ai_root().setdefault("memory_facts", {})
+        guild_rows = memory_facts.get(str(guild_id), {})
+        if not isinstance(guild_rows, dict):
+            return ""
+        rows = guild_rows.get(str(user_id), [])
+        if not isinstance(rows, list):
+            return ""
+        ordered = sorted(
+            (row for row in rows if isinstance(row, dict)),
+            key=lambda row: self._parse_ts(row.get("ts")),
+            reverse=True,
+        )
+        for row in ordered:
+            fact = str(row.get("fact", "")).strip()
+            lowered = fact.lower()
+            if lowered.startswith("preferred name:"):
+                return fact.split(":", 1)[1].strip()[:32]
+        for row in ordered:
+            fact = str(row.get("fact", "")).strip()
+            lowered = fact.lower()
+            if lowered.startswith("name:"):
+                return fact.split(":", 1)[1].strip()[:32]
+        return ""
+
+    def _relationship_summary(self, guild_id: int, user_id: int) -> str:
+        profiles = self._ai_root().setdefault("profiles", {})
+        guild_profiles = profiles.get(str(guild_id), {})
+        if not isinstance(guild_profiles, dict):
+            return "unknown"
+        profile = guild_profiles.get(str(user_id), {})
+        if not isinstance(profile, dict) or not profile:
+            return "new-user"
+
+        count = int(profile.get("message_count", 0) or 0)
+        questions = int(profile.get("question_count", 0) or 0)
+        positives = int(profile.get("positive_count", 0) or 0)
+        negatives = int(profile.get("negative_count", 0) or 0)
+        rapport = float(profile.get("rapport_score", 0.0) or 0.0)
+        fact_count = len(self._user_fact_lines(guild_id, user_id, limit=6))
+
+        familiarity = "new"
+        if count >= 60:
+            familiarity = "veteran"
+        elif count >= 20:
+            familiarity = "familiar"
+        elif count >= 6:
+            familiarity = "known"
+
+        tone = "neutral"
+        if rapport >= 1.6:
+            tone = "warm"
+        elif rapport >= 0.45:
+            tone = "positive"
+        elif rapport <= -1.6:
+            tone = "tense"
+        elif rapport <= -0.45:
+            tone = "spiky"
+
+        curiosity = "low"
+        if count > 0:
+            ratio = questions / max(1, count)
+            if ratio >= 0.35:
+                curiosity = "high"
+            elif ratio >= 0.16:
+                curiosity = "medium"
+        return (
+            f"familiarity={familiarity} tone={tone} curiosity={curiosity} "
+            f"rapport={rapport:.2f} pos={positives} neg={negatives} facts={fact_count}"
+        )
+
     def _prune_user_fact_rows(self, rows: list[dict[str, Any]]) -> None:
         if len(rows) <= FACT_MEMORY_MAX_ROWS_PER_USER:
             return
@@ -1119,6 +1235,19 @@ class AIService:
         if lowered.startswith(("can you", "could you", "would you", "tell me", "help me", "what do you think")):
             return True
         return bool(self._direct_request_regex.search(content))
+
+    def _is_image_explicit_request(self, content: str) -> bool:
+        text = content.strip()
+        if not text:
+            return False
+        if self._image_request_regex.search(text):
+            return True
+        lowered = text.lower()
+        image_words = ("image", "img", "pic", "picture", "photo", "screenshot")
+        if any(word in lowered for word in image_words):
+            if "?" in lowered or self._is_direct_request(text):
+                return True
+        return False
 
     def _format_lines(self, lines: list[str]) -> str:
         if not lines:
