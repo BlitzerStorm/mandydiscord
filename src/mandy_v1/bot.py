@@ -8,6 +8,7 @@ import discord
 from discord.ext import commands
 
 from mandy_v1.config import Settings
+from mandy_v1.services.admin_layout_service import AdminLayoutService
 from mandy_v1.services.dm_bridge_service import DMBridgeService
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.mirror_service import MirrorService
@@ -59,6 +60,7 @@ class MandyBot(commands.Bot):
         self.settings = settings
         self.store = MessagePackStore(settings.store_path)
         self.logger = LoggerService(self.store)
+        self.layout = AdminLayoutService(self.store, self.logger)
         self.soc = SocService(settings, self.store)
         self.watchers = WatcherService(self.store)
         self.mirrors = MirrorService(settings, self.store, self.logger)
@@ -160,6 +162,20 @@ class MandyBot(commands.Bot):
                 await self.mirrors.sync_admin_member_access(self, member, bypass)
             await ctx.send("Access sync complete.")
 
+        @self.command(name="setup")
+        @self._tier_check(90)
+        async def setup_cmd(ctx: commands.Context) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or ctx.guild.id != self.settings.admin_guild_id:
+                await ctx.send("Run this in the Admin Hub.")
+                return
+            summary = await self.layout.ensure(ctx.guild)
+            await self._ensure_base_access_roles(ctx.guild)
+            await ctx.send(
+                "Setup complete. "
+                f"created_categories={summary['created_categories']} "
+                f"created_channels={summary['created_channels']}"
+            )
+
         @self.command(name="setguestpass")
         @self._tier_check(90)
         async def setguestpass(ctx: commands.Context, *, password: str) -> None:
@@ -205,6 +221,13 @@ class MandyBot(commands.Bot):
             return
         self._ready_once = True
         self.logger.log("bot.ready", user_id=self.user.id if self.user else None, guilds=len(self.guilds))
+        admin_guild = self.get_guild(self.settings.admin_guild_id)
+        if admin_guild:
+            try:
+                await self.layout.ensure(admin_guild)
+                await self._ensure_base_access_roles(admin_guild)
+            except discord.HTTPException:
+                self.logger.log("admin.layout_setup_failed", guild_id=admin_guild.id)
         for guild in self.guilds:
             if guild.id == self.settings.admin_guild_id:
                 continue
@@ -216,6 +239,13 @@ class MandyBot(commands.Bot):
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         self.logger.log("guild.joined", guild_id=guild.id, guild_name=guild.name)
+        if guild.id == self.settings.admin_guild_id:
+            try:
+                await self.layout.ensure(guild)
+                await self._ensure_base_access_roles(guild)
+            except discord.HTTPException:
+                self.logger.log("admin.layout_setup_failed", guild_id=guild.id)
+            return
         try:
             await self.mirrors.ensure_satellite(self, guild)
         except discord.HTTPException:
@@ -290,7 +320,7 @@ class MandyBot(commands.Bot):
         )
 
     async def _ensure_base_access_roles(self, guild: discord.Guild) -> None:
-        for role_name in ("ACCESS:Guest", "ACCESS:Member"):
+        for role_name in ("ACCESS:Guest", "ACCESS:Member", "ACCESS:Engineer", "ACCESS:Admin", "ACCESS:SOC"):
             if discord.utils.get(guild.roles, name=role_name) is None:
                 await guild.create_role(name=role_name, reason="Mandy v1 access role setup")
 

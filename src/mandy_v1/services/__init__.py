@@ -1,4 +1,5 @@
 __all__ = [
+    "admin_layout_service",
     "dm_bridge_service",
     "logger_service",
     "mirror_service",

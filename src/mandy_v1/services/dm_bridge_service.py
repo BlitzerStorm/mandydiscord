@@ -17,9 +17,9 @@ class DMBridgeService:
         admin_guild = bot.get_guild(self.settings.admin_guild_id)
         if not admin_guild:
             return None
-        category = discord.utils.get(admin_guild.categories, name="DM BRIDGES")
+        category = discord.utils.get(admin_guild.categories, name="ENGINEERING")
         if category is None:
-            category = await admin_guild.create_category("DM BRIDGES", reason="Mandy v1 DM bridge setup")
+            category = await admin_guild.create_category("ENGINEERING", reason="Mandy v1 DM bridge setup")
         channel_name = f"dm-{user.id}"
         channel = discord.utils.get(category.text_channels, name=channel_name)
         if channel is None:
