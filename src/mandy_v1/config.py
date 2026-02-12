@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+
 @dataclass(frozen=True)
 class Settings:
     discord_token: str
@@ -10,6 +11,9 @@ class Settings:
     god_user_id: int
     command_prefix: str
     store_path: Path
+    alibaba_api_key: str
+    alibaba_base_url: str
+    alibaba_model: str
 
     @staticmethod
     def load() -> "Settings":
@@ -19,6 +23,9 @@ class Settings:
         god_user_id = int(values.get("GOD_USER_ID", "741470965359443970"))
         command_prefix = values.get("COMMAND_PREFIX", "!")
         store_path = Path(values.get("STORE_PATH", "data/mandy_v1.msgpack"))
+        alibaba_api_key = values.get("ALIBABA_API_KEY", "").strip()
+        alibaba_base_url = values.get("ALIBABA_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1").strip()
+        alibaba_model = values.get("ALIBABA_MODEL", "qwen-plus").strip()
         if not token:
             raise RuntimeError("DISCORD_TOKEN is required in passwords.txt.")
         if not admin_guild_id:
@@ -29,6 +36,9 @@ class Settings:
             god_user_id=god_user_id,
             command_prefix=command_prefix,
             store_path=store_path,
+            alibaba_api_key=alibaba_api_key,
+            alibaba_base_url=alibaba_base_url,
+            alibaba_model=alibaba_model,
         )
 
 

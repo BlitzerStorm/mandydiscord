@@ -62,10 +62,13 @@ class MirrorService:
         await debug_channel.set_permissions(admin_guild.default_role, view_channel=False)
         await debug_channel.set_permissions(server_role, view_channel=True, send_messages=False, read_message_history=True)
 
+        existing = self.store.data["mirrors"]["servers"].get(str(satellite_guild.id), {})
         payload = {
             "category_id": category.id,
             "mirror_feed_id": mirror_feed.id,
             "debug_channel_id": debug_channel.id,
+            "debug_dashboard_message_id": int(existing.get("debug_dashboard_message_id", 0) or 0),
+            "satellite_invite_url": str(existing.get("satellite_invite_url", "")),
         }
         self.store.data["mirrors"]["servers"][str(satellite_guild.id)] = payload
         self.store.touch()

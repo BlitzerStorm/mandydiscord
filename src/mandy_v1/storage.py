@@ -33,6 +33,22 @@ DEFAULT_STORE: dict[str, Any] = {
         "verified_user_ids": [],
     },
     "dm_bridges": {},
+    "feature_requests": {
+        "next_id": 1,
+        "requests": {},
+        "grants": {
+            "once": {},
+            "permanent": {},
+        },
+    },
+    "ai": {
+        "guild_modes": {},
+        "long_term_memory": {},
+        "last_api_test": {},
+    },
+    "ui": {
+        "global_menu_message_id": 0,
+    },
     "logs": [],
 }
 

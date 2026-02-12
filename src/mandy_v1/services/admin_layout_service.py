@@ -10,7 +10,7 @@ from mandy_v1.storage import MessagePackStore
 
 DEFAULT_LAYOUT: dict[str, list[str]] = {
     "WELCOME": ["rules", "announcements", "guest-briefing", "manual-for-living"],
-    "OPERATIONS": ["console", "requests", "reports", "diagnostics"],
+    "OPERATIONS": ["console", "menu", "requests", "reports", "diagnostics"],
     "SATELLITES": [],
     "GUEST ACCESS": ["guest-chat", "guest-feedback", "quarantine"],
     "ENGINEERING": ["system-log", "audit-log", "debug-log", "mirror-log", "data-lab", "dm-bridges"],
@@ -23,6 +23,7 @@ DEFAULT_TOPICS: dict[str, str] = {
     "guest-briefing": "Guest onboarding guidance.",
     "manual-for-living": "Published Mandy v1 operator manual.",
     "console": "Live control-plane console updates.",
+    "menu": "Unified Mandy control menu and satellite controls.",
     "requests": "Operator requests and command coordination.",
     "reports": "Incident and investigation reports.",
     "diagnostics": "Minimal system health and setup diagnostics.",
@@ -45,6 +46,7 @@ DEFAULT_TOPICS: dict[str, str] = {
 DEFAULT_PINS: dict[str, str] = {
     "rules": "<!--PIN:rules-->\nMandy v1 is a control plane. Follow SOC rules and Discord ToS.",
     "console": "<!--PIN:console-->\nOperational console. Keep this channel signal-only.",
+    "menu": "<!--PIN:menu-->\nUnified Mandy menu channel. Use the control panel message in this channel.",
     "requests": "<!--PIN:requests-->\nUse this channel for operator requests and command intent.",
     "diagnostics": "<!--PIN:diagnostics-->\nDiagnostics panel is maintained by Mandy v1 setup.",
     "admin-chat": "<!--PIN:admin-chat-->\nAdmin coordination channel. Use for privileged decisions.",
@@ -173,16 +175,39 @@ class AdminLayoutService:
     def _layout_map(self) -> dict[str, list[str]]:
         config = self.store.data.setdefault("layout", {})
         default_categories = {key: list(value) for key, value in DEFAULT_LAYOUT.items()}
+        had_categories = "categories" in config
         categories = config.setdefault("categories", default_categories)
-        self.store.touch()
+        changed = not had_categories
+        for category_name, default_channels in default_categories.items():
+            existing = categories.setdefault(category_name, [])
+            for channel_name in default_channels:
+                if channel_name not in existing:
+                    existing.append(channel_name)
+                    changed = True
+        if changed:
+            self.store.touch()
         return categories
 
     def _topic_map(self) -> dict[str, str]:
+        had_topics = "channel_topics" in self.store.data
         topics = self.store.data.setdefault("channel_topics", DEFAULT_TOPICS.copy())
-        self.store.touch()
+        changed = not had_topics
+        for channel_name, topic in DEFAULT_TOPICS.items():
+            if channel_name not in topics:
+                topics[channel_name] = topic
+                changed = True
+        if changed:
+            self.store.touch()
         return topics
 
     def _pin_map(self) -> dict[str, str]:
+        had_pins = "pinned_text" in self.store.data
         pins = self.store.data.setdefault("pinned_text", DEFAULT_PINS.copy())
-        self.store.touch()
+        changed = not had_pins
+        for channel_name, pin_text in DEFAULT_PINS.items():
+            if channel_name not in pins:
+                pins[channel_name] = pin_text
+                changed = True
+        if changed:
+            self.store.touch()
         return pins

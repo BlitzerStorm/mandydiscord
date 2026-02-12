@@ -27,10 +27,12 @@ Core modules:
 - `src/mandy_v1/services/admin_layout_service.py` Admin Hub layout/bootstrap
 - `src/mandy_v1/services/mirror_service.py` satellite provisioning + mirror pipeline
 - `src/mandy_v1/services/watcher_service.py` global watcher counters/triggers
+- `src/mandy_v1/services/ai_service.py` AI chat/roast mode and Alibaba API test
 - `src/mandy_v1/services/onboarding_service.py` onboarding invites + bypass state
 - `src/mandy_v1/services/dm_bridge_service.py` DM bridge open/relay
 - `src/mandy_v1/services/logger_service.py` structured runtime log sink
 - `src/mandy_v1/ui/mirror_actions.py` interactive mirror action buttons
+- `src/mandy_v1/ui/satellite_debug.py` satellite debug dashboard/menu + permission requests
 
 ## 3) Requirements
 
@@ -62,6 +64,9 @@ Optional keys:
 - `GOD_USER_ID` (default `741470965359443970`)
 - `COMMAND_PREFIX` (default `!`)
 - `STORE_PATH` (default `data/mandy_v1.msgpack`)
+- `ALIBABA_API_KEY` (for AI mode + roast mode API calls)
+- `ALIBABA_BASE_URL` (default `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`)
+- `ALIBABA_MODEL` (default `qwen-plus`)
 
 Example:
 
@@ -71,6 +76,9 @@ ADMIN_GUILD_ID=123456789012345678
 GOD_USER_ID=741470965359443970
 COMMAND_PREFIX=!
 STORE_PATH=data/mandy_v1.msgpack
+ALIBABA_API_KEY=
+ALIBABA_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+ALIBABA_MODEL=qwen-plus
 ```
 
 Security:
@@ -98,6 +106,7 @@ Mandy ensures categories:
 - `GOD CORE`
 
 Mandy ensures channels (per blueprint), applies topics, and keeps signature-pinned panels updated.
+Mandy also maintains a unified control panel message in `OPERATIONS/menu`.
 
 Mandy ensures access roles:
 - `ACCESS:Guest`
@@ -113,6 +122,7 @@ For each non-admin guild:
 - Creates `mirror-feed` and `debug` channels
 - Creates/ensures role `SOC:SERVER:<guild_id>`
 - Applies visibility permissions for mirror/debug channels
+- Maintains a debug dashboard + button menu in each satellite `debug` channel
 
 ## 7) Commands
 
@@ -121,6 +131,7 @@ Prefix default is `!`.
 Health/setup:
 - `!health` (tier >= 50)
 - `!setup` (tier >= 90, Admin Hub)
+- `!menupanel` (tier >= 50, Admin Hub)
 - `!syncaccess` (tier >= 90, Admin Hub)
 
 SOC:
@@ -139,6 +150,12 @@ Onboarding:
 Guest password flow:
 - `!setguestpass <password>` (tier >= 90)
 - `!guestpass <password>` (Admin Hub members use this to verify)
+
+Satellite debug:
+- `!debugpanel` (tier >= 50; in satellite guilds, refreshes dashboard/menu)
+
+Global menu:
+- Admin Hub `menu` channel includes the full control panel and satellite entry menu
 
 ## 8) SOC tiers
 
@@ -180,12 +197,12 @@ Store behavior:
 
 Mandy records structured runtime events in store and stdout, including:
 - setup events
-- mirror events
 - watcher events
 - onboarding events
 - DM bridge events
+- AI mode events
 
-Minimal diagnostic channel is created in `OPERATIONS/diagnostics`.
+Runtime events are also pushed into debug channels (excluding `mirror.*` events) and into Admin Hub `debug-log` (fallback `diagnostics`).
 
 ## 12) Discord permission notes
 
