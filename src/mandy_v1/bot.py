@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -38,6 +39,10 @@ HOUSEKEEPING_ADMIN_POLICIES: dict[str, tuple[int, int]] = {
 }
 HOUSEKEEPING_SATELLITE_DEBUG_POLICY = (180, 14)
 HOUSEKEEPING_SATELLITE_MIRROR_POLICY = (420, 21)
+SEND_BACKOFF_MAX_SEC = 6 * 60 * 60
+SEND_SUPPRESSION_LOG_INTERVAL_SEC = 60
+SEND_ACCESS_PROBE_INTERVAL_SEC = 90
+SEND_RANT_INTERVAL_SEC = 10 * 60
 
 
 @dataclass(frozen=True)
@@ -104,7 +109,12 @@ class MandyBot(commands.Bot):
         self._ai_warmup_task: asyncio.Task | None = None
         self._housekeeping_task: asyncio.Task | None = None
         self._shadow_task: asyncio.Task | None = None
+        self._send_probe_task: asyncio.Task | None = None
         self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self._send_block_until_by_guild: dict[int, float] = {}
+        self._send_failure_count_by_guild: dict[int, int] = {}
+        self._send_suppressed_log_ts_by_guild: dict[int, float] = {}
+        self._send_rant_ts_by_guild: dict[int, float] = {}
         self._typing_rng = random.Random()
         self._ready_once = False
         self.logger.subscribe(self._on_log_row)
@@ -723,6 +733,8 @@ class MandyBot(commands.Bot):
             self._housekeeping_task = asyncio.create_task(self._run_housekeeping_loop(), name="channel-housekeeping")
         if self._shadow_task is None or self._shadow_task.done():
             self._shadow_task = asyncio.create_task(self._run_shadow_loop(), name="shadow-ai-loop")
+        if self._send_probe_task is None or self._send_probe_task.done():
+            self._send_probe_task = asyncio.create_task(self._run_send_access_probe_loop(), name="send-access-probe")
         print(f"Connected as {self.user} ({self.user.id if self.user else '?'})")
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -795,17 +807,33 @@ class MandyBot(commands.Bot):
 
         hit = self.watchers.on_message(message)
         if hit:
-            typing_delay = await self._simulate_typing_delay(message.channel)
-            parts = await self._send_split_channel_message(message.channel, hit.response)
-            self.logger.log(
-                "watcher.hit",
-                user_id=hit.user_id,
-                threshold=hit.threshold,
-                count=hit.count,
-                guild_id=message.guild.id if message.guild else 0,
-                typing_delay_sec=typing_delay,
-                parts=parts,
-            )
+            guild_id = message.guild.id if message.guild else 0
+            if guild_id > 0 and self._is_send_blocked(guild_id):
+                await self._log_send_suppressed(guild_id, context="watcher.send")
+            else:
+                try:
+                    typing_delay = await self._simulate_typing_delay(message.channel)
+                    parts = await self._send_split_channel_message(message.channel, hit.response)
+                    if guild_id > 0:
+                        self._note_send_success(guild_id)
+                    self.logger.log(
+                        "watcher.hit",
+                        user_id=hit.user_id,
+                        threshold=hit.threshold,
+                        count=hit.count,
+                        guild_id=guild_id,
+                        typing_delay_sec=typing_delay,
+                        parts=parts,
+                    )
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    if guild_id > 0:
+                        self._note_send_failure(guild_id, exc, context="watcher.send")
+                    self.logger.log(
+                        "watcher.send_failed",
+                        guild_id=guild_id,
+                        user_id=hit.user_id,
+                        error=str(exc)[:300],
+                    )
 
         if message.guild and not message.content.startswith(self.settings.command_prefix):
             await self._maybe_handle_ai_message(message)
@@ -855,19 +883,32 @@ class MandyBot(commands.Bot):
         if not message.guild or not self.user:
             return
         guild_id = message.guild.id
+        if self._is_send_blocked(guild_id):
+            await self._log_send_suppressed(guild_id, context="ai.chat_pipeline")
+            return
         if self.ai.is_roast_enabled(guild_id):
             if self.ai.should_roast(message, self.user.id):
-                reply = await self.ai.generate_roast_reply(message)
-                typing_delay = await self._simulate_typing_delay(message.channel)
-                parts = await self._send_split_reply(message, reply, mention_author=False)
-                self.ai.note_bot_action(message.channel.id, "reply", user_id=message.author.id)
-                self.logger.log(
-                    "ai.roast_reply",
-                    guild_id=guild_id,
-                    user_id=message.author.id,
-                    typing_delay_sec=typing_delay,
-                    parts=parts,
-                )
+                try:
+                    reply = await self.ai.generate_roast_reply(message)
+                    typing_delay = await self._simulate_typing_delay(message.channel)
+                    parts = await self._send_split_reply(message, reply, mention_author=False)
+                    self._note_send_success(guild_id)
+                    self.ai.note_bot_action(message.channel.id, "reply", user_id=message.author.id)
+                    self.logger.log(
+                        "ai.roast_reply",
+                        guild_id=guild_id,
+                        user_id=message.author.id,
+                        typing_delay_sec=typing_delay,
+                        parts=parts,
+                    )
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    self._note_send_failure(guild_id, exc, context="ai.roast_reply")
+                    self.logger.log(
+                        "ai.roast_reply_failed",
+                        guild_id=guild_id,
+                        user_id=message.author.id,
+                        error=str(exc)[:300],
+                    )
             return
         if self.ai.is_chat_enabled(guild_id):
             directive = self.ai.decide_chat_action(message, self.user.id)
@@ -916,6 +957,11 @@ class MandyBot(commands.Bot):
             except asyncio.CancelledError:
                 return
 
+            guild_id = message.guild.id if message.guild else 0
+            if guild_id > 0 and self._is_send_blocked(guild_id):
+                await self._log_send_suppressed(guild_id, context="ai.chat_reply")
+                return
+
             try:
                 burst = self.ai.user_burst_lines(message.channel.id, message.author.id, limit=6)
                 reply = await self.ai.generate_chat_reply(
@@ -926,10 +972,12 @@ class MandyBot(commands.Bot):
                 )
                 typing_delay = await self._simulate_typing_delay(message.channel)
                 parts = await self._send_split_reply(message, reply, mention_author=False)
+                if guild_id > 0:
+                    self._note_send_success(guild_id)
                 self.ai.note_bot_action(message.channel.id, "reply", user_id=message.author.id)
                 self.logger.log(
                     "ai.chat_reply",
-                    guild_id=message.guild.id if message.guild else 0,
+                    guild_id=guild_id,
                     user_id=message.author.id,
                     reason=reason,
                     still_talking=still_talking,
@@ -940,10 +988,12 @@ class MandyBot(commands.Bot):
                 )
             except asyncio.CancelledError:
                 return
-            except discord.HTTPException as exc:
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                if guild_id > 0:
+                    self._note_send_failure(guild_id, exc, context="ai.chat_reply")
                 self.logger.log(
                     "ai.chat_reply_failed",
-                    guild_id=message.guild.id if message.guild else 0,
+                    guild_id=guild_id,
                     user_id=message.author.id,
                     error=str(exc)[:300],
                 )
@@ -961,6 +1011,138 @@ class MandyBot(commands.Bot):
             reason=reason,
             delay_sec=round(delay_sec, 2),
         )
+
+    def _is_send_blocked(self, guild_id: int) -> bool:
+        if guild_id <= 0:
+            return False
+        until = float(self._send_block_until_by_guild.get(guild_id, 0.0) or 0.0)
+        if until <= 0:
+            return False
+        return until > time.time()
+
+    def _remaining_send_block_sec(self, guild_id: int) -> int:
+        until = float(self._send_block_until_by_guild.get(guild_id, 0.0) or 0.0)
+        if until <= 0:
+            return 0
+        return max(0, int(until - time.time()))
+
+    def _note_send_success(self, guild_id: int) -> None:
+        if guild_id <= 0:
+            return
+        had_block = guild_id in self._send_block_until_by_guild
+        self._send_block_until_by_guild.pop(guild_id, None)
+        self._send_failure_count_by_guild.pop(guild_id, None)
+        self._send_suppressed_log_ts_by_guild.pop(guild_id, None)
+        self._send_rant_ts_by_guild.pop(guild_id, None)
+        if had_block:
+            self.logger.log("send.backoff_cleared", guild_id=guild_id)
+
+    def _note_send_failure(self, guild_id: int, exc: Exception, *, context: str) -> None:
+        if guild_id <= 0:
+            return
+        status = int(getattr(exc, "status", 0) or 0)
+        raw_code = getattr(exc, "code", 0)
+        try:
+            code = int(raw_code or 0)
+        except (TypeError, ValueError):
+            code = 0
+
+        if status == 403 or code in {50013, 50001, 20013, 20016}:
+            base = 15 * 60
+        elif status == 429:
+            base = 120
+        elif status >= 500:
+            base = 90
+        else:
+            base = 180
+
+        count = int(self._send_failure_count_by_guild.get(guild_id, 0)) + 1
+        self._send_failure_count_by_guild[guild_id] = count
+        duration = int(base * (1.7 ** max(0, count - 1)))
+        duration = max(60, min(SEND_BACKOFF_MAX_SEC, duration))
+        until = time.time() + duration
+        previous = float(self._send_block_until_by_guild.get(guild_id, 0.0) or 0.0)
+        self._send_block_until_by_guild[guild_id] = max(previous, until)
+        self.logger.log(
+            "send.backoff_set",
+            guild_id=guild_id,
+            context=context,
+            status=status,
+            code=code,
+            fail_count=count,
+            duration_sec=duration,
+            error=str(exc)[:220],
+        )
+
+    async def _log_send_suppressed(self, guild_id: int, *, context: str) -> None:
+        if guild_id <= 0:
+            return
+        now = time.time()
+        last = float(self._send_suppressed_log_ts_by_guild.get(guild_id, 0.0) or 0.0)
+        if (now - last) < SEND_SUPPRESSION_LOG_INTERVAL_SEC:
+            return
+        self._send_suppressed_log_ts_by_guild[guild_id] = now
+        self.logger.log(
+            "send.suppressed",
+            guild_id=guild_id,
+            context=context,
+            remaining_sec=self._remaining_send_block_sec(guild_id),
+        )
+        await self._maybe_shadow_rant_for_blocked_guild(guild_id, context=context)
+
+    async def _run_send_access_probe_loop(self) -> None:
+        await asyncio.sleep(20)
+        while True:
+            try:
+                await self._probe_send_access_once()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("send.probe_failed", error=str(exc)[:300])
+            await asyncio.sleep(SEND_ACCESS_PROBE_INTERVAL_SEC)
+
+    async def _probe_send_access_once(self) -> None:
+        blocked_ids = [gid for gid in self._send_block_until_by_guild.keys() if self._is_send_blocked(gid)]
+        for guild_id in blocked_ids:
+            guild = self.get_guild(guild_id)
+            if guild is None:
+                continue
+            if self._guild_has_send_access(guild):
+                self._note_send_success(guild_id)
+                self.logger.log("send.access_restored", guild_id=guild_id)
+                continue
+            await self._maybe_shadow_rant_for_blocked_guild(guild_id, context="send.probe")
+
+    def _guild_has_send_access(self, guild: discord.Guild) -> bool:
+        me = guild.me
+        if me is None:
+            return False
+        for channel in guild.text_channels:
+            perms = channel.permissions_for(me)
+            if perms.view_channel and perms.send_messages:
+                return True
+        return False
+
+    async def _maybe_shadow_rant_for_blocked_guild(self, guild_id: int, *, context: str) -> None:
+        now = time.time()
+        last = float(self._send_rant_ts_by_guild.get(guild_id, 0.0) or 0.0)
+        if (now - last) < SEND_RANT_INTERVAL_SEC:
+            return
+        admin_guild = self.get_guild(self.settings.admin_guild_id)
+        blocked_guild = self.get_guild(guild_id)
+        if admin_guild is None:
+            return
+        guild_name = blocked_guild.name if blocked_guild else f"Guild {guild_id}"
+        remaining = self._remaining_send_block_sec(guild_id)
+        text = (
+            f"Shadow update: send path blocked in `{guild_name}` (`{guild_id}`), "
+            f"context=`{context}`, cooldown_remaining_sec=`{remaining}`. "
+            "Holding outbound chatter until access returns."
+        )
+        try:
+            sent = await self.shadow.send_council_message(admin_guild, text, reason="Send path blocked")
+        except discord.HTTPException:
+            sent = False
+        if sent:
+            self._send_rant_ts_by_guild[guild_id] = now
 
     async def _simulate_typing_delay(self, channel: discord.abc.Messageable) -> float:
         delay = round(self._typing_rng.uniform(2.0, 10.0), 2)
