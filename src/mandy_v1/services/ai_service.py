@@ -67,6 +67,8 @@ FACT_MEMORY_MAX_ROWS_PER_USER = 18
 FACT_MEMORY_RECENT_FLOOR = 5
 FACT_MEMORY_MIN_TEXT_LEN = 6
 SHADOW_EVENT_MAX_ROWS = 1600
+DM_EVENT_MAX_ROWS = 1800
+HIVE_NOTE_MAX_ROWS = 180
 
 MEMORY_STOPWORDS = {
     "about",
@@ -310,6 +312,98 @@ class AIService:
         if touch:
             self.store.touch()
 
+    def capture_dm_signal(self, message: discord.Message, *, touch: bool = True) -> None:
+        if message.guild is not None or message.author.bot:
+            return
+        text = " ".join(message.clean_content.split())
+        if not text and not message.attachments:
+            return
+        if message.attachments:
+            text = f"{text} | attachments={len(message.attachments)}".strip()
+        root = self._ai_root()
+        dm = root.setdefault("dm_brain", {})
+        events = dm.setdefault("events", [])
+        events.append(
+            {
+                "ts": time.time(),
+                "user_id": int(message.author.id),
+                "user_name": str(message.author.display_name)[:80],
+                "direction": "inbound",
+                "text": text[:500],
+            }
+        )
+        if len(events) > DM_EVENT_MAX_ROWS:
+            del events[: len(events) - DM_EVENT_MAX_ROWS]
+        if touch:
+            self.store.touch()
+
+    def capture_dm_outbound(self, *, user_id: int, user_name: str, text: str, touch: bool = True) -> None:
+        root = self._ai_root()
+        dm = root.setdefault("dm_brain", {})
+        events = dm.setdefault("events", [])
+        body = " ".join(str(text or "").split())
+        if not body:
+            return
+        events.append(
+            {
+                "ts": time.time(),
+                "user_id": int(user_id),
+                "user_name": str(user_name or "")[:80],
+                "direction": "outbound",
+                "text": body[:500],
+            }
+        )
+        if len(events) > DM_EVENT_MAX_ROWS:
+            del events[: len(events) - DM_EVENT_MAX_ROWS]
+        if touch:
+            self.store.touch()
+
+    def dm_recent_lines(self, user_id: int, limit: int = 8) -> list[str]:
+        events = self._ai_root().setdefault("dm_brain", {}).setdefault("events", [])
+        out: list[str] = []
+        for row in reversed(events):
+            if not isinstance(row, dict):
+                continue
+            if int(row.get("user_id", 0) or 0) != user_id:
+                continue
+            text = str(row.get("text", "")).strip()
+            if not text:
+                continue
+            direction = str(row.get("direction", "inbound"))
+            who = "user" if direction == "inbound" else "mandy"
+            out.append(f"{who}: {text[:220]}")
+            if len(out) >= max(1, limit):
+                break
+        out.reverse()
+        return out
+
+    async def generate_dm_reply(self, message: discord.Message) -> str:
+        user_id = int(message.author.id)
+        recent = self.dm_recent_lines(user_id, limit=10)
+        hive_notes = self.hive_recent_notes(limit=6)
+        prompt = (
+            "You are Mandy in direct messages. "
+            "Stay concise, warm, and strategic. "
+            "Be honest and non-coercive. "
+            "If the user asks a direct question, answer directly."
+        )
+        user_prompt = (
+            f"User: {message.author.display_name} ({message.author.id})\n"
+            f"Message: {message.clean_content[:700]}\n"
+            f"Recent DM context:\n{self._format_lines(recent)}\n"
+            f"Hive notes:\n{self._format_lines(hive_notes)}"
+        )
+        generated = await self.complete_text(
+            system_prompt=prompt,
+            user_prompt=user_prompt,
+            max_tokens=260,
+            temperature=0.6,
+        )
+        if not generated:
+            generated = "I'm here. Keep going, I'm tracking the thread."
+        self._remember_dm_reply(message.author.id, generated)
+        return generated
+
     def shadow_recent_lines(self, limit: int = 20) -> list[str]:
         rows = self._ai_root().setdefault("shadow_brain", {}).setdefault("events", [])
         out: list[str] = []
@@ -323,6 +417,86 @@ class AIService:
             if text:
                 out.append(f"[{guild}#{channel}] {user}: {text}")
         return out[-max(1, limit) :]
+
+    def dm_global_recent_lines(self, limit: int = 20) -> list[str]:
+        rows = self._ai_root().setdefault("dm_brain", {}).setdefault("events", [])
+        out: list[str] = []
+        for row in rows[-max(1, limit * 3) :]:
+            if not isinstance(row, dict):
+                continue
+            user = str(row.get("user_name", ""))[:24]
+            direction = str(row.get("direction", "inbound"))
+            text = str(row.get("text", ""))[:140]
+            if not text:
+                continue
+            out.append(f"[dm:{user}:{direction}] {text}")
+        return out[-max(1, limit) :]
+
+    def hive_recent_notes(self, limit: int = 5) -> list[str]:
+        rows = self._ai_root().setdefault("hive_brain", {}).setdefault("notes", [])
+        out: list[str] = []
+        for row in rows[-max(1, limit) :]:
+            if not isinstance(row, dict):
+                continue
+            summary = str(row.get("summary", "")).strip()
+            if summary:
+                out.append(summary[:240])
+        return out
+
+    async def generate_hive_note(self, *, admin_guild_id: int, reason: str) -> str | None:
+        dm_lines = self.dm_global_recent_lines(limit=18)
+        shadow_lines = self.shadow_recent_lines(limit=18)
+        if not dm_lines and not shadow_lines:
+            return None
+        system_prompt = (
+            "You are Mandy Hive Coordinator. "
+            "Produce strict JSON with keys: dm_note, shadow_note, summary. "
+            "Coordinate between DM strategy and shadow operations strategy. "
+            "Keep notes concise and non-coercive."
+        )
+        user_prompt = (
+            f"Admin guild id: {admin_guild_id}\n"
+            f"Reason: {reason}\n"
+            f"Recent DM stream:\n{self._format_lines(dm_lines)}\n"
+            f"Recent Shadow stream:\n{self._format_lines(shadow_lines)}\n"
+            "Return JSON only."
+        )
+        raw = await self.complete_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=420,
+            temperature=0.35,
+        )
+        payload = self._extract_json_object(raw or "")
+        if payload is None:
+            return None
+        dm_note = str(payload.get("dm_note", "")).strip()
+        shadow_note = str(payload.get("shadow_note", "")).strip()
+        summary = str(payload.get("summary", "")).strip()
+        if not summary:
+            return None
+        hive = self._ai_root().setdefault("hive_brain", {})
+        notes = hive.setdefault("notes", [])
+        if notes:
+            last_summary = str(notes[-1].get("summary", "")).strip()
+            if last_summary and last_summary.casefold() == summary.casefold():
+                hive["last_sync_ts"] = time.time()
+                self.store.touch()
+                return summary[:320]
+        notes.append(
+            {
+                "ts": datetime.now(tz=timezone.utc).isoformat(),
+                "reason": reason[:80],
+                "dm_note": dm_note[:240],
+                "shadow_note": shadow_note[:240],
+                "summary": summary[:320],
+            }
+        )
+        if len(notes) > HIVE_NOTE_MAX_ROWS:
+            del notes[: len(notes) - HIVE_NOTE_MAX_ROWS]
+        hive["last_sync_ts"] = time.time()
+        self.store.touch()
+        return summary[:320]
 
     def shadow_candidate_summaries(
         self,
@@ -394,10 +568,11 @@ class AIService:
             "You are strategic and socially smart. Your goal is to grow Mandy's shadow presence across servers by inviting high-value users, giving them a custom nickname to pique curiosity, and removing harmful users. "
             "Choose only from allowed actions: invite_user, nickname_user, remove_user, send_shadow_message. "
             "Each action object must include action plus needed fields. "
-            "If there is no high-confidence action, return actions as an empty list."
-            "You can manupliate your way through but do so carefully where you no user doesn't realize it"
+            "If there is no high-confidence action, return actions as an empty list. "
+            "Do not use coercion, deception, or manipulation."
         )
         recent_lines = self.shadow_recent_lines(limit=20)
+        hive_notes = self.hive_recent_notes(limit=6)
         candidate_lines = []
         for row in candidates[:40]:
             candidate_lines.append(
@@ -413,6 +588,7 @@ class AIService:
             f"Excluded ids: {shadow_snapshot.get('excluded_user_ids', [])}\n"
             f"Current members sample: {shadow_snapshot.get('members_sample', [])}\n"
             f"Recent cross-server context:\n{self._format_lines(recent_lines)}\n"
+            f"Hive notes:\n{self._format_lines(hive_notes)}\n"
             f"Candidate pool:\n{self._format_lines(candidate_lines)}\n"
             "Rules:\n"
             "- max 3 actions\n"
@@ -589,9 +765,10 @@ class AIService:
             "Read social context like a human, adapt tone by relationship history, and keep continuity."
             "Prioritize recent user messages, but use long-term memory for relationship and style. "
             "Go short and don't roleplay unless the user is roleplaying. If the user seems to be asking a question, answer it directly. "
-            "Be socially intelligent, direct, and tactful. Build trust through honest communication, and black manipulation. "
+            "Be socially intelligent, direct, and tactful. Build trust through honest communication. "
             "If the user is sharing feelings or emotions, respond with empathy and understanding. "
         )
+        hive_notes = self.hive_recent_notes(limit=6)
         user_prompt = (
             f"Trigger reason: {reason or 'chat'}\n"
             f"Still talking: {still_talking}\n"
@@ -603,7 +780,8 @@ class AIService:
             f"Message: {message.clean_content[:500]}\n"
             f"Recent same-user burst:\n{self._format_lines(burst)}\n"
             f"Recent channel context:\n{self._format_lines(recent)}\n"
-            f"Long-term memory:\n{self._format_lines(memory)}"
+            f"Long-term memory:\n{self._format_lines(memory)}\n"
+            f"Hive notes:\n{self._format_lines(hive_notes)}"
         )
         generated: str | None = None
         if image_urls:
@@ -860,6 +1038,21 @@ class AIService:
             "latency_ms": result.latency_ms,
             "ts": datetime.now(tz=timezone.utc).isoformat(),
         }
+        self.store.touch()
+
+    def _remember_dm_reply(self, user_id: int, bot_text: str) -> None:
+        events = self._ai_root().setdefault("dm_brain", {}).setdefault("events", [])
+        events.append(
+            {
+                "ts": time.time(),
+                "user_id": int(user_id),
+                "user_name": "",
+                "direction": "outbound",
+                "text": str(bot_text or "")[:500],
+            }
+        )
+        if len(events) > DM_EVENT_MAX_ROWS:
+            del events[: len(events) - DM_EVENT_MAX_ROWS]
         self.store.touch()
 
     def _remember_exchange(self, message: discord.Message, bot_reply: str) -> None:
@@ -1518,6 +1711,11 @@ class AIService:
         shadow = root.setdefault("shadow_brain", {})
         shadow.setdefault("events", [])
         shadow.setdefault("last_plan_text", "")
+        dm = root.setdefault("dm_brain", {})
+        dm.setdefault("events", [])
+        hive = root.setdefault("hive_brain", {})
+        hive.setdefault("notes", [])
+        hive.setdefault("last_sync_ts", 0.0)
         return root
 
     def _extract_json_object(self, raw: str) -> dict[str, Any] | None:

@@ -43,6 +43,7 @@ SEND_BACKOFF_MAX_SEC = 6 * 60 * 60
 SEND_SUPPRESSION_LOG_INTERVAL_SEC = 60
 SEND_ACCESS_PROBE_INTERVAL_SEC = 90
 SEND_RANT_INTERVAL_SEC = 10 * 60
+HIVE_SYNC_INTERVAL_SEC = 4 * 60
 
 
 @dataclass(frozen=True)
@@ -110,7 +111,9 @@ class MandyBot(commands.Bot):
         self._housekeeping_task: asyncio.Task | None = None
         self._shadow_task: asyncio.Task | None = None
         self._send_probe_task: asyncio.Task | None = None
+        self._hive_sync_task: asyncio.Task | None = None
         self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self._ai_pending_dm_reply_tasks: dict[int, asyncio.Task] = {}
         self._send_block_until_by_guild: dict[int, float] = {}
         self._send_failure_count_by_guild: dict[int, int] = {}
         self._send_suppressed_log_ts_by_guild: dict[int, float] = {}
@@ -735,7 +738,27 @@ class MandyBot(commands.Bot):
             self._shadow_task = asyncio.create_task(self._run_shadow_loop(), name="shadow-ai-loop")
         if self._send_probe_task is None or self._send_probe_task.done():
             self._send_probe_task = asyncio.create_task(self._run_send_access_probe_loop(), name="send-access-probe")
+        if self._hive_sync_task is None or self._hive_sync_task.done():
+            self._hive_sync_task = asyncio.create_task(self._run_hive_sync_loop(), name="hive-sync-loop")
         print(f"Connected as {self.user} ({self.user.id if self.user else '?'})")
+
+    async def _run_hive_sync_loop(self) -> None:
+        await asyncio.sleep(35)
+        while True:
+            try:
+                summary = await self.ai.generate_hive_note(admin_guild_id=self.settings.admin_guild_id, reason="periodic")
+                if summary:
+                    admin_guild = self.get_guild(self.settings.admin_guild_id)
+                    if admin_guild and not self._is_send_blocked(admin_guild.id):
+                        try:
+                            await self.shadow.send_council_message(admin_guild, f"Hive sync: {summary}", reason="Hive sync")
+                            self._note_send_success(admin_guild.id)
+                        except (discord.Forbidden, discord.HTTPException) as exc:
+                            self._note_send_failure(admin_guild.id, exc, context="hive.sync")
+                    self.logger.log("hive.sync", guild_id=self.settings.admin_guild_id, chars=len(summary))
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("hive.sync_failed", error=str(exc)[:300])
+            await asyncio.sleep(HIVE_SYNC_INTERVAL_SEC)
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         self.logger.log("guild.joined", guild_id=guild.id, guild_name=guild.name)
@@ -796,6 +819,8 @@ class MandyBot(commands.Bot):
             return
         if isinstance(message.channel, discord.DMChannel):
             await self.dm_bridges.relay_inbound(self, message)
+            self.ai.capture_dm_signal(message)
+            await self._maybe_handle_ai_dm_message(message)
             await self.process_commands(message)
             return
 
@@ -843,6 +868,15 @@ class MandyBot(commands.Bot):
                 if self.soc.can_run(message.author, 50):
                     sent = await self.dm_bridges.relay_outbound(self, message)
                     if sent:
+                        parts = message.channel.name.split("-", 1)
+                        if len(parts) == 2 and parts[1].isdigit():
+                            user_id = int(parts[1])
+                            user = self.get_user(user_id)
+                            self.ai.capture_dm_outbound(
+                                user_id=user_id,
+                                user_name=str(user.name if user else ""),
+                                text=str(message.content or ""),
+                            )
                         await message.add_reaction("\u2705")
 
         await self.process_commands(message)
@@ -937,6 +971,33 @@ class MandyBot(commands.Bot):
                     still_talking=directive.still_talking,
                     delay_sec=delay,
                 )
+
+    async def _maybe_handle_ai_dm_message(self, message: discord.Message) -> None:
+        key = int(message.author.id)
+        existing = self._ai_pending_dm_reply_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+
+        async def worker() -> None:
+            try:
+                await asyncio.sleep(1.2)
+            except asyncio.CancelledError:
+                return
+            try:
+                reply = await self.ai.generate_dm_reply(message)
+                await self._simulate_typing_delay(message.channel)
+                await self._send_split_channel_message(message.channel, reply)
+                self.logger.log("ai.dm_reply", user_id=message.author.id, chars=len(reply))
+            except asyncio.CancelledError:
+                return
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                self.logger.log("ai.dm_reply_failed", user_id=message.author.id, error=str(exc)[:240])
+            finally:
+                current = self._ai_pending_dm_reply_tasks.get(key)
+                if current is asyncio.current_task():
+                    self._ai_pending_dm_reply_tasks.pop(key, None)
+
+        self._ai_pending_dm_reply_tasks[key] = asyncio.create_task(worker(), name=f"ai-dm-reply-{key}")
 
     def _schedule_ai_reply(
         self,

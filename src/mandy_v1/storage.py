@@ -54,6 +54,13 @@ DEFAULT_STORE: dict[str, Any] = {
             "events": [],
             "last_plan_text": "",
         },
+        "dm_brain": {
+            "events": [],
+        },
+        "hive_brain": {
+            "notes": [],
+            "last_sync_ts": 0.0,
+        },
     },
     "shadow_league": {
         "pending_user_ids": [],
