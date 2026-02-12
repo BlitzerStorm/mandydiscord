@@ -49,6 +49,7 @@ DEFAULT_STORE: dict[str, Any] = {
         "auto_vision_model": "",
         "profiles": {},
         "memory_facts": {},
+        "relationships": {},
         "warmup": {},
         "shadow_brain": {
             "events": [],
@@ -66,6 +67,9 @@ DEFAULT_STORE: dict[str, Any] = {
         "pending_user_ids": [],
         "member_user_ids": [],
         "nickname_map": {},
+        "blocked_user_ids": [],
+        "invite_min_affinity": 0.15,
+        "invite_cooldown_sec": 7 * 24 * 60 * 60,
         "ai_enabled": True,
         "loop_interval_sec": 150,
         "max_actions_per_cycle": 3,

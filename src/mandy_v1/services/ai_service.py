@@ -178,6 +178,21 @@ class AIService:
         self._passwords_cache: dict[str, str] | None = None
         self._rng = random.Random()
 
+    def relationship_snapshot(self, user_id: int) -> dict[str, Any]:
+        row = self._relationship_row(user_id)
+        flags = row.get("risk_flags", [])
+        if not isinstance(flags, list):
+            flags = []
+        return {
+            "affinity": float(row.get("affinity", 0.0) or 0.0),
+            "positive_hits": int(row.get("positive_hits", 0) or 0),
+            "negative_hits": int(row.get("negative_hits", 0) or 0),
+            "risk_flags": [str(f)[:40] for f in flags[:8]],
+            "last_seen_ts": float(row.get("last_seen_ts", 0.0) or 0.0),
+            "last_invited_ts": float(row.get("last_invited_ts", 0.0) or 0.0),
+            "invite_count": int(row.get("invite_count", 0) or 0),
+        }
+
     def has_api_key(self) -> bool:
         key, _source = self._resolve_api_key()
         return bool(key)
@@ -272,6 +287,12 @@ class AIService:
         raw = message.clean_content.strip() or "(no text)"
         if message.attachments:
             raw += f" | attachments={len(message.attachments)}"
+        self._note_relationship_signal(
+            user_id=int(message.author.id),
+            user_name=str(message.author.display_name),
+            text=str(message.clean_content or ""),
+            source=f"guild:{int(message.guild.id)}",
+        )
         line = f"{message.author.display_name}: {raw[:240]}"
         self._recent_by_channel[message.channel.id].append(line)
         self._recent_entries_by_channel[message.channel.id].append(
@@ -320,6 +341,12 @@ class AIService:
             return
         if message.attachments:
             text = f"{text} | attachments={len(message.attachments)}".strip()
+        self._note_relationship_signal(
+            user_id=int(message.author.id),
+            user_name=str(message.author.display_name),
+            text=str(message.clean_content or ""),
+            source="dm:inbound",
+        )
         root = self._ai_root()
         dm = root.setdefault("dm_brain", {})
         events = dm.setdefault("events", [])
@@ -344,6 +371,12 @@ class AIService:
         body = " ".join(str(text or "").split())
         if not body:
             return
+        self._note_relationship_signal(
+            user_id=int(user_id),
+            user_name=str(user_name or ""),
+            text=body,
+            source="dm:outbound",
+        )
         events.append(
             {
                 "ts": time.time(),
@@ -540,7 +573,11 @@ class AIService:
             guild_count = len(cell["guild_ids"])
             message_count = int(cell["message_count"])
             recent_hits = int(cell["recent_hits"])
-            score = (recent_hits * 3) + min(message_count, 20) + (guild_count * 2)
+            rel = self.relationship_snapshot(int(cell["user_id"]))
+            affinity = float(rel.get("affinity", 0.0) or 0.0)
+            risk_flags = rel.get("risk_flags", [])
+            risk_penalty = 4 if risk_flags else 0
+            score = (recent_hits * 3) + min(message_count, 20) + (guild_count * 2) + int(affinity * 4) - risk_penalty
             ordered.append(
                 {
                     "user_id": int(cell["user_id"]),
@@ -549,6 +586,8 @@ class AIService:
                     "recent_hits": recent_hits,
                     "guild_count": guild_count,
                     "last_text": str(cell["last_text"])[:140],
+                    "affinity": affinity,
+                    "risk_flags": risk_flags,
                     "score": score,
                 }
             )
@@ -575,10 +614,15 @@ class AIService:
         hive_notes = self.hive_recent_notes(limit=6)
         candidate_lines = []
         for row in candidates[:40]:
+            risk = row.get("risk_flags", [])
+            risk_text = ""
+            if isinstance(risk, list) and risk:
+                risk_text = ",".join(str(x)[:16] for x in risk[:3])
             candidate_lines.append(
                 f"{row.get('user_name','?')} ({row.get('user_id',0)}) "
                 f"score={row.get('score',0)} recent={row.get('recent_hits',0)} "
                 f"messages={row.get('message_count',0)} guilds={row.get('guild_count',0)} "
+                f"affinity={float(row.get('affinity',0.0) or 0.0):.2f} risk={risk_text or 'none'} "
                 f"last={row.get('last_text','')}"
             )
         user_prompt = (
@@ -1053,6 +1097,81 @@ class AIService:
         )
         if len(events) > DM_EVENT_MAX_ROWS:
             del events[: len(events) - DM_EVENT_MAX_ROWS]
+        self.store.touch()
+
+    def _relationships_root(self) -> dict[str, Any]:
+        root = self._ai_root()
+        rel = root.setdefault("relationships", {})
+        if not isinstance(rel, dict):
+            root["relationships"] = {}
+            rel = root["relationships"]
+        return rel
+
+    def _relationship_row(self, user_id: int, user_name: str = "") -> dict[str, Any]:
+        rel = self._relationships_root()
+        key = str(int(user_id))
+        row = rel.get(key)
+        if not isinstance(row, dict):
+            row = {
+                "user_name": str(user_name or "")[:80],
+                "affinity": 0.0,
+                "positive_hits": 0,
+                "negative_hits": 0,
+                "risk_flags": [],
+                "notes": [],
+                "last_seen_ts": 0.0,
+                "last_seen_iso": "",
+                "last_invited_ts": 0.0,
+                "invite_count": 0,
+            }
+            rel[key] = row
+            self.store.touch()
+        if user_name:
+            row["user_name"] = str(user_name)[:80]
+        return row
+
+    def _note_relationship_signal(self, *, user_id: int, user_name: str, text: str, source: str) -> None:
+        if user_id <= 0:
+            return
+        row = self._relationship_row(user_id, user_name=user_name)
+        now = time.time()
+        raw = str(text or "").strip()
+        prev_seen = float(row.get("last_seen_ts", 0.0) or 0.0)
+        if raw:
+            row["last_seen_ts"] = now
+            row["last_seen_iso"] = datetime.now(tz=timezone.utc).isoformat()
+
+        # Small, bounded updates only. This is a gate/ledger, not a transcript.
+        affinity = float(row.get("affinity", 0.0) or 0.0)
+        positives = int(row.get("positive_hits", 0) or 0)
+        negatives = int(row.get("negative_hits", 0) or 0)
+        flags = row.get("risk_flags", [])
+        if not isinstance(flags, list):
+            flags = []
+            row["risk_flags"] = flags
+
+        if raw and self._positive_regex.search(raw):
+            positives += 1
+            affinity = min(5.0, affinity + 0.10)
+        if raw and self._negative_regex.search(raw):
+            negatives += 1
+            affinity = max(-5.0, affinity - 0.15)
+            if "hostile_language" not in flags:
+                flags.append("hostile_language")
+
+        # Mild decay so old negatives don't permanently poison someone.
+        if prev_seen > 0 and (now - prev_seen) > 30 * 86400:
+            affinity *= 0.98
+
+        # If recent behavior trends positive, clear the generic hostility flag.
+        if affinity >= 0.25 and negatives <= max(2, positives):
+            if "hostile_language" in flags:
+                flags.remove("hostile_language")
+
+        row["affinity"] = round(affinity, 3)
+        row["positive_hits"] = positives
+        row["negative_hits"] = negatives
+        row["last_source"] = str(source)[:60]
         self.store.touch()
 
     def _remember_exchange(self, message: discord.Message, bot_reply: str) -> None:
@@ -1707,6 +1826,7 @@ class AIService:
         root.setdefault("auto_vision_model", "")
         root.setdefault("profiles", {})
         root.setdefault("memory_facts", {})
+        root.setdefault("relationships", {})
         root.setdefault("warmup", {})
         shadow = root.setdefault("shadow_brain", {})
         shadow.setdefault("events", [])

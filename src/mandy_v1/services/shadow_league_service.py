@@ -26,6 +26,9 @@ class ShadowLeagueService:
         node.setdefault("pending_user_ids", [])
         node.setdefault("member_user_ids", [])
         node.setdefault("nickname_map", {})
+        node.setdefault("blocked_user_ids", [])
+        node.setdefault("invite_min_affinity", 0.15)
+        node.setdefault("invite_cooldown_sec", 7 * 24 * 60 * 60)
         node.setdefault("ai_enabled", True)
         node.setdefault("loop_interval_sec", 150)
         node.setdefault("max_actions_per_cycle", 3)
@@ -63,6 +66,74 @@ class ShadowLeagueService:
             if value > 0:
                 out.add(value)
         return out
+
+    def blocked_ids(self) -> set[int]:
+        out: set[int] = set()
+        for raw in self.root().get("blocked_user_ids", []):
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                out.add(value)
+        return out
+
+    def invite_min_affinity(self) -> float:
+        try:
+            value = float(self.root().get("invite_min_affinity", 0.15) or 0.15)
+        except (TypeError, ValueError):
+            value = 0.15
+        return max(-5.0, min(5.0, value))
+
+    def invite_cooldown_sec(self) -> int:
+        try:
+            value = int(self.root().get("invite_cooldown_sec", 7 * 24 * 60 * 60) or (7 * 24 * 60 * 60))
+        except (TypeError, ValueError):
+            value = 7 * 24 * 60 * 60
+        return max(0, min(60 * 60 * 24 * 60, value))
+
+    def _relationship_row(self, user_id: int) -> dict[str, Any]:
+        ai = self.store.data.setdefault("ai", {})
+        rel = ai.setdefault("relationships", {})
+        if not isinstance(rel, dict):
+            ai["relationships"] = {}
+            rel = ai["relationships"]
+        key = str(int(user_id))
+        row = rel.get(key)
+        if not isinstance(row, dict):
+            row = {"affinity": 0.0, "risk_flags": [], "last_invited_ts": 0.0, "invite_count": 0}
+            rel[key] = row
+            self.store.touch()
+        return row
+
+    def can_invite_user(self, user_id: int, *, guild: discord.Guild) -> tuple[bool, str]:
+        uid = int(user_id)
+        if uid <= 0:
+            return False, "invalid user_id"
+        if uid in self._protected_ids(guild):
+            return False, "protected user"
+        if uid in self.blocked_ids():
+            return False, "blocked user"
+        row = self._relationship_row(uid)
+        try:
+            affinity = float(row.get("affinity", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            affinity = 0.0
+        flags = row.get("risk_flags", [])
+        if not isinstance(flags, list):
+            flags = []
+        if flags:
+            return False, f"risk_flags={','.join(str(f)[:20] for f in flags[:3])}"
+        if affinity < self.invite_min_affinity():
+            return False, f"affinity={affinity:.2f} below_min={self.invite_min_affinity():.2f}"
+        try:
+            last_invited = float(row.get("last_invited_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last_invited = 0.0
+        cooldown = self.invite_cooldown_sec()
+        if cooldown > 0 and last_invited > 0 and (time.time() - last_invited) < cooldown:
+            return False, "invite cooldown active"
+        return True, "ok"
 
     async def ensure_structure(self, guild: discord.Guild) -> None:
         role = await self._ensure_role(guild)
@@ -207,7 +278,7 @@ class ShadowLeagueService:
     def snapshot_for_ai(self, guild: discord.Guild) -> dict[str, Any]:
         members = sorted(self.member_ids())
         pending = sorted(self.pending_ids())
-        excluded = sorted(set(members) | set(pending) | self._protected_ids(guild))
+        excluded = sorted(set(members) | set(pending) | self._protected_ids(guild) | self.blocked_ids())
         return {
             "member_count": len(members),
             "pending_count": len(pending),
@@ -237,12 +308,21 @@ class ShadowLeagueService:
                         ok = True
                         detail = "already pending/member"
                     else:
-                        user = bot.get_user(uid)
-                        if user is None:
-                            user = await bot.fetch_user(uid)
-                        invite = await self.send_invite(bot, user)
-                        ok = True
-                        detail = f"invited {uid}: {invite}"
+                        allowed, why = self.can_invite_user(uid, guild=guild)
+                        if not allowed:
+                            ok = False
+                            detail = f"invite gated: {why}"
+                        else:
+                            user = bot.get_user(uid)
+                            if user is None:
+                                user = await bot.fetch_user(uid)
+                            invite = await self.send_invite(bot, user)
+                            rel = self._relationship_row(uid)
+                            rel["last_invited_ts"] = time.time()
+                            rel["invite_count"] = int(rel.get("invite_count", 0) or 0) + 1
+                            self.store.touch()
+                            ok = True
+                            detail = f"invited {uid}: {invite}"
                 elif name == "nickname_user":
                     uid = self._extract_user_id(action)
                     member = guild.get_member(uid) if uid > 0 else None

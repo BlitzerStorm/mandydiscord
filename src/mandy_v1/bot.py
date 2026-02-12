@@ -666,7 +666,21 @@ class MandyBot(commands.Bot):
         await self.shadow.ensure_structure(admin_guild)
         snapshot = self.shadow.snapshot_for_ai(admin_guild)
         excluded = set(snapshot.get("excluded_user_ids", []))
-        candidates = self.ai.shadow_candidate_summaries(excluded_user_ids=excluded, limit=40)
+        candidates = self.ai.shadow_candidate_summaries(excluded_user_ids=excluded, limit=60)
+        min_affinity = self.shadow.invite_min_affinity()
+        filtered: list[dict[str, Any]] = []
+        for row in candidates:
+            try:
+                affinity = float(row.get("affinity", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                affinity = 0.0
+            risk = row.get("risk_flags", [])
+            if isinstance(risk, list) and risk:
+                continue
+            if affinity < min_affinity:
+                continue
+            filtered.append(row)
+        candidates = filtered[:40]
         if not candidates and not self.shadow.pending_ids():
             return
         plan = await self.ai.generate_shadow_plan(
