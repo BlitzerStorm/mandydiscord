@@ -13,6 +13,11 @@ This build is intentionally lean and optimized for reliable v1 operations.
 - Enforces SOC tier-based access with hard GOD bypass.
 - Supports onboarding invites and guest-password access in Admin Hub.
 - Relays user DMs into staff-visible bridge channels and supports outbound relay.
+- In AI chat mode, performs startup memory scan and adaptive live decisioning (ignore/react/reply).
+- In AI chat mode, debounces burst prompts so rapid multi-message asks are merged into fewer smarter replies.
+- In AI chat mode, Mandy can respond without wake-word and can do quick image analysis on image attachments.
+- Before watcher, roast, and AI chat replies, Mandy shows a random typing delay (2-10s).
+- If a Mandy response exceeds Discord text limits, it auto-continues in follow-up messages.
 - Stores runtime state in MessagePack only (no JSON DB, no SQL).
 
 ## 2) v1 architecture
@@ -210,6 +215,7 @@ Mandy records structured runtime events in store and stdout, including:
 - AI mode events
 
 Runtime events are also pushed into debug channels (excluding `mirror.*` events) and into Admin Hub `debug-log` (fallback `diagnostics`).
+AI warmup events include startup scan summaries per satellite (`ai.warmup_*`).
 
 ## 12) Discord permission notes
 
@@ -251,7 +257,7 @@ Guestpass not granting access:
 - No MySQL mode
 - No channel-scope mirror rules (server-scope default provisioning)
 - No persistent reaction mapping storage
-- No heavy autonomous AI layer
+- No uncontrolled full-autonomy AI layer (adaptive AI remains bounded by cooldowns and mode toggles)
 
 ## 15) Quick start checklist
 

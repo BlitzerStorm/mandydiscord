@@ -45,6 +45,10 @@ DEFAULT_STORE: dict[str, Any] = {
         "guild_modes": {},
         "long_term_memory": {},
         "last_api_test": {},
+        "auto_model": "",
+        "auto_vision_model": "",
+        "profiles": {},
+        "warmup": {},
     },
     "ui": {
         "global_menu_message_id": 0,

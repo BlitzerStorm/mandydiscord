@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -74,6 +75,9 @@ class MandyBot(commands.Bot):
         self.ai = AIService(settings, self.store)
         self.started_at = datetime.now(tz=timezone.utc)
         self._autosave_task: asyncio.Task | None = None
+        self._ai_warmup_task: asyncio.Task | None = None
+        self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self._typing_rng = random.Random()
         self._ready_once = False
         self.logger.subscribe(self._on_log_row)
 
@@ -390,6 +394,26 @@ class MandyBot(commands.Bot):
             embed=embed,
         )
 
+    async def _run_ai_startup_scan(self) -> None:
+        self.logger.log("ai.warmup_started", guilds=max(0, len(self.guilds) - 1))
+        for guild in self.guilds:
+            if guild.id == self.settings.admin_guild_id:
+                continue
+            await self._warmup_ai_for_guild(guild)
+        self.logger.log("ai.warmup_finished")
+
+    async def _warmup_ai_for_guild(self, guild: discord.Guild) -> None:
+        try:
+            summary = await self.ai.warmup_guild(guild)
+            self.logger.log(
+                "ai.warmup_guild",
+                guild_id=guild.id,
+                scanned_channels=summary.get("scanned_channels", 0),
+                scanned_messages=summary.get("scanned_messages", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.log("ai.warmup_failed", guild_id=guild.id, error=str(exc)[:300])
+
     async def on_ready(self) -> None:
         if self._ready_once:
             return
@@ -411,6 +435,8 @@ class MandyBot(commands.Bot):
                 await self._ensure_satellite_debug_panel(guild)
             except discord.HTTPException:
                 self.logger.log("mirror.ensure_failed", guild_id=guild.id)
+        if self._ai_warmup_task is None or self._ai_warmup_task.done():
+            self._ai_warmup_task = asyncio.create_task(self._run_ai_startup_scan(), name="ai-startup-scan")
         print(f"Connected as {self.user} ({self.user.id if self.user else '?'})")
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -426,6 +452,7 @@ class MandyBot(commands.Bot):
         try:
             await self.mirrors.ensure_satellite(self, guild)
             await self._ensure_satellite_debug_panel(guild, force_invite_refresh=True)
+            asyncio.create_task(self._warmup_ai_for_guild(guild), name=f"ai-warmup-{guild.id}")
         except discord.HTTPException:
             self.logger.log("guild.join_setup_failed", guild_id=guild.id)
 
@@ -474,13 +501,16 @@ class MandyBot(commands.Bot):
 
         hit = self.watchers.on_message(message)
         if hit:
-            await message.channel.send(hit.response)
+            typing_delay = await self._simulate_typing_delay(message.channel)
+            parts = await self._send_split_channel_message(message.channel, hit.response)
             self.logger.log(
                 "watcher.hit",
                 user_id=hit.user_id,
                 threshold=hit.threshold,
                 count=hit.count,
                 guild_id=message.guild.id if message.guild else 0,
+                typing_delay_sec=typing_delay,
+                parts=parts,
             )
 
         if message.guild and not message.content.startswith(self.settings.command_prefix):
@@ -534,14 +564,163 @@ class MandyBot(commands.Bot):
         if self.ai.is_roast_enabled(guild_id):
             if self.ai.should_roast(message, self.user.id):
                 reply = await self.ai.generate_roast_reply(message)
-                await message.reply(reply, mention_author=False)
-                self.logger.log("ai.roast_reply", guild_id=guild_id, user_id=message.author.id)
+                typing_delay = await self._simulate_typing_delay(message.channel)
+                parts = await self._send_split_reply(message, reply, mention_author=False)
+                self.ai.note_bot_action(message.channel.id, "reply", user_id=message.author.id)
+                self.logger.log(
+                    "ai.roast_reply",
+                    guild_id=guild_id,
+                    user_id=message.author.id,
+                    typing_delay_sec=typing_delay,
+                    parts=parts,
+                )
             return
         if self.ai.is_chat_enabled(guild_id):
-            if self.ai.should_chat(message, self.user.id):
-                reply = await self.ai.generate_chat_reply(message)
-                await message.reply(reply, mention_author=False)
-                self.logger.log("ai.chat_reply", guild_id=guild_id, user_id=message.author.id)
+            directive = self.ai.decide_chat_action(message, self.user.id)
+            if directive.action == "ignore":
+                return
+            if directive.action == "react":
+                emoji = directive.emoji or "\U0001F440"
+                try:
+                    await message.add_reaction(emoji)
+                    self.ai.note_bot_action(message.channel.id, "react")
+                    self.logger.log(
+                        "ai.chat_react",
+                        guild_id=guild_id,
+                        user_id=message.author.id,
+                        emoji=emoji,
+                        reason=directive.reason,
+                    )
+                except discord.HTTPException:
+                    self.logger.log("ai.chat_react_failed", guild_id=guild_id, user_id=message.author.id, emoji=emoji)
+                return
+            if directive.action == "reply":
+                delay = self.ai.reply_delay_seconds(message, reason=directive.reason, still_talking=directive.still_talking)
+                self._schedule_ai_reply(
+                    message,
+                    reason=directive.reason,
+                    still_talking=directive.still_talking,
+                    delay_sec=delay,
+                )
+
+    def _schedule_ai_reply(
+        self,
+        message: discord.Message,
+        *,
+        reason: str,
+        still_talking: bool,
+        delay_sec: float,
+    ) -> None:
+        key = (message.channel.id, message.author.id)
+        existing = self._ai_pending_reply_tasks.get(key)
+        if existing and not existing.done():
+            existing.cancel()
+
+        async def worker() -> None:
+            try:
+                await asyncio.sleep(max(0.4, delay_sec))
+            except asyncio.CancelledError:
+                return
+
+            try:
+                burst = self.ai.user_burst_lines(message.channel.id, message.author.id, limit=6)
+                reply = await self.ai.generate_chat_reply(
+                    message,
+                    reason=reason,
+                    still_talking=still_talking,
+                    burst_lines=burst,
+                )
+                typing_delay = await self._simulate_typing_delay(message.channel)
+                parts = await self._send_split_reply(message, reply, mention_author=False)
+                self.ai.note_bot_action(message.channel.id, "reply", user_id=message.author.id)
+                self.logger.log(
+                    "ai.chat_reply",
+                    guild_id=message.guild.id if message.guild else 0,
+                    user_id=message.author.id,
+                    reason=reason,
+                    still_talking=still_talking,
+                    delay_sec=round(delay_sec, 2),
+                    burst_count=len(burst),
+                    typing_delay_sec=typing_delay,
+                    parts=parts,
+                )
+            except asyncio.CancelledError:
+                return
+            except discord.HTTPException as exc:
+                self.logger.log(
+                    "ai.chat_reply_failed",
+                    guild_id=message.guild.id if message.guild else 0,
+                    user_id=message.author.id,
+                    error=str(exc)[:300],
+                )
+            finally:
+                current = self._ai_pending_reply_tasks.get(key)
+                if current is asyncio.current_task():
+                    self._ai_pending_reply_tasks.pop(key, None)
+
+        task = asyncio.create_task(worker(), name=f"ai-reply-{message.channel.id}-{message.author.id}")
+        self._ai_pending_reply_tasks[key] = task
+        self.logger.log(
+            "ai.chat_reply_scheduled",
+            guild_id=message.guild.id if message.guild else 0,
+            user_id=message.author.id,
+            reason=reason,
+            delay_sec=round(delay_sec, 2),
+        )
+
+    async def _simulate_typing_delay(self, channel: discord.abc.Messageable) -> float:
+        delay = round(self._typing_rng.uniform(2.0, 10.0), 2)
+        try:
+            async with channel.typing():
+                await asyncio.sleep(delay)
+        except (AttributeError, discord.HTTPException):
+            await asyncio.sleep(delay)
+        return delay
+
+    def _split_text_for_discord(self, text: str, limit: int = 1900) -> list[str]:
+        normalized = str(text or "").replace("\r\n", "\n").strip()
+        if not normalized:
+            return ["(no response)"]
+
+        chunks: list[str] = []
+        remaining = normalized
+        while len(remaining) > limit:
+            cut = remaining.rfind("\n\n", 0, limit + 1)
+            if cut < max(1, int(limit * 0.5)):
+                cut = remaining.rfind("\n", 0, limit + 1)
+            if cut < max(1, int(limit * 0.5)):
+                cut = remaining.rfind(" ", 0, limit + 1)
+            if cut <= 0:
+                cut = limit
+            chunk = remaining[:cut].strip()
+            if not chunk:
+                chunk = remaining[:limit]
+                cut = len(chunk)
+            chunks.append(chunk[:limit])
+            remaining = remaining[cut:].strip()
+        if remaining:
+            chunks.append(remaining[:limit])
+        return chunks
+
+    async def _send_split_channel_message(self, channel: discord.abc.Messageable, text: str) -> int:
+        chunks = self._split_text_for_discord(text)
+        for chunk in chunks:
+            await channel.send(chunk)
+        return len(chunks)
+
+    async def _send_split_reply(
+        self,
+        source_message: discord.Message,
+        text: str,
+        *,
+        mention_author: bool = False,
+    ) -> int:
+        chunks = self._split_text_for_discord(text)
+        first, *rest = chunks
+        await source_message.reply(first, mention_author=mention_author)
+        for chunk in rest:
+            await source_message.channel.send(chunk)
+        return len(chunks)
 
     async def _ensure_satellite_debug_panel(self, satellite_guild: discord.Guild, force_invite_refresh: bool = False) -> None:
         if satellite_guild.id == self.settings.admin_guild_id:
@@ -603,6 +782,14 @@ class MandyBot(commands.Bot):
 
         chat_enabled = self.ai.is_chat_enabled(satellite_guild.id)
         roast_enabled = self.ai.is_roast_enabled(satellite_guild.id)
+        warmup = self.ai.warmup_status(satellite_guild.id) or {}
+        warmup_line = "not run"
+        if warmup:
+            warmup_line = (
+                f"channels={int(warmup.get('scanned_channels', 0))} "
+                f"messages={int(warmup.get('scanned_messages', 0))} "
+                f"at {str(warmup.get('ts', ''))[:19]}"
+            )
         last_test = self.store.data.get("ai", {}).get("last_api_test", {})
         last_test_line = "No API test yet."
         if isinstance(last_test, dict) and last_test:
@@ -634,6 +821,7 @@ class MandyBot(commands.Bot):
                 f"AI chat mode: `{chat_enabled}`\n"
                 f"AI roast mode: `{roast_enabled}`\n"
                 f"Alibaba key configured: `{self.ai.has_api_key()}`\n"
+                f"Startup memory scan: {warmup_line}\n"
                 f"Last API test: {last_test_line}"
             )[:1024],
             inline=False,
@@ -836,6 +1024,8 @@ class MandyBot(commands.Bot):
 
         if action == "toggle_ai_mode":
             enabled = self.ai.toggle_chat(satellite_guild_id)
+            if enabled:
+                await self._warmup_ai_for_guild(guild)
             await self._ensure_satellite_debug_panel(guild)
             self.logger.log(
                 "ai.mode_toggled",
