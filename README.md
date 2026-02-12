@@ -21,8 +21,9 @@ This build is intentionally lean and optimized for reliable v1 operations.
 - Before watcher, roast, and AI chat replies, Mandy shows a random typing delay (2-10s).
 - If a Mandy response exceeds Discord text limits, it auto-continues in follow-up messages.
 - Auto-trims debug/log and mirror channels on a schedule so control channels stay readable.
-- Optional autonomy mode can plan and execute admin actions in the Admin Hub without approval.
-- Autonomy can read cross-server context but is write-locked to the Admin Hub guild.
+- Includes a private Shadow League subsystem for invite-only channels in the Admin Hub.
+- Shadow members are restricted to Shadow League visibility; other Admin Hub categories remain hidden.
+- Shadow League runs an autonomous AI loop that evaluates cross-server activity and can send DM invites.
 - Stores runtime state in MessagePack only (no JSON DB, no SQL).
 
 ## 2) v1 architecture
@@ -38,7 +39,7 @@ Core modules:
 - `src/mandy_v1/services/mirror_service.py` satellite provisioning + mirror pipeline
 - `src/mandy_v1/services/watcher_service.py` global watcher counters/triggers
 - `src/mandy_v1/services/ai_service.py` AI chat/roast mode and Alibaba API test
-- `src/mandy_v1/services/autonomy_service.py` autonomous admin planner/executor (write-locked to Admin Hub)
+- `src/mandy_v1/services/shadow_league_service.py` invite-only shadow role/channel management
 - `src/mandy_v1/services/onboarding_service.py` onboarding invites + bypass state
 - `src/mandy_v1/services/dm_bridge_service.py` DM bridge open/relay
 - `src/mandy_v1/services/logger_service.py` structured runtime log sink
@@ -118,6 +119,7 @@ On first successful `on_ready`, Mandy auto-runs Admin Hub layout ensure + satell
 Mandy ensures categories:
 - `WELCOME`
 - `OPERATIONS`
+- `SHADOW LEAGUE`
 - `SATELLITES`
 - `GUEST ACCESS`
 - `ENGINEERING`
@@ -132,6 +134,7 @@ Mandy ensures access roles:
 - `ACCESS:Engineer`
 - `ACCESS:Admin`
 - `ACCESS:SOC`
+- `SHADOW:Associate`
 
 ### Satellite self-setup
 
@@ -172,9 +175,11 @@ Guest password flow:
 
 Satellite debug:
 - `!debugpanel` (tier >= 50; in satellite guilds, refreshes dashboard/menu)
-- `!autonomy` (tier >= 90; status snapshot)
-- `!autonomy status|on|off`
-- `!autonomy run <prompt>` (tier >= 90; force a single autonomy planning/execution pass)
+
+Shadow League:
+- No command trigger required; autonomous loop is always active by default.
+- AI plans actions using shared `AIService` memory/model flow.
+- Current autonomous action set: DM invite candidate, set member nickname, remove member, send council update message.
 
 Global menu:
 - Admin Hub `menu` channel includes the full control panel and satellite entry menu
@@ -268,7 +273,7 @@ Guestpass not granting access:
 - No MySQL mode
 - No channel-scope mirror rules (server-scope default provisioning)
 - No persistent reaction mapping storage
-- No write access outside `ADMIN_GUILD_ID` for autonomy actions
+- Shadow access is constrained to Admin Hub role/category permissions
 
 ## 15) Quick start checklist
 

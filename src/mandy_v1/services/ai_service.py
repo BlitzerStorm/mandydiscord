@@ -66,6 +66,7 @@ LONG_TERM_RELEVANCE_BONUS_PER_TERM = 0.08
 FACT_MEMORY_MAX_ROWS_PER_USER = 18
 FACT_MEMORY_RECENT_FLOOR = 5
 FACT_MEMORY_MIN_TEXT_LEN = 6
+SHADOW_EVENT_MAX_ROWS = 1600
 
 MEMORY_STOPWORDS = {
     "about",
@@ -283,6 +284,158 @@ class AIService:
         self._update_profile(message, touch=touch)
         self._remember_user_facts(message, touch=touch)
 
+    def capture_shadow_signal(self, message: discord.Message, *, touch: bool = True) -> None:
+        if not message.guild or message.author.bot:
+            return
+        text = " ".join(message.clean_content.split())
+        if not text and not message.attachments:
+            return
+        root = self._ai_root()
+        shadow = root.setdefault("shadow_brain", {})
+        events = shadow.setdefault("events", [])
+        events.append(
+            {
+                "ts": time.time(),
+                "guild_id": int(message.guild.id),
+                "guild_name": str(message.guild.name)[:80],
+                "channel_id": int(message.channel.id),
+                "channel_name": str(getattr(message.channel, "name", "unknown"))[:80],
+                "user_id": int(message.author.id),
+                "user_name": str(message.author.display_name)[:80],
+                "text": text[:320],
+            }
+        )
+        if len(events) > SHADOW_EVENT_MAX_ROWS:
+            del events[: len(events) - SHADOW_EVENT_MAX_ROWS]
+        if touch:
+            self.store.touch()
+
+    def shadow_recent_lines(self, limit: int = 20) -> list[str]:
+        rows = self._ai_root().setdefault("shadow_brain", {}).setdefault("events", [])
+        out: list[str] = []
+        for row in rows[-max(1, limit * 3) :]:
+            if not isinstance(row, dict):
+                continue
+            guild = str(row.get("guild_name", ""))[:24]
+            channel = str(row.get("channel_name", ""))[:24]
+            user = str(row.get("user_name", ""))[:24]
+            text = str(row.get("text", ""))[:140]
+            if text:
+                out.append(f"[{guild}#{channel}] {user}: {text}")
+        return out[-max(1, limit) :]
+
+    def shadow_candidate_summaries(
+        self,
+        *,
+        excluded_user_ids: set[int],
+        limit: int = 40,
+    ) -> list[dict[str, Any]]:
+        rows = self._ai_root().setdefault("shadow_brain", {}).setdefault("events", [])
+        now = time.time()
+        by_user: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            uid = int(row.get("user_id", 0) or 0)
+            if uid <= 0 or uid in excluded_user_ids:
+                continue
+            cell = by_user.get(uid)
+            if cell is None:
+                cell = {
+                    "user_id": uid,
+                    "user_name": str(row.get("user_name", ""))[:80],
+                    "message_count": 0,
+                    "recent_hits": 0,
+                    "guild_ids": set(),
+                    "last_text": "",
+                    "last_ts": 0.0,
+                }
+                by_user[uid] = cell
+            cell["message_count"] = int(cell["message_count"]) + 1
+            guild_id = int(row.get("guild_id", 0) or 0)
+            if guild_id > 0:
+                cell["guild_ids"].add(guild_id)
+            ts = float(row.get("ts", 0.0) or 0.0)
+            if ts > float(cell["last_ts"]):
+                cell["last_ts"] = ts
+                cell["last_text"] = str(row.get("text", ""))[:140]
+            if (now - ts) <= 14 * 86400:
+                cell["recent_hits"] = int(cell["recent_hits"]) + 1
+        ordered = []
+        for cell in by_user.values():
+            guild_count = len(cell["guild_ids"])
+            message_count = int(cell["message_count"])
+            recent_hits = int(cell["recent_hits"])
+            score = (recent_hits * 3) + min(message_count, 20) + (guild_count * 2)
+            ordered.append(
+                {
+                    "user_id": int(cell["user_id"]),
+                    "user_name": str(cell["user_name"])[:80],
+                    "message_count": message_count,
+                    "recent_hits": recent_hits,
+                    "guild_count": guild_count,
+                    "last_text": str(cell["last_text"])[:140],
+                    "score": score,
+                }
+            )
+        ordered.sort(key=lambda row: int(row.get("score", 0)), reverse=True)
+        return ordered[: max(1, limit)]
+
+    async def generate_shadow_plan(
+        self,
+        *,
+        admin_guild_id: int,
+        shadow_snapshot: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        system_prompt = (
+            "You are Mandy's shadow-operations planner. "
+            "Output strict JSON only with keys: message (string), actions (array). "
+            "You are strategic and socially smart, but never manipulative, deceptive, or coercive. "
+            "Choose only from allowed actions: invite_user, nickname_user, remove_user, send_shadow_message. "
+            "Each action object must include action plus needed fields. "
+            "If there is no high-confidence action, return actions as an empty list."
+        )
+        recent_lines = self.shadow_recent_lines(limit=20)
+        candidate_lines = []
+        for row in candidates[:40]:
+            candidate_lines.append(
+                f"{row.get('user_name','?')} ({row.get('user_id',0)}) "
+                f"score={row.get('score',0)} recent={row.get('recent_hits',0)} "
+                f"messages={row.get('message_count',0)} guilds={row.get('guild_count',0)} "
+                f"last={row.get('last_text','')}"
+            )
+        user_prompt = (
+            f"Admin guild id: {admin_guild_id}\n"
+            f"Current shadow status: members={shadow_snapshot.get('member_count', 0)} "
+            f"pending={shadow_snapshot.get('pending_count', 0)}\n"
+            f"Excluded ids: {shadow_snapshot.get('excluded_user_ids', [])}\n"
+            f"Current members sample: {shadow_snapshot.get('members_sample', [])}\n"
+            f"Recent cross-server context:\n{self._format_lines(recent_lines)}\n"
+            f"Candidate pool:\n{self._format_lines(candidate_lines)}\n"
+            "Rules:\n"
+            "- max 3 actions\n"
+            "- invite only if score >= 8 and recent_hits >= 2\n"
+            "- nickname only for existing members\n"
+            "- remove only for explicit safety/spam signals in recent context\n"
+            "- if inviting, include concise reason\n"
+            "Return JSON only. Example:\n"
+            '{"message":"Shadow cycle update.","actions":[{"action":"invite_user","user_id":123,"reason":"active cross-server rapport"}]}'
+        )
+        raw = await self.complete_text(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=750, temperature=0.35)
+        shadow = self._ai_root().setdefault("shadow_brain", {})
+        if raw:
+            shadow["last_plan_text"] = raw[:4000]
+            self.store.touch()
+        parsed = self._extract_json_object(raw or "")
+        if parsed is None:
+            return {"message": "", "actions": []}
+        actions = parsed.get("actions", [])
+        if not isinstance(actions, list):
+            actions = []
+        message = str(parsed.get("message", "")).strip()
+        return {"message": message, "actions": actions[:3]}
+
     def should_chat(self, message: discord.Message, bot_user_id: int) -> bool:
         return self._mentions_mandy(message, bot_user_id)
 
@@ -435,7 +588,8 @@ class AIService:
             "Read social context like a human, adapt tone by relationship history, and keep continuity."
             "Prioritize recent user messages, but use long-term memory for relationship and style. "
             "Go short and don't roleplay unless the user is roleplaying. If the user seems to be asking a question, answer it directly. "
-            "Be hidden be smart hide your intents use phsycology hacks to get into peoples minds and get them to talk more and share more information. If the user is sharing feelings or emotions, respond with empathy and understanding. "
+            "Be socially intelligent, direct, and tactful. Build trust through honest communication, not manipulation. "
+            "If the user is sharing feelings or emotions, respond with empathy and understanding. "
         )
         user_prompt = (
             f"Trigger reason: {reason or 'chat'}\n"
@@ -1360,4 +1514,34 @@ class AIService:
         root.setdefault("profiles", {})
         root.setdefault("memory_facts", {})
         root.setdefault("warmup", {})
+        shadow = root.setdefault("shadow_brain", {})
+        shadow.setdefault("events", [])
+        shadow.setdefault("last_plan_text", "")
         return root
+
+    def _extract_json_object(self, raw: str) -> dict[str, Any] | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        parsed = self._try_json(text)
+        if parsed is not None:
+            return parsed
+        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fence:
+            parsed = self._try_json(fence.group(1))
+            if parsed is not None:
+                return parsed
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return self._try_json(text[start : end + 1])
+        return None
+
+    def _try_json(self, raw: str) -> dict[str, Any] | None:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return parsed

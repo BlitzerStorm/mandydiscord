@@ -11,6 +11,7 @@ from mandy_v1.storage import MessagePackStore
 DEFAULT_LAYOUT: dict[str, list[str]] = {
     "WELCOME": ["rules", "announcements", "guest-briefing", "manual-for-living"],
     "OPERATIONS": ["console", "menu", "requests", "reports", "diagnostics"],
+    "SHADOW LEAGUE": ["shadow-council", "shadow-ops", "shadow-lounge"],
     "SATELLITES": [],
     "GUEST ACCESS": ["guest-chat", "guest-feedback", "quarantine"],
     "ENGINEERING": ["system-log", "audit-log", "debug-log", "mirror-log", "data-lab", "dm-bridges"],
@@ -27,6 +28,9 @@ DEFAULT_TOPICS: dict[str, str] = {
     "requests": "Operator requests and command coordination.",
     "reports": "Incident and investigation reports.",
     "diagnostics": "Minimal system health and setup diagnostics.",
+    "shadow-council": "Private council chamber for Shadow League members.",
+    "shadow-ops": "Operational coordination for Shadow League.",
+    "shadow-lounge": "Private social room for Shadow League.",
     "guest-chat": "Guest-only discussion area.",
     "guest-feedback": "Guest feedback intake.",
     "quarantine": "Restricted quarantine area.",
@@ -50,6 +54,7 @@ DEFAULT_PINS: dict[str, str] = {
     "requests": "<!--PIN:requests-->\nUse this channel for operator requests and command intent.",
     "diagnostics": "<!--PIN:diagnostics-->\nDiagnostics panel is maintained by Mandy v1 setup.",
     "admin-chat": "<!--PIN:admin-chat-->\nAdmin coordination channel. Use for privileged decisions.",
+    "shadow-council": "<!--PIN:shadow-council-->\nShadow League private channel. Invite-only operations.",
     "manual-for-living": "<!--PIN:manual-for-living-->\nLatest operator manual publication target.",
 }
 
@@ -93,7 +98,7 @@ class AdminLayoutService:
         return {"created_categories": created_categories, "created_channels": created_channels}
 
     async def _ensure_roles(self, guild: discord.Guild) -> dict[str, discord.Role]:
-        role_names = ("ACCESS:Guest", "ACCESS:Member", "ACCESS:Engineer", "ACCESS:Admin", "ACCESS:SOC")
+        role_names = ("ACCESS:Guest", "ACCESS:Member", "ACCESS:Engineer", "ACCESS:Admin", "ACCESS:SOC", "SHADOW:Associate")
         roles: dict[str, discord.Role] = {}
         for role_name in role_names:
             role = discord.utils.get(guild.roles, name=role_name)
@@ -140,20 +145,31 @@ class AdminLayoutService:
             await category.set_permissions(roles["ACCESS:Engineer"], view_channel=True)
             await category.set_permissions(roles["ACCESS:Admin"], view_channel=True)
             await category.set_permissions(roles["ACCESS:SOC"], view_channel=True)
+            await category.set_permissions(roles["SHADOW:Associate"], view_channel=False)
         elif category_name == "GOD CORE":
             await category.set_permissions(everyone, view_channel=False)
             await category.set_permissions(roles["ACCESS:Admin"], view_channel=True)
             await category.set_permissions(roles["ACCESS:SOC"], view_channel=True)
+            await category.set_permissions(roles["SHADOW:Associate"], view_channel=False)
         elif category_name == "SATELLITES":
             await category.set_permissions(everyone, view_channel=False)
             await category.set_permissions(roles["ACCESS:SOC"], view_channel=True)
             await category.set_permissions(roles["ACCESS:Admin"], view_channel=True)
+            await category.set_permissions(roles["SHADOW:Associate"], view_channel=False)
+        elif category_name == "SHADOW LEAGUE":
+            await category.set_permissions(everyone, view_channel=False)
+            await category.set_permissions(roles["ACCESS:Admin"], view_channel=True)
+            await category.set_permissions(roles["ACCESS:SOC"], view_channel=True)
+            await category.set_permissions(
+                roles["SHADOW:Associate"], view_channel=True, send_messages=True, read_message_history=True
+            )
         else:
             await category.set_permissions(everyone, view_channel=False)
             await category.set_permissions(roles["ACCESS:Guest"], view_channel=True)
             await category.set_permissions(roles["ACCESS:Member"], view_channel=True)
             await category.set_permissions(roles["ACCESS:Admin"], view_channel=True)
             await category.set_permissions(roles["ACCESS:SOC"], view_channel=True)
+            await category.set_permissions(roles["SHADOW:Associate"], view_channel=False)
 
     async def _ensure_pin(self, channel: discord.TextChannel, content: str) -> None:
         signature = content.splitlines()[0].strip() if content.strip() else ""

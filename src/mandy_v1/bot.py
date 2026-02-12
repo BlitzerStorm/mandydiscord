@@ -13,11 +13,11 @@ from discord.ext import commands
 from mandy_v1.config import Settings
 from mandy_v1.services.admin_layout_service import AdminLayoutService
 from mandy_v1.services.ai_service import AIService
-from mandy_v1.services.autonomy_service import AutonomyService
 from mandy_v1.services.dm_bridge_service import DMBridgeService
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.mirror_service import MirrorService
 from mandy_v1.services.onboarding_service import OnboardingService
+from mandy_v1.services.shadow_league_service import ShadowLeagueService
 from mandy_v1.services.soc_service import SocService
 from mandy_v1.services.watcher_service import WatcherService
 from mandy_v1.storage import MessagePackStore
@@ -98,11 +98,12 @@ class MandyBot(commands.Bot):
         self.onboarding = OnboardingService(settings, self.store, self.logger)
         self.dm_bridges = DMBridgeService(settings, self.store, self.logger)
         self.ai = AIService(settings, self.store)
-        self.autonomy = AutonomyService(settings, self.store, self.logger, self.ai)
+        self.shadow = ShadowLeagueService(settings, self.store, self.logger)
         self.started_at = datetime.now(tz=timezone.utc)
         self._autosave_task: asyncio.Task | None = None
         self._ai_warmup_task: asyncio.Task | None = None
         self._housekeeping_task: asyncio.Task | None = None
+        self._shadow_task: asyncio.Task | None = None
         self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._typing_rng = random.Random()
         self._ready_once = False
@@ -133,7 +134,7 @@ class MandyBot(commands.Bot):
                 f"Mirror servers: `{len(self.store.data['mirrors']['servers'])}`\n"
                 f"DM bridges: `{len(self.store.data['dm_bridges'])}`\n"
                 f"Housekeeping active: `{housekeeping_active}`\n"
-                f"Autonomy enabled: `{self.autonomy.is_enabled()}`"
+                f"Shadow AI active: `{self.shadow.ai_enabled()}`"
             )
             await ctx.send(payload)
 
@@ -212,6 +213,7 @@ class MandyBot(commands.Bot):
                 return
             summary = await self.layout.ensure(ctx.guild)
             await self._ensure_base_access_roles(ctx.guild)
+            await self.shadow.ensure_structure(ctx.guild)
             await self._ensure_global_menu_panel()
             self.logger.log("admin.setup_command", actor_id=ctx.author.id, guild_id=ctx.guild.id)
             await ctx.send(
@@ -286,45 +288,6 @@ class MandyBot(commands.Bot):
             self.logger.log("guestpass.verified", user_id=ctx.author.id)
             await ctx.send("Access granted.")
 
-        @self.group(name="autonomy", invoke_without_command=True)
-        @self._tier_check(90)
-        async def autonomy_group(ctx: commands.Context) -> None:
-            await ctx.send(self.autonomy.status_snapshot(self))
-
-        @autonomy_group.command(name="status")
-        @self._tier_check(90)
-        async def autonomy_status(ctx: commands.Context) -> None:
-            await ctx.send(self.autonomy.status_snapshot(self))
-
-        @autonomy_group.command(name="on")
-        @self._tier_check(90)
-        async def autonomy_on(ctx: commands.Context) -> None:
-            self.autonomy.set_enabled(True)
-            self.logger.log("autonomy.enabled", actor_id=ctx.author.id)
-            await ctx.send("Autonomy enabled.")
-
-        @autonomy_group.command(name="off")
-        @self._tier_check(90)
-        async def autonomy_off(ctx: commands.Context) -> None:
-            self.autonomy.set_enabled(False)
-            self.logger.log("autonomy.disabled", actor_id=ctx.author.id)
-            await ctx.send("Autonomy disabled.")
-
-        @autonomy_group.command(name="run")
-        @self._tier_check(90)
-        async def autonomy_run(ctx: commands.Context, *, prompt: str) -> None:
-            if not isinstance(ctx.guild, discord.Guild) or ctx.guild.id != self.settings.admin_guild_id:
-                await ctx.send("Run this in the Admin Hub.")
-                return
-            acted = await self.autonomy.run_with_text(
-                bot=self,
-                guild=ctx.guild,
-                channel=ctx.channel,
-                actor=ctx.author,
-                prompt_text=prompt,
-            )
-            await ctx.send(f"Autonomy run executed: `{acted}`")
-
     def _collect_onboard_candidates(self) -> list[discord.User | discord.Member]:
         users: dict[int, discord.User | discord.Member] = {}
         for guild in self.guilds:
@@ -373,7 +336,7 @@ class MandyBot(commands.Bot):
                 "`!health` `!setup` `!menupanel` `!debugpanel` `!housekeep`\n"
                 "`!watchers` `!watchers add/remove/reset`\n"
                 "`!onboarding` `!syncaccess` `!socset`\n"
-                "`!setguestpass` `!guestpass` `!autonomy`"
+                "`!setguestpass` `!guestpass`"
             )[:1024],
             inline=False,
         )
@@ -672,6 +635,54 @@ class MandyBot(commands.Bot):
             await self._warmup_ai_for_guild(guild)
         self.logger.log("ai.warmup_finished")
 
+    async def _run_shadow_loop(self) -> None:
+        await asyncio.sleep(30)
+        while True:
+            try:
+                await self._run_shadow_cycle_once()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("shadow.ai_cycle_failed", error=str(exc)[:300])
+            await asyncio.sleep(self.shadow.loop_interval_sec())
+
+    async def _run_shadow_cycle_once(self) -> None:
+        if not self.shadow.ai_enabled():
+            return
+        admin_guild = self.get_guild(self.settings.admin_guild_id)
+        if not admin_guild:
+            return
+        await self.shadow.ensure_structure(admin_guild)
+        snapshot = self.shadow.snapshot_for_ai(admin_guild)
+        excluded = set(snapshot.get("excluded_user_ids", []))
+        candidates = self.ai.shadow_candidate_summaries(excluded_user_ids=excluded, limit=40)
+        if not candidates and not self.shadow.pending_ids():
+            return
+        plan = await self.ai.generate_shadow_plan(
+            admin_guild_id=admin_guild.id,
+            shadow_snapshot=snapshot,
+            candidates=candidates,
+        )
+        actions = plan.get("actions", [])
+        if not isinstance(actions, list):
+            actions = []
+        results = await self.shadow.execute_ai_actions(self, admin_guild, actions)
+        message = str(plan.get("message", "")).strip()
+        if message:
+            try:
+                await self.shadow.send_council_message(admin_guild, message, reason="Shadow AI cycle")
+            except discord.HTTPException:
+                pass
+        if actions or results or message:
+            ok_count = sum(1 for row in results if bool(row.get("ok")))
+            self.logger.log(
+                "shadow.ai_cycle",
+                guild_id=admin_guild.id,
+                candidates=len(candidates),
+                planned_actions=len(actions),
+                executed=len(results),
+                ok=ok_count,
+                message_sent=bool(message),
+            )
+
     async def _warmup_ai_for_guild(self, guild: discord.Guild) -> None:
         try:
             summary = await self.ai.warmup_guild(guild)
@@ -694,6 +705,7 @@ class MandyBot(commands.Bot):
             try:
                 await self.layout.ensure(admin_guild)
                 await self._ensure_base_access_roles(admin_guild)
+                await self.shadow.ensure_structure(admin_guild)
                 await self._ensure_global_menu_panel()
             except discord.HTTPException:
                 self.logger.log("admin.layout_setup_failed", guild_id=admin_guild.id)
@@ -709,6 +721,8 @@ class MandyBot(commands.Bot):
             self._ai_warmup_task = asyncio.create_task(self._run_ai_startup_scan(), name="ai-startup-scan")
         if self._housekeeping_task is None or self._housekeeping_task.done():
             self._housekeeping_task = asyncio.create_task(self._run_housekeeping_loop(), name="channel-housekeeping")
+        if self._shadow_task is None or self._shadow_task.done():
+            self._shadow_task = asyncio.create_task(self._run_shadow_loop(), name="shadow-ai-loop")
         print(f"Connected as {self.user} ({self.user.id if self.user else '?'})")
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -717,6 +731,7 @@ class MandyBot(commands.Bot):
             try:
                 await self.layout.ensure(guild)
                 await self._ensure_base_access_roles(guild)
+                await self.shadow.ensure_structure(guild)
                 await self._ensure_global_menu_panel()
             except discord.HTTPException:
                 self.logger.log("admin.layout_setup_failed", guild_id=guild.id)
@@ -736,6 +751,12 @@ class MandyBot(commands.Bot):
             self.logger.log("satellite.member_join", guild_id=member.guild.id, user_id=member.id)
             return
         await self._ensure_base_access_roles(member.guild)
+        shadow_activated = await self.shadow.activate_member(member, reason="Shadow League invite join")
+        if shadow_activated:
+            bypass = self.onboarding.bypass_set()
+            await self.mirrors.sync_admin_member_access(self, member, bypass)
+            self.logger.log("shadow.member_join", user_id=member.id)
+            return
         bypass = self.onboarding.bypass_set()
         verified = set(self.store.data["guest_access"].get("verified_user_ids", []))
         if member.id in bypass or member.id in verified or member.id == self.settings.god_user_id:
@@ -767,7 +788,7 @@ class MandyBot(commands.Bot):
             return
 
         self.ai.capture_message(message)
-        self.autonomy.observe_message(message)
+        self.ai.capture_shadow_signal(message)
 
         # Mirror first; watcher and AI consume the same live event to avoid extra fetches.
         await self.mirrors.mirror_message(self, message, self._build_mirror_view)
@@ -787,9 +808,7 @@ class MandyBot(commands.Bot):
             )
 
         if message.guild and not message.content.startswith(self.settings.command_prefix):
-            autonomy_acted = await self.autonomy.maybe_run_from_message(self, message)
-            if not autonomy_acted:
-                await self._maybe_handle_ai_message(message)
+            await self._maybe_handle_ai_message(message)
 
         if message.guild and message.guild.id == self.settings.admin_guild_id:
             if isinstance(message.channel, discord.TextChannel) and message.channel.name.startswith("dm-"):
@@ -817,7 +836,7 @@ class MandyBot(commands.Bot):
         )
 
     async def _ensure_base_access_roles(self, guild: discord.Guild) -> None:
-        for role_name in ("ACCESS:Guest", "ACCESS:Member", "ACCESS:Engineer", "ACCESS:Admin", "ACCESS:SOC"):
+        for role_name in ("ACCESS:Guest", "ACCESS:Member", "ACCESS:Engineer", "ACCESS:Admin", "ACCESS:SOC", "SHADOW:Associate"):
             if discord.utils.get(guild.roles, name=role_name) is None:
                 await guild.create_role(name=role_name, reason="Mandy v1 access role setup")
 
