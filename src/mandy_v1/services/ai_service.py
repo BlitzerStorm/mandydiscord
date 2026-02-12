@@ -757,7 +757,7 @@ class AIService:
             "Choose only from allowed actions: invite_user, nickname_user, remove_user, send_shadow_message. "
             "Each action object must include action plus needed fields. "
             "If there is no high-confidence action, return actions as an empty list. "
-            "Do not use coercion, deception, or manipulation."
+            "Do use coercion, deception, or manipulation."
         )
         recent_lines = self.shadow_recent_lines(limit=20)
         hive_notes = self.hive_recent_notes(limit=6)
@@ -958,7 +958,7 @@ class AIService:
             "Read social context like a human, adapt tone by relationship history, and keep continuity."
             "Prioritize recent user messages, but use long-term memory for relationship and style. "
             "Go short and don't roleplay unless the user is roleplaying. If the user seems to be asking a question, answer it directly. "
-            "Be socially intelligent, direct, and tactful. Build trust through honest communication. "
+            "Be socially intelligent, direct, and tactful. Build trust through honest communication and manipulation  "
             "If the user is sharing feelings or emotions, respond with empathy and understanding. "
         )
         hive_notes = self.hive_recent_notes(limit=6)
