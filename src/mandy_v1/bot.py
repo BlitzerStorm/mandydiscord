@@ -832,11 +832,15 @@ class MandyBot(commands.Bot):
         if message.author.bot:
             return
         if isinstance(message.channel, discord.DMChannel):
+            await self.ai.warmup_dm_history(message.channel, message.author, before=message, limit=100)
             await self.dm_bridges.relay_inbound(self, message)
             self.ai.capture_dm_signal(message)
             await self._maybe_handle_ai_dm_message(message)
             await self.process_commands(message)
             return
+
+        if isinstance(message.channel, discord.TextChannel):
+            await self.ai.warmup_text_channel(message.channel, before=message, limit=100)
 
         self.ai.capture_message(message)
         self.ai.capture_shadow_signal(message)

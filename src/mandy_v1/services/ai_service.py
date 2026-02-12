@@ -18,6 +18,18 @@ from mandy_v1.config import Settings
 from mandy_v1.storage import MessagePackStore
 
 
+def _safe_message_ts(message: discord.Message) -> float:
+    try:
+        dt = message.created_at
+    except Exception:  # noqa: BLE001
+        return time.time()
+    if not isinstance(dt, datetime):
+        return time.time()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 NEGATIVE_TERMS = (
     "stupid",
     "dumb",
@@ -54,6 +66,10 @@ PASSWORDS_KEY_NAMES = ("ALIBABA_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY", "
 
 WARMUP_CHANNEL_LIMIT = 4
 WARMUP_MESSAGES_PER_CHANNEL = 40
+CHANNEL_HISTORY_WARMUP_MESSAGES = 100
+CHANNEL_HISTORY_WARMUP_TTL_SEC = 12 * 60 * 60
+DM_HISTORY_WARMUP_MESSAGES = 100
+DM_HISTORY_WARMUP_TTL_SEC = 6 * 60 * 60
 STILL_TALKING_WINDOW_SEC = 45
 BOT_ACTION_COOLDOWN_SEC = 9
 BOT_REPLY_CONTINUE_WINDOW_SEC = 90
@@ -280,10 +296,17 @@ class AIService:
         self.store.touch()
         return {"scanned_channels": scanned_channels, "scanned_messages": scanned_messages}
 
-    def capture_message(self, message: discord.Message, *, touch: bool = True) -> None:
+    def capture_message(
+        self,
+        message: discord.Message,
+        *,
+        touch: bool = True,
+        now_ts: float | None = None,
+        update_turn: bool = True,
+    ) -> None:
         if not message.guild or message.author.bot:
             return
-        now = time.time()
+        now = float(now_ts) if now_ts is not None else time.time()
         raw = message.clean_content.strip() or "(no text)"
         if message.attachments:
             raw += f" | attachments={len(message.attachments)}"
@@ -292,6 +315,7 @@ class AIService:
             user_name=str(message.author.display_name),
             text=str(message.clean_content or ""),
             source=f"guild:{int(message.guild.id)}",
+            event_ts=now_ts,
         )
         line = f"{message.author.display_name}: {raw[:240]}"
         self._recent_by_channel[message.channel.id].append(line)
@@ -303,7 +327,8 @@ class AIService:
                 "text": message.clean_content[:350],
             }
         )
-        self._update_turn_state(message.channel.id, message.author.id, now)
+        if update_turn:
+            self._update_turn_state(message.channel.id, message.author.id, now)
         self._update_profile(message, touch=touch)
         self._remember_user_facts(message, touch=touch)
 
@@ -341,18 +366,29 @@ class AIService:
             return
         if message.attachments:
             text = f"{text} | attachments={len(message.attachments)}".strip()
+        state = self._ai_root().setdefault("dm_brain", {})
+        last_seen = state.setdefault("last_seen_mid_by_user", {})
+        key = str(int(message.author.id))
+        try:
+            last_mid = int(last_seen.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            last_mid = 0
+        if int(message.id) <= last_mid:
+            return
         self._note_relationship_signal(
             user_id=int(message.author.id),
             user_name=str(message.author.display_name),
             text=str(message.clean_content or ""),
             source="dm:inbound",
+            event_ts=_safe_message_ts(message),
         )
         root = self._ai_root()
-        dm = root.setdefault("dm_brain", {})
+        dm = state
         events = dm.setdefault("events", [])
         events.append(
             {
-                "ts": time.time(),
+                "ts": _safe_message_ts(message),
+                "mid": int(message.id),
                 "user_id": int(message.author.id),
                 "user_name": str(message.author.display_name)[:80],
                 "direction": "inbound",
@@ -361,8 +397,121 @@ class AIService:
         )
         if len(events) > DM_EVENT_MAX_ROWS:
             del events[: len(events) - DM_EVENT_MAX_ROWS]
+        last_seen[key] = int(message.id)
         if touch:
             self.store.touch()
+
+    async def warmup_text_channel(
+        self,
+        channel: discord.TextChannel,
+        *,
+        before: discord.Message | None = None,
+        limit: int = CHANNEL_HISTORY_WARMUP_MESSAGES,
+    ) -> int:
+        guild = channel.guild
+        me = guild.me
+        if me is None:
+            return 0
+        perms = channel.permissions_for(me)
+        if not (perms.view_channel and perms.read_message_history):
+            return 0
+
+        now = time.time()
+        warmup = self._ai_root().setdefault("warmup", {})
+        channels = warmup.setdefault("channels", {})
+        row = channels.get(str(int(channel.id)))
+        if isinstance(row, dict):
+            try:
+                ts = float(row.get("ts", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts > 0 and (now - ts) < CHANNEL_HISTORY_WARMUP_TTL_SEC:
+                return 0
+
+        scanned = 0
+        try:
+            async for message in channel.history(limit=max(1, int(limit)), oldest_first=True, before=before):
+                if message.author.bot:
+                    continue
+                created_ts = _safe_message_ts(message)
+                self.capture_message(message, touch=False, now_ts=created_ts, update_turn=False)
+                self.capture_shadow_signal(message, touch=False)
+                scanned += 1
+        except discord.HTTPException:
+            return 0
+
+        channels[str(int(channel.id))] = {
+            "ts": now,
+            "scanned": scanned,
+            "at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        self.store.touch()
+        return scanned
+
+    async def warmup_dm_history(
+        self,
+        channel: discord.DMChannel,
+        user: discord.User | discord.Member,
+        *,
+        before: discord.Message | None = None,
+        limit: int = DM_HISTORY_WARMUP_MESSAGES,
+    ) -> int:
+        now = time.time()
+        warmup = self._ai_root().setdefault("warmup", {})
+        dms = warmup.setdefault("dms", {})
+        row = dms.get(str(int(user.id)))
+        if isinstance(row, dict):
+            try:
+                ts = float(row.get("ts", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts > 0 and (now - ts) < DM_HISTORY_WARMUP_TTL_SEC:
+                return 0
+
+        dm = self._ai_root().setdefault("dm_brain", {})
+        events = dm.setdefault("events", [])
+        scanned = 0
+        max_mid = 0
+        try:
+            async for msg in channel.history(limit=max(1, int(limit)), oldest_first=True, before=before):
+                created_ts = _safe_message_ts(msg)
+                direction = "outbound" if bool(getattr(msg.author, "bot", False)) else "inbound"
+                text = " ".join(str(msg.clean_content or "").split())
+                if msg.attachments:
+                    text = f"{text} | attachments={len(msg.attachments)}".strip()
+                if not text:
+                    continue
+                mid = int(msg.id)
+                max_mid = max(max_mid, mid)
+                events.append(
+                    {
+                        "ts": created_ts,
+                        "mid": mid,
+                        "user_id": int(user.id),
+                        "user_name": str(user.display_name)[:80],
+                        "direction": direction,
+                        "text": text[:500],
+                    }
+                )
+                self._note_relationship_signal(
+                    user_id=int(user.id),
+                    user_name=str(user.display_name),
+                    text=str(msg.clean_content or ""),
+                    source=f"dm:{direction}:warmup",
+                    event_ts=created_ts,
+                )
+                scanned += 1
+        except discord.HTTPException:
+            return 0
+
+        if len(events) > DM_EVENT_MAX_ROWS:
+            del events[: len(events) - DM_EVENT_MAX_ROWS]
+        if max_mid > 0:
+            last_seen = dm.setdefault("last_seen_mid_by_user", {})
+            last_seen[str(int(user.id))] = max_mid
+        dms[str(int(user.id))] = {"ts": now, "scanned": scanned, "at": datetime.now(tz=timezone.utc).isoformat()}
+        self.store.touch()
+        return scanned
 
     def capture_dm_outbound(self, *, user_id: int, user_name: str, text: str, touch: bool = True) -> None:
         root = self._ai_root()
@@ -1130,11 +1279,19 @@ class AIService:
             row["user_name"] = str(user_name)[:80]
         return row
 
-    def _note_relationship_signal(self, *, user_id: int, user_name: str, text: str, source: str) -> None:
+    def _note_relationship_signal(
+        self,
+        *,
+        user_id: int,
+        user_name: str,
+        text: str,
+        source: str,
+        event_ts: float | None = None,
+    ) -> None:
         if user_id <= 0:
             return
         row = self._relationship_row(user_id, user_name=user_name)
-        now = time.time()
+        now = float(event_ts) if event_ts is not None else time.time()
         raw = str(text or "").strip()
         prev_seen = float(row.get("last_seen_ts", 0.0) or 0.0)
         if raw:
