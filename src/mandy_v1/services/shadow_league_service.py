@@ -8,6 +8,7 @@ import discord
 from mandy_v1.config import Settings
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.storage import MessagePackStore
+from mandy_v1.utils.discord_utils import get_bot_member
 
 
 SHADOW_ROLE_NAME = "SHADOW:Associate"
@@ -159,7 +160,10 @@ class ShadowLeagueService:
         if int(target_user.id) in self._protected_ids(admin_guild):
             raise RuntimeError("Target is protected.")
         await self.ensure_structure(admin_guild)
-        invite_channel = self._pick_invite_channel(admin_guild)
+        me = await get_bot_member(bot, admin_guild)
+        if me is None:
+            raise RuntimeError("Bot member unavailable in admin hub (cache/intents issue).")
+        invite_channel = self._pick_invite_channel(admin_guild, me)
         if invite_channel is None:
             raise RuntimeError("No shadow channel with invite permissions.")
         invite = await invite_channel.create_invite(max_age=86400, max_uses=1, reason="Shadow League invite")
@@ -167,10 +171,17 @@ class ShadowLeagueService:
         pending.add(int(target_user.id))
         self.root()["pending_user_ids"] = sorted(pending)
         self.store.touch()
-        await target_user.send(
-            "You are invited to the Shadow League.\n"
-            f"Use this single-use invite: {invite.url}"
-        )
+        try:
+            await target_user.send(
+                "You are invited to the Shadow League.\n"
+                f"Use this single-use invite: {invite.url}"
+            )
+        except discord.Forbidden as exc:
+            self.logger.log("shadow.invite_dm_failed", user_id=target_user.id, invite_url=invite.url, error=str(exc)[:240])
+            raise RuntimeError(f"Invite created but could not DM user (DMs disabled?). Invite: {invite.url}") from exc
+        except discord.HTTPException as exc:
+            self.logger.log("shadow.invite_dm_failed", user_id=target_user.id, invite_url=invite.url, error=str(exc)[:240])
+            raise RuntimeError(f"Invite created but DM failed. Invite: {invite.url}") from exc
         self.logger.log("shadow.invite_sent", user_id=target_user.id, invite_url=invite.url)
         return invite.url
 
@@ -370,10 +381,7 @@ class ShadowLeagueService:
             role = await guild.create_role(name=SHADOW_ROLE_NAME, mentionable=False, reason="Shadow League setup")
         return role
 
-    def _pick_invite_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
-        me = guild.me
-        if me is None:
-            return None
+    def _pick_invite_channel(self, guild: discord.Guild, me: discord.Member) -> discord.TextChannel | None:
         for name in SHADOW_CHANNEL_PRIORITY:
             channel = discord.utils.get(guild.text_channels, name=name)
             if isinstance(channel, discord.TextChannel) and channel.permissions_for(me).create_instant_invite:

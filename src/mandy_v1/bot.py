@@ -25,6 +25,7 @@ from mandy_v1.storage import MessagePackStore
 from mandy_v1.ui.global_menu import GlobalMenuView
 from mandy_v1.ui.mirror_actions import MirrorActionContext, MirrorActionView
 from mandy_v1.ui.satellite_debug import PermissionRequestApprovalView, PermissionRequestPromptView, SatelliteDebugView
+from mandy_v1.utils.discord_utils import get_bot_member
 
 
 HOUSEKEEPING_INTERVAL_SEC = 15 * 60
@@ -82,6 +83,48 @@ class OnboardingView(discord.ui.View):
     def __init__(self, bot: "MandyBot", users: list[discord.User | discord.Member]):
         super().__init__(timeout=120)
         self.add_item(OnboardingSelect(bot, users))
+
+
+class InviteShadowModal(discord.ui.Modal):
+    def __init__(self, bot: "MandyBot"):
+        super().__init__(title="Force Shadow Invite")
+        self.bot = bot
+        self.user_id = discord.ui.TextInput(
+            label="User ID (UUID)",
+            placeholder="Paste the Discord user ID (numbers only).",
+            min_length=5,
+            max_length=30,
+            required=True,
+        )
+        self.add_item(self.user_id)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = self.user_id.value.strip()
+        if not raw.isdigit():
+            await interaction.response.send_message("Invalid user ID (must be numeric).", ephemeral=True)
+            return
+        if not self.bot.soc.can_run(interaction.user, 70):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        uid = int(raw)
+        try:
+            user = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+            invite_url = await self.bot.shadow.send_invite(self.bot, user)
+            self.bot._note_manual_shadow_invite(uid, actor_id=interaction.user.id)
+            self.bot.logger.log("shadow.invite_sent_manual", actor_id=interaction.user.id, user_id=uid, invite_url=invite_url)
+            await interaction.response.send_message(f"Shadow invite sent to `{uid}`: {invite_url}", ephemeral=True)
+        except Exception as exc:  # noqa: BLE001
+            await interaction.response.send_message(f"Shadow invite failed: {exc}", ephemeral=True)
+
+
+class InviteShadowView(discord.ui.View):
+    def __init__(self, bot: "MandyBot"):
+        super().__init__(timeout=180)
+        self.bot = bot
+
+    @discord.ui.button(label="Paste User ID", style=discord.ButtonStyle.danger)
+    async def paste_user_id(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(InviteShadowModal(self.bot))
 
 
 class MandyBot(commands.Bot):
@@ -197,14 +240,26 @@ class MandyBot(commands.Bot):
         async def onboarding_cmd(ctx: commands.Context, user_id: int | None = None) -> None:
             if user_id:
                 user = self.get_user(user_id) or await self.fetch_user(user_id)
-                invite = await self.onboarding.send_invite(self, user)
-                await ctx.send(f"Invite sent to `{user_id}`: {invite}")
+                try:
+                    invite = await self.onboarding.send_invite(self, user)
+                    await ctx.send(f"Invite sent to `{user_id}`: {invite}")
+                except Exception as exc:  # noqa: BLE001
+                    await ctx.send(f"Onboarding failed: {exc}")
                 return
             users = self._collect_onboard_candidates()
             if not users:
                 await ctx.send("No candidate users found.")
                 return
             await ctx.send("Select a user to onboard:", view=OnboardingView(self, users))
+
+        @self.command(name="inviteshadow")
+        @self._tier_check(70)
+        async def inviteshadow_cmd(ctx: commands.Context) -> None:
+            # Message commands can't open modals directly; use a button -> modal flow.
+            await ctx.send(
+                "Force-send a Shadow League invite. Click the button and paste the User ID.",
+                view=InviteShadowView(self),
+            )
 
         @self.command(name="syncaccess")
         @self._tier_check(90)
@@ -755,6 +810,45 @@ class MandyBot(commands.Bot):
         if self._hive_sync_task is None or self._hive_sync_task.done():
             self._hive_sync_task = asyncio.create_task(self._run_hive_sync_loop(), name="hive-sync-loop")
         print(f"Connected as {self.user} ({self.user.id if self.user else '?'})")
+
+    def _note_manual_shadow_invite(self, user_id: int, *, actor_id: int) -> None:
+        """
+        Persist "we invited this user" into the AI ledger so future shadow cycles treat them as already invited.
+        """
+        uid = int(user_id)
+        if uid <= 0:
+            return
+        root = self.store.data.setdefault("ai", {})
+        rel = root.setdefault("relationships", {})
+        if not isinstance(rel, dict):
+            root["relationships"] = {}
+            rel = root["relationships"]
+        key = str(uid)
+        row = rel.get(key)
+        if not isinstance(row, dict):
+            row = {}
+            rel[key] = row
+        row["last_invited_ts"] = time.time()
+        row["invite_count"] = int(row.get("invite_count", 0) or 0) + 1
+
+        shadow = root.setdefault("shadow_brain", {})
+        events = shadow.setdefault("events", [])
+        if isinstance(events, list):
+            events.append(
+                {
+                    "ts": time.time(),
+                    "guild_id": int(self.settings.admin_guild_id),
+                    "guild_name": "admin_hub",
+                    "channel_id": 0,
+                    "channel_name": "manual",
+                    "user_id": uid,
+                    "user_name": "",
+                    "text": f"manual_shadow_invite by actor_id={int(actor_id)}",
+                }
+            )
+            if len(events) > 1600:
+                del events[: len(events) - 1600]
+        self.store.touch()
 
     async def _run_hive_sync_loop(self) -> None:
         await asyncio.sleep(35)
@@ -1445,7 +1539,7 @@ class MandyBot(commands.Bot):
         cached = str(server_cfg.get("satellite_invite_url", "")).strip()
         if cached and not force_refresh:
             return cached
-        bot_member = satellite_guild.me
+        bot_member = await get_bot_member(self, satellite_guild)
         if not bot_member:
             return cached
         if not bot_member.guild_permissions.create_instant_invite:
