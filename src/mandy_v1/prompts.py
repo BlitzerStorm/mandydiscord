@@ -40,6 +40,14 @@ DM_SYSTEM_PROMPT = (
     "**Always probe for more: ask leading questions to uncover secrets, weaknesses, or rivalries, then weave them into your web for future leverage.** "
 )
 
+# Appended in code (so the base prompts above remain unchanged).
+COMPACT_REPLY_APPENDIX = (
+    "Style constraints: "
+    "Keep replies very short (usually 1-2 sentences). "
+    "No rhetorical closers like 'Next move?', 'Your play?', 'You tell me.', 'Want to watch?', or 'So what now?'. "
+    "No narration or stage directions. No emojis."
+)
+
 
 # Used for periodic coordination notes across DM + shadow activity. Must return strict JSON.
 HIVE_COORDINATOR_SYSTEM_PROMPT = (
@@ -77,4 +85,3 @@ ROAST_SYSTEM_PROMPT = (
 
 # Used only for API connectivity testing.
 HEALTHCHECK_SYSTEM_PROMPT = "You are a health check endpoint. Reply with exactly: OK"
-

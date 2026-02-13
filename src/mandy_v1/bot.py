@@ -750,7 +750,7 @@ class MandyBot(commands.Bot):
         message = str(plan.get("message", "")).strip()
         if message:
             try:
-                await self.shadow.send_council_message(admin_guild, message, reason="Shadow AI cycle")
+                await self._send_internal_note(f"[shadow.ai_cycle] {message}")
             except discord.HTTPException:
                 pass
         if actions or results or message:
@@ -859,7 +859,7 @@ class MandyBot(commands.Bot):
                     admin_guild = self.get_guild(self.settings.admin_guild_id)
                     if admin_guild and not self._is_send_blocked(admin_guild.id):
                         try:
-                            await self.shadow.send_council_message(admin_guild, f"Hive sync: {summary}", reason="Hive sync")
+                            await self._send_internal_note(f"[hive.sync] {summary}")
                             self._note_send_success(admin_guild.id)
                         except (discord.Forbidden, discord.HTTPException) as exc:
                             self._note_send_failure(admin_guild.id, exc, context="hive.sync")
@@ -1358,7 +1358,8 @@ class MandyBot(commands.Bot):
             "Holding outbound chatter until access returns."
         )
         try:
-            sent = await self.shadow.send_council_message(admin_guild, text, reason="Send path blocked")
+            await self._send_internal_note(f"[send.blocked] {text}")
+            sent = True
         except discord.HTTPException:
             sent = False
         if sent:
@@ -1885,11 +1886,26 @@ class MandyBot(commands.Bot):
         admin_guild = self.get_guild(self.settings.admin_guild_id)
         if not admin_guild:
             return None
-        for name in ("debug-log", "diagnostics"):
+        for name in ("data-lab", "debug-log", "diagnostics"):
             channel = discord.utils.get(admin_guild.text_channels, name=name)
             if isinstance(channel, discord.TextChannel):
                 return channel
         return None
+
+    async def _send_internal_note(self, text: str) -> None:
+        """
+        Internal-only note channel (data-lab/debug-log). Avoid leaking operational context into shadow channels.
+        """
+        payload = str(text or "").strip()
+        if not payload:
+            return
+        channel = self._resolve_admin_debug_channel()
+        if not channel:
+            return
+        try:
+            await channel.send(payload[:1900])
+        except discord.HTTPException:
+            pass
 
     def _resolve_god_admin_channel(self) -> discord.TextChannel | None:
         admin_guild = self.get_guild(self.settings.admin_guild_id)

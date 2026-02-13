@@ -17,6 +17,7 @@ import discord
 from mandy_v1.config import Settings
 from mandy_v1.prompts import (
     CHAT_SYSTEM_PROMPT,
+    COMPACT_REPLY_APPENDIX,
     DM_SYSTEM_PROMPT,
     HEALTHCHECK_SYSTEM_PROMPT,
     HIVE_COORDINATOR_SYSTEM_PROMPT,
@@ -633,7 +634,7 @@ class AIService:
         user_id = int(message.author.id)
         recent = self.dm_recent_lines(user_id, limit=10)
         hive_notes = self.hive_recent_notes(limit=6)
-        prompt = DM_SYSTEM_PROMPT
+        prompt = f"{DM_SYSTEM_PROMPT} {COMPACT_REPLY_APPENDIX}"
         user_prompt = (
             f"User: {message.author.display_name} ({message.author.id})\n"
             f"Message: {message.clean_content[:700]}\n"
@@ -1082,7 +1083,7 @@ class AIService:
         preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
         burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
         image_urls = self._extract_image_urls(message, max_images=2)
-        prompt = CHAT_SYSTEM_PROMPT
+        prompt = f"{CHAT_SYSTEM_PROMPT} {COMPACT_REPLY_APPENDIX}"
         hive_notes = self.hive_recent_notes(limit=6)
         user_prompt = (
             f"Trigger reason: {reason or 'chat'}\n"
