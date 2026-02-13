@@ -8,6 +8,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -635,18 +636,18 @@ class AIService:
         recent = self.dm_recent_lines(user_id, limit=10)
         hive_notes = self.hive_recent_notes(limit=6)
         prompt = f"{DM_SYSTEM_PROMPT} {COMPACT_REPLY_APPENDIX}"
+        now_utc = datetime.now(tz=timezone.utc).isoformat()
         user_prompt = (
+            f"Current time (UTC): {now_utc}\n"
             f"User: {message.author.display_name} ({message.author.id})\n"
             f"Message: {message.clean_content[:700]}\n"
             f"Recent DM context:\n{self._format_lines(recent)}\n"
             f"Hive notes:\n{self._format_lines(hive_notes)}"
         )
-        generated = await self.complete_text(
-            system_prompt=prompt,
-            user_prompt=user_prompt,
-            max_tokens=260,
-            temperature=0.6,
-        )
+        generated = await self.complete_text(system_prompt=prompt, user_prompt=user_prompt, max_tokens=220, temperature=0.6)
+        if generated and self._is_repetitive_reply(generated, recent):
+            retry_prompt = f"{user_prompt}\nHard rule: do NOT repeat earlier DM lines. Fresh 1-2 sentences."
+            generated = await self.complete_text(system_prompt=prompt, user_prompt=retry_prompt, max_tokens=220, temperature=0.8)
         if not generated:
             generated = "I'm here. Keep going, I'm tracking the thread."
         self._remember_dm_reply(message.author.id, generated)
@@ -1085,7 +1086,9 @@ class AIService:
         image_urls = self._extract_image_urls(message, max_images=2)
         prompt = f"{CHAT_SYSTEM_PROMPT} {COMPACT_REPLY_APPENDIX}"
         hive_notes = self.hive_recent_notes(limit=6)
+        now_utc = datetime.now(tz=timezone.utc).isoformat()
         user_prompt = (
+            f"Current time (UTC): {now_utc}\n"
             f"Trigger reason: {reason or 'chat'}\n"
             f"Still talking: {still_talking}\n"
             f"User: {message.author.display_name} ({message.author.id})\n"
@@ -1117,7 +1120,10 @@ class AIService:
                 max_tokens=220,
             )
         if not generated:
-            generated = await self._try_completion(prompt, user_prompt, max_tokens=220)
+            generated = await self.complete_text(system_prompt=prompt, user_prompt=user_prompt, max_tokens=220, temperature=0.65)
+            if generated and self._is_repetitive_reply(generated, recent):
+                retry_prompt = f"{user_prompt}\nHard rule: do NOT repeat previous lines. No rhetorical closers. Fresh 1-2 sentences."
+                generated = await self.complete_text(system_prompt=prompt, user_prompt=retry_prompt, max_tokens=220, temperature=0.85)
         if not generated:
             generated = f"{message.author.mention} I am tracking this thread. Keep going."
         self._remember_exchange(message, generated)
@@ -1207,6 +1213,23 @@ class AIService:
     def recent_context(self, channel_id: int, limit: int = 5) -> list[str]:
         rows = list(self._recent_by_channel.get(channel_id, []))
         return rows[-max(1, limit) :]
+
+    def _is_repetitive_reply(self, text: str, recent_lines: list[str]) -> bool:
+        body = " ".join(str(text or "").split()).strip().casefold()
+        if len(body) < 10:
+            return False
+        for phrase in ("next move", "your play", "you tell me", "so what now", "want to watch"):
+            if phrase in body:
+                return True
+        for line in recent_lines[-6:]:
+            other = " ".join(str(line or "").split()).strip().casefold()
+            if not other:
+                continue
+            if body == other:
+                return True
+            if len(other) >= 10 and SequenceMatcher(a=body, b=other).ratio() >= 0.88:
+                return True
+        return False
 
     def _mentions_mandy(self, message: discord.Message, bot_user_id: int) -> bool:
         if any(user.id == bot_user_id for user in message.mentions):
