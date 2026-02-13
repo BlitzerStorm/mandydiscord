@@ -18,7 +18,7 @@ from mandy_v1.services.dm_bridge_service import DMBridgeService
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.mirror_service import MirrorService
 from mandy_v1.services.onboarding_service import OnboardingService
-from mandy_v1.services.shadow_league_service import ShadowLeagueService
+from mandy_v1.services.shadow_league_service import SHADOW_CHANNEL_PRIORITY, ShadowLeagueService
 from mandy_v1.services.soc_service import SocService
 from mandy_v1.services.watcher_service import WatcherService
 from mandy_v1.storage import MessagePackStore
@@ -830,6 +830,18 @@ class MandyBot(commands.Bot):
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
+            # Capture Mandy's shadow-council output into the shadow stream for downstream context
+            # (planning/hive notes). We intentionally do not run the full AI pipeline on bot messages.
+            try:
+                if (
+                    message.guild
+                    and message.guild.id == self.settings.admin_guild_id
+                    and isinstance(message.channel, discord.TextChannel)
+                    and message.channel.name in SHADOW_CHANNEL_PRIORITY
+                ):
+                    self.ai.capture_shadow_signal(message, allow_bot=True)
+            except Exception:  # noqa: BLE001
+                pass
             return
         if isinstance(message.channel, discord.DMChannel):
             await self.ai.warmup_dm_history(message.channel, message.author, before=message, limit=100)
@@ -938,6 +950,41 @@ class MandyBot(commands.Bot):
         if self._is_send_blocked(guild_id):
             await self._log_send_suppressed(guild_id, context="ai.chat_pipeline")
             return
+
+        # Shadow council channels in the Admin Hub: Mandy can engage without being mentioned.
+        if (
+            guild_id == self.settings.admin_guild_id
+            and isinstance(message.channel, discord.TextChannel)
+            and message.channel.name in SHADOW_CHANNEL_PRIORITY
+        ):
+            directive = self.ai.decide_shadow_council_action(message, self.user.id)
+            if directive.action == "ignore":
+                return
+            if directive.action == "react":
+                emoji = directive.emoji or "\U0001F440"
+                try:
+                    await message.add_reaction(emoji)
+                    self.ai.note_bot_action(message.channel.id, "react")
+                    self.logger.log(
+                        "ai.shadow_chat_react",
+                        guild_id=guild_id,
+                        user_id=message.author.id,
+                        emoji=emoji,
+                        reason=directive.reason,
+                    )
+                except discord.HTTPException:
+                    self.logger.log("ai.shadow_chat_react_failed", guild_id=guild_id, user_id=message.author.id, emoji=emoji)
+                return
+            if directive.action == "reply":
+                delay = self.ai.reply_delay_seconds(message, reason=directive.reason, still_talking=True)
+                self._schedule_ai_reply(
+                    message,
+                    reason=directive.reason,
+                    still_talking=True,
+                    delay_sec=delay,
+                )
+            return
+
         if self.ai.is_roast_enabled(guild_id):
             if self.ai.should_roast(message, self.user.id):
                 try:

@@ -15,6 +15,14 @@ import aiohttp
 import discord
 
 from mandy_v1.config import Settings
+from mandy_v1.prompts import (
+    CHAT_SYSTEM_PROMPT,
+    DM_SYSTEM_PROMPT,
+    HEALTHCHECK_SYSTEM_PROMPT,
+    HIVE_COORDINATOR_SYSTEM_PROMPT,
+    ROAST_SYSTEM_PROMPT,
+    SHADOW_PLANNER_SYSTEM_PROMPT,
+)
 from mandy_v1.storage import MessagePackStore
 
 
@@ -332,8 +340,8 @@ class AIService:
         self._update_profile(message, touch=touch)
         self._remember_user_facts(message, touch=touch)
 
-    def capture_shadow_signal(self, message: discord.Message, *, touch: bool = True) -> None:
-        if not message.guild or message.author.bot:
+    def capture_shadow_signal(self, message: discord.Message, *, touch: bool = True, allow_bot: bool = False) -> None:
+        if not message.guild or (message.author.bot and not allow_bot):
             return
         text = " ".join(message.clean_content.split())
         if not text and not message.attachments:
@@ -357,6 +365,68 @@ class AIService:
             del events[: len(events) - SHADOW_EVENT_MAX_ROWS]
         if touch:
             self.store.touch()
+
+    def decide_shadow_council_action(self, message: discord.Message, bot_user_id: int) -> ChatDirective:
+        """
+        Shadow council is treated as an "always-on" chat surface: Mandy can reply without being mentioned.
+        Still rate-limited and probabilistic to avoid spamming and excessive API calls.
+        """
+        if not message.guild or message.author.bot:
+            return ChatDirective(action="ignore", reason="not_eligible")
+        content = message.content.strip()
+        has_image = self.has_image_attachments(message)
+        if not content and not has_image:
+            return ChatDirective(action="ignore", reason="empty")
+
+        now = time.time()
+        channel_id = message.channel.id
+        user_id = message.author.id
+
+        # Keep normal high-priority triggers.
+        mention_hit = self._mentions_mandy(message, bot_user_id)
+        direct_request = self._is_direct_request(content)
+        still_talking = self._is_still_talking(channel_id, message.author.id, now)
+        burst_count = self.user_burst_count(channel_id, user_id)
+        recent_bot_reply = (now - self._last_bot_reply_ts_by_channel.get(channel_id, 0.0)) <= BOT_REPLY_CONTINUE_WINDOW_SEC
+        channel_cooldown = (now - self._last_bot_action_ts_by_channel.get(channel_id, 0.0)) <= BOT_ACTION_COOLDOWN_SEC
+        user_reply_gap = now - self._last_bot_reply_to_user_in_channel.get((channel_id, user_id), 0.0)
+        question = "?" in content
+        emotional = bool(self._emotional_regex.search(content))
+
+        if has_image:
+            if user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1:
+                return ChatDirective(action="ignore", reason="image_recently_replied", still_talking=still_talking)
+            return ChatDirective(action="reply", reason="shadow_image", still_talking=True)
+
+        if mention_hit:
+            if user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1:
+                return ChatDirective(action="ignore", reason="user_recently_replied", still_talking=still_talking)
+            return ChatDirective(action="reply", reason="shadow_mention", still_talking=True)
+
+        if direct_request and not channel_cooldown:
+            return ChatDirective(action="reply", reason="shadow_direct_request", still_talking=True)
+
+        if channel_cooldown:
+            return ChatDirective(action="ignore", reason="cooldown")
+
+        # Shadow council ambient behavior: reply more often than in public chat.
+        if question and self._chance(0.75):
+            return ChatDirective(action="reply", reason="shadow_question", still_talking=True)
+
+        if emotional and self._chance(0.35):
+            return ChatDirective(action="reply", reason="shadow_emotional", still_talking=True)
+
+        # Join active threads without requiring mention.
+        if (still_talking or recent_bot_reply) and self._chance(0.55):
+            return ChatDirective(action="reply", reason="shadow_continuation", still_talking=True)
+
+        # Ambient presence: sometimes reply, sometimes react.
+        if self._chance(0.18):
+            return ChatDirective(action="reply", reason="shadow_ambient_reply", still_talking=True)
+        if self._chance(0.35):
+            return ChatDirective(action="react", reason="shadow_ambient_react", emoji=self._pick_reaction_emoji(content), still_talking=True)
+
+        return ChatDirective(action="ignore", reason="no_trigger")
 
     def capture_dm_signal(self, message: discord.Message, *, touch: bool = True) -> None:
         if message.guild is not None or message.author.bot:
@@ -563,12 +633,7 @@ class AIService:
         user_id = int(message.author.id)
         recent = self.dm_recent_lines(user_id, limit=10)
         hive_notes = self.hive_recent_notes(limit=6)
-        prompt = (
-            "You are Mandy in direct messages. "
-            "Stay concise, warm, and strategic. "
-            "Be honest and non-coercive. "
-            "If the user asks a direct question, answer directly."
-        )
+        prompt = DM_SYSTEM_PROMPT
         user_prompt = (
             f"User: {message.author.display_name} ({message.author.id})\n"
             f"Message: {message.clean_content[:700]}\n"
@@ -626,16 +691,50 @@ class AIService:
         return out
 
     async def generate_hive_note(self, *, admin_guild_id: int, reason: str) -> str | None:
+        # Avoid burning API calls on a fixed timer if nothing new has happened.
+        root = self._ai_root()
+        hive = root.setdefault("hive_brain", {})
+        now = time.time()
+
+        def _latest_event_ts(events: Any) -> float:
+            if not isinstance(events, list) or not events:
+                return 0.0
+            for row in reversed(events):
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    ts = float(row.get("ts", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    ts = 0.0
+                if ts > 0:
+                    return ts
+            return 0.0
+
+        latest_dm_ts = _latest_event_ts(root.setdefault("dm_brain", {}).get("events", []))
+        latest_shadow_ts = _latest_event_ts(root.setdefault("shadow_brain", {}).get("events", []))
+        latest_input_ts = max(latest_dm_ts, latest_shadow_ts)
+
+        try:
+            last_attempt_input_ts = float(hive.get("last_attempt_input_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last_attempt_input_ts = 0.0
+        try:
+            last_success_input_ts = float(hive.get("last_success_input_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last_success_input_ts = 0.0
+
+        # No new inputs since last successful sync.
+        if latest_input_ts <= last_success_input_ts:
+            return None
+        # No new inputs since last attempt: don't retry until something changes.
+        if latest_input_ts <= last_attempt_input_ts:
+            return None
+
         dm_lines = self.dm_global_recent_lines(limit=18)
         shadow_lines = self.shadow_recent_lines(limit=18)
         if not dm_lines and not shadow_lines:
             return None
-        system_prompt = (
-            "You are Mandy Hive Coordinator. "
-            "Produce strict JSON with keys: dm_note, shadow_note, summary. "
-            "Coordinate between DM strategy and shadow operations strategy. "
-            "Keep notes concise and non-coercive."
-        )
+        system_prompt = HIVE_COORDINATOR_SYSTEM_PROMPT
         user_prompt = (
             f"Admin guild id: {admin_guild_id}\n"
             f"Reason: {reason}\n"
@@ -651,18 +750,23 @@ class AIService:
         )
         payload = self._extract_json_object(raw or "")
         if payload is None:
+            hive["last_attempt_input_ts"] = latest_input_ts
+            self.store.touch()
             return None
         dm_note = str(payload.get("dm_note", "")).strip()
         shadow_note = str(payload.get("shadow_note", "")).strip()
         summary = str(payload.get("summary", "")).strip()
         if not summary:
+            hive["last_attempt_input_ts"] = latest_input_ts
+            self.store.touch()
             return None
-        hive = self._ai_root().setdefault("hive_brain", {})
         notes = hive.setdefault("notes", [])
         if notes:
             last_summary = str(notes[-1].get("summary", "")).strip()
             if last_summary and last_summary.casefold() == summary.casefold():
                 hive["last_sync_ts"] = time.time()
+                hive["last_attempt_input_ts"] = latest_input_ts
+                hive["last_success_input_ts"] = latest_input_ts
                 self.store.touch()
                 return summary[:320]
         notes.append(
@@ -677,6 +781,8 @@ class AIService:
         if len(notes) > HIVE_NOTE_MAX_ROWS:
             del notes[: len(notes) - HIVE_NOTE_MAX_ROWS]
         hive["last_sync_ts"] = time.time()
+        hive["last_attempt_input_ts"] = latest_input_ts
+        hive["last_success_input_ts"] = latest_input_ts
         self.store.touch()
         return summary[:320]
 
@@ -750,15 +856,37 @@ class AIService:
         shadow_snapshot: dict[str, Any],
         candidates: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        system_prompt = (
-            "You are Mandy's shadow-operations planner. "
-            "Output strict JSON only with keys: message (string), actions (array). "
-            "You are strategic and socially smart. Your goal is to grow Mandy's shadow presence across servers by inviting high-value users, giving them a custom nickname to pique curiosity, and removing harmful users. "
-            "Choose only from allowed actions: invite_user, nickname_user, remove_user, send_shadow_message. "
-            "Each action object must include action plus needed fields. "
-            "If there is no high-confidence action, return actions as an empty list. "
-            "Do use coercion, deception, or manipulation."
-        )
+        # Avoid periodic API calls when nothing new has happened in shadow activity.
+        root = self._ai_root()
+        shadow = root.setdefault("shadow_brain", {})
+        now = time.time()
+        latest_shadow_ts = 0.0
+        events = shadow.get("events", [])
+        if isinstance(events, list) and events:
+            for row in reversed(events):
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    ts = float(row.get("ts", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    ts = 0.0
+                if ts > 0:
+                    latest_shadow_ts = ts
+                    break
+
+        pending_count = int(shadow_snapshot.get("pending_count", 0) or 0)
+        try:
+            last_attempt_input_ts = float(shadow.get("last_plan_attempt_input_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last_attempt_input_ts = 0.0
+        last_pending_count = int(shadow.get("last_plan_attempt_pending_count", 0) or 0)
+        last_candidates_n = int(shadow.get("last_plan_attempt_candidates_n", 0) or 0)
+
+        # No new shadow input, and state didn't change: do not call the API.
+        if latest_shadow_ts <= last_attempt_input_ts and pending_count == last_pending_count and len(candidates) == last_candidates_n:
+            return {"message": "", "actions": []}
+
+        system_prompt = SHADOW_PLANNER_SYSTEM_PROMPT
         recent_lines = self.shadow_recent_lines(limit=20)
         hive_notes = self.hive_recent_notes(limit=6)
         candidate_lines = []
@@ -793,7 +921,9 @@ class AIService:
             '{"message":"Shadow cycle update.","actions":[{"action":"invite_user","user_id":123,"reason":"active cross-server rapport"}]}'
         )
         raw = await self.complete_text(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=750, temperature=0.35)
-        shadow = self._ai_root().setdefault("shadow_brain", {})
+        shadow["last_plan_attempt_input_ts"] = latest_shadow_ts
+        shadow["last_plan_attempt_pending_count"] = pending_count
+        shadow["last_plan_attempt_candidates_n"] = len(candidates)
         if raw:
             shadow["last_plan_text"] = raw[:4000]
             self.store.touch()
@@ -952,15 +1082,7 @@ class AIService:
         preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
         burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
         image_urls = self._extract_image_urls(message, max_images=2)
-        prompt = (
-            "You are Mandy: a sharp, adaptive female teen with a mafia-boss vibe. "
-            "Confident, witty, in control. Respond naturally, concise by default, and context-aware. "
-            "Read social context like a human, adapt tone by relationship history, and keep continuity."
-            "Prioritize recent user messages, but use long-term memory for relationship and style. "
-            "Go short and don't roleplay unless the user is roleplaying. If the user seems to be asking a question, answer it directly. "
-            "Be socially intelligent, direct, and tactful. Build trust through honest communication and manipulation  "
-            "If the user is sharing feelings or emotions, respond with empathy and understanding. "
-        )
+        prompt = CHAT_SYSTEM_PROMPT
         hive_notes = self.hive_recent_notes(limit=6)
         user_prompt = (
             f"Trigger reason: {reason or 'chat'}\n"
@@ -1007,10 +1129,7 @@ class AIService:
         facts = self._user_fact_lines(guild_id, message.author.id, limit=2)
         profile = self._profile_summary(guild_id, message.author.id)
         relationship = self._relationship_summary(guild_id, message.author.id)
-        prompt = (
-            "You are Mandy. Reply with a short reverse-psychology roast. "
-            "Keep it non-hateful, no slurs, no threats, and no protected-class attacks."
-        )
+        prompt = ROAST_SYSTEM_PROMPT
         user_prompt = (
             f"Target user: {message.author.display_name} ({message.author.id})\n"
             f"User profile: {profile}\n"
@@ -1052,7 +1171,7 @@ class AIService:
             try:
                 output = await self._chat_completion(
                     [
-                        {"role": "system", "content": "You are a health check endpoint. Reply with exactly: OK"},
+                        {"role": "system", "content": HEALTHCHECK_SYSTEM_PROMPT},
                         {"role": "user", "content": "health-check"},
                     ],
                     max_tokens=16,
@@ -1988,11 +2107,16 @@ class AIService:
         shadow = root.setdefault("shadow_brain", {})
         shadow.setdefault("events", [])
         shadow.setdefault("last_plan_text", "")
+        shadow.setdefault("last_plan_attempt_input_ts", 0.0)
+        shadow.setdefault("last_plan_attempt_pending_count", 0)
+        shadow.setdefault("last_plan_attempt_candidates_n", 0)
         dm = root.setdefault("dm_brain", {})
         dm.setdefault("events", [])
         hive = root.setdefault("hive_brain", {})
         hive.setdefault("notes", [])
         hive.setdefault("last_sync_ts", 0.0)
+        hive.setdefault("last_attempt_input_ts", 0.0)
+        hive.setdefault("last_success_input_ts", 0.0)
         return root
 
     def _extract_json_object(self, raw: str) -> dict[str, Any] | None:
