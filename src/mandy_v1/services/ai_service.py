@@ -19,6 +19,7 @@ from mandy_v1.config import Settings
 from mandy_v1.prompts import (
     CHAT_SYSTEM_PROMPT,
     COMPACT_REPLY_APPENDIX,
+    CONTEXT_AWARENESS_APPENDIX,
     DM_SYSTEM_PROMPT,
     HEALTHCHECK_SYSTEM_PROMPT,
     HIVE_COORDINATOR_SYSTEM_PROMPT,
@@ -635,10 +636,11 @@ class AIService:
         user_id = int(message.author.id)
         recent = self.dm_recent_lines(user_id, limit=10)
         hive_notes = self.hive_recent_notes(limit=6)
-        prompt = f"{DM_SYSTEM_PROMPT} {COMPACT_REPLY_APPENDIX}"
+        prompt = f"{DM_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
         now_utc = datetime.now(tz=timezone.utc).isoformat()
         user_prompt = (
             f"Current time (UTC): {now_utc}\n"
+            "Discord context: direct message (DM)\n"
             f"User: {message.author.display_name} ({message.author.id})\n"
             f"Message: {message.clean_content[:700]}\n"
             f"Recent DM context:\n{self._format_lines(recent)}\n"
@@ -855,6 +857,7 @@ class AIService:
         self,
         *,
         admin_guild_id: int,
+        bot_user_id: int,
         shadow_snapshot: dict[str, Any],
         candidates: list[dict[str, Any]],
     ) -> dict[str, Any]:
@@ -891,6 +894,7 @@ class AIService:
         system_prompt = SHADOW_PLANNER_SYSTEM_PROMPT
         recent_lines = self.shadow_recent_lines(limit=20)
         hive_notes = self.hive_recent_notes(limit=6)
+        now_utc = datetime.now(tz=timezone.utc).isoformat()
         candidate_lines = []
         for row in candidates[:40]:
             risk = row.get("risk_flags", [])
@@ -905,6 +909,14 @@ class AIService:
                 f"last={row.get('last_text','')}"
             )
         user_prompt = (
+            f"Current time (UTC): {now_utc}\n"
+            "Identity and access (hard rules):\n"
+            f"- This is Mandy's internal shadow-planning job, not public chat.\n"
+            f"- Bot user id (Mandy): {int(bot_user_id)}\n"
+            f"- Operator/god user id (trusted admin): {int(self.settings.god_user_id)}\n"
+            f"- Admin guild id (home base): {int(admin_guild_id)}\n"
+            "- Shadow League members listed below are on our side.\n"
+            "- Candidates are not members yet; do not assume loyalty.\n"
             f"Admin guild id: {admin_guild_id}\n"
             f"Current shadow status: members={shadow_snapshot.get('member_count', 0)} "
             f"pending={shadow_snapshot.get('pending_count', 0)}\n"
@@ -1084,13 +1096,17 @@ class AIService:
         preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
         burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
         image_urls = self._extract_image_urls(message, max_images=2)
-        prompt = f"{CHAT_SYSTEM_PROMPT} {COMPACT_REPLY_APPENDIX}"
+        prompt = f"{CHAT_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
         hive_notes = self.hive_recent_notes(limit=6)
         now_utc = datetime.now(tz=timezone.utc).isoformat()
+        guild_name = str(getattr(message.guild, "name", "") or "").strip()
+        channel_name = str(getattr(message.channel, "name", "") or "").strip()
         user_prompt = (
             f"Current time (UTC): {now_utc}\n"
             f"Trigger reason: {reason or 'chat'}\n"
             f"Still talking: {still_talking}\n"
+            f"Guild: {guild_name} ({guild_id})\n"
+            f"Channel: {channel_name} ({message.channel.id})\n"
             f"User: {message.author.display_name} ({message.author.id})\n"
             f"Preferred alias: {preferred_alias}\n"
             f"User profile: {profile}\n"

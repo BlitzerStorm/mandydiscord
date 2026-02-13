@@ -740,6 +740,7 @@ class MandyBot(commands.Bot):
             return
         plan = await self.ai.generate_shadow_plan(
             admin_guild_id=admin_guild.id,
+            bot_user_id=int(self.user.id),
             shadow_snapshot=snapshot,
             candidates=candidates,
         )
