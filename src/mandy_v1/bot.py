@@ -917,6 +917,9 @@ class MandyBot(commands.Bot):
         await self.mirrors.forward_reaction(self, reaction, user)
 
     async def on_command_error(self, ctx: commands.Context, exception: Exception) -> None:
+        # Be silent for unknown commands; users may type non-toolbox commands (e.g. "!warn").
+        if isinstance(exception, commands.CommandNotFound):
+            return
         if isinstance(exception, commands.CheckFailure):
             await ctx.send("Not authorized.")
             return
