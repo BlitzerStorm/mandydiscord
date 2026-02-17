@@ -165,8 +165,8 @@ Health/setup:
 - `!housekeep` (tier >= 70, Admin Hub; run cleanup immediately)
 - `!satellitesync` (tier >= 70; force reconcile all satellite channels/roles now)
 - `!syncaccess` (tier >= 90, Admin Hub)
-- `!setprompt <global|guild_id> <off|light|full> <prompt...>` (tier >= 90)
-- `!showprompt [global|guild_id]` (tier >= 70)
+- `!setprompt <global|guild_id> <off|light|full> <prompt...>` (global scope: tier >= 90; satellite scope: tier >= 90 or satellite owner)
+- `!showprompt [global|guild_id]` (global scope: tier >= 70; satellite scope: tier >= 70 or satellite owner)
 - `!permlist` (tier >= 90; show pending requests and grants)
 - `!permgrant <satellite_guild_id> <user_id> <action> <once|perm|revoke>` (tier >= 90)
 
@@ -175,10 +175,10 @@ SOC:
 - `!socrole <role_name> <tier>` (tier >= 90)
 
 Watchers:
-- `!watchers` (tier >= 50)
-- `!watchers add <user_id> <threshold> <response_text>` (tier >= 70)
-- `!watchers remove <user_id>` (tier >= 70)
-- `!watchers reset <user_id>` (tier >= 70)
+- `!watchers` (tier >= 50, or satellite owner with filtered visibility)
+- `!watchers add <user_id> <threshold> <response_text>` (tier >= 70 or satellite owner for a server containing that user)
+- `!watchers remove <user_id>` (tier >= 70 or satellite owner for a server containing that user)
+- `!watchers reset <user_id>` (tier >= 70 or satellite owner for a server containing that user)
 
 Onboarding:
 - `!onboarding` (tier >= 70; selector mode)
@@ -209,6 +209,8 @@ Global menu:
 - Includes quick actions for satellite listing, health snapshot, panel refresh, and self-check.
 - Includes a satellite drop-down selector for faster access (no manual ID paste required when satellites exist).
 - Includes `Inject Prompt` modal to set hard-priority global/per-server AI prompt + learning mode and hard-save immediately.
+- Includes `View Prompt` modal for global/per-server prompt inspection.
+- Satellite owners can open and control their own satellite panel actions from the menu without SOC elevation.
 
 ## 8) SOC tiers
 
@@ -223,6 +225,7 @@ Default numeric tiers:
 Tier evaluation:
 - Hardcoded GOD user bypass always wins.
 - Otherwise per-user configured tier is checked.
+- For satellite-scoped controls, the owner of that satellite server is treated as fully authorized for their own server scope.
 
 ## 9) Mirror interactive actions
 

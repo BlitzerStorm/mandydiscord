@@ -370,11 +370,18 @@ class MandyBot(commands.Bot):
             await ctx.send(f"Task `{task_id}` prompt updated (`{len(row['prompt'])}` chars).")
 
         @self.group(name="watchers", invoke_without_command=True)
-        @self._tier_check(50)
         async def watchers_group(ctx: commands.Context) -> None:
-            rows = self.watchers.list_all()
+            is_soc = self.soc.can_run(ctx.author, 50)
+            owns_satellite = bool(self._owned_satellite_ids(int(ctx.author.id)))
+            if not is_soc and not owns_satellite:
+                await ctx.send("Not authorized.")
+                return
+            rows = self._visible_watcher_rows_for_user(ctx.author, self.watchers.list_all())
             if not rows:
-                await ctx.send("No watchers configured.")
+                if is_soc:
+                    await ctx.send("No watchers configured.")
+                else:
+                    await ctx.send("No watchers visible for your satellites.")
                 return
             lines = ["Active watchers:"]
             for user_id, cfg in rows.items():
@@ -383,22 +390,28 @@ class MandyBot(commands.Bot):
             await ctx.send("\n".join(lines)[:1900])
 
         @watchers_group.command(name="add")
-        @self._tier_check(70)
         async def watchers_add(ctx: commands.Context, user_id: int, threshold: int, *, response_text: str) -> None:
+            if not self._can_manage_watcher_target(ctx.author, user_id):
+                await ctx.send("Not authorized.")
+                return
             self.watchers.add_or_update(user_id=user_id, threshold=threshold, response_text=response_text)
             self.logger.log("watcher.add", actor_id=ctx.author.id, user_id=user_id, threshold=threshold)
             await ctx.send(f"Watcher set for `{user_id}` with threshold `{threshold}`.")
 
         @watchers_group.command(name="remove")
-        @self._tier_check(70)
         async def watchers_remove(ctx: commands.Context, user_id: int) -> None:
+            if not self._can_manage_watcher_target(ctx.author, user_id):
+                await ctx.send("Not authorized.")
+                return
             existed = self.watchers.remove(user_id)
             self.logger.log("watcher.remove", actor_id=ctx.author.id, user_id=user_id, existed=existed)
             await ctx.send(f"Watcher removed for `{user_id}`: `{existed}`.")
 
         @watchers_group.command(name="reset")
-        @self._tier_check(70)
         async def watchers_reset(ctx: commands.Context, user_id: int) -> None:
+            if not self._can_manage_watcher_target(ctx.author, user_id):
+                await ctx.send("Not authorized.")
+                return
             self.watchers.reset_count(user_id)
             self.logger.log("watcher.reset", actor_id=ctx.author.id, user_id=user_id)
             await ctx.send(f"Watcher count reset for `{user_id}`.")
@@ -420,16 +433,26 @@ class MandyBot(commands.Bot):
             await ctx.send(f"SOC role tier set: `{role_name}` -> `{tier}`")
 
         @self.command(name="setprompt")
-        @self._tier_check(90)
         async def setprompt(ctx: commands.Context, scope: str, learning_mode: str, *, prompt_text: str) -> None:
             target = scope.strip().casefold()
             if target == "global":
                 guild_id = 0
             elif target.isdigit():
                 guild_id = int(target)
+                if guild_id == self.settings.admin_guild_id:
+                    await ctx.send("Use `global` for Admin Hub behavior.")
+                    return
             else:
                 await ctx.send("Scope must be `global` or a numeric satellite guild id.")
                 return
+            if guild_id <= 0:
+                if not self.soc.can_run(ctx.author, 90):
+                    await ctx.send("Not authorized.")
+                    return
+            else:
+                if not self._can_control_satellite(ctx.author, guild_id, min_tier=90):
+                    await ctx.send("Not authorized for that satellite scope.")
+                    return
             mode = learning_mode.strip().casefold()
             if mode not in {"off", "light", "full"}:
                 await ctx.send("Learning mode must be one of: `off`, `light`, `full`.")
@@ -443,22 +466,36 @@ class MandyBot(commands.Bot):
             )
             await self.store.save()
             await self._ensure_global_menu_panel(force_refresh=True)
+            if guild_id > 0:
+                guild = self.get_guild(guild_id)
+                if guild:
+                    await self._ensure_satellite_debug_panel(guild)
             scope_text = "global" if guild_id <= 0 else f"guild `{guild_id}`"
             await ctx.send(
                 f"Prompt updated for {scope_text}. learning_mode=`{row['learning_mode']}` chars=`{row['prompt_chars']}`"
             )
 
         @self.command(name="showprompt")
-        @self._tier_check(70)
         async def showprompt(ctx: commands.Context, scope: str = "global") -> None:
             target = scope.strip().casefold()
             if target == "global":
                 guild_id = 0
             elif target.isdigit():
                 guild_id = int(target)
+                if guild_id == self.settings.admin_guild_id:
+                    await ctx.send("Use `global` for Admin Hub behavior.")
+                    return
             else:
                 await ctx.send("Scope must be `global` or numeric guild id.")
                 return
+            if guild_id <= 0:
+                if not self.soc.can_run(ctx.author, 70):
+                    await ctx.send("Not authorized.")
+                    return
+            else:
+                if not self._can_control_satellite(ctx.author, guild_id, min_tier=70):
+                    await ctx.send("Not authorized for that satellite scope.")
+                    return
             row = self.ai.get_prompt_injection(guild_id)
             prompt = str(row.get("effective_prompt", "") or "").strip()
             if not prompt:
@@ -669,6 +706,75 @@ class MandyBot(commands.Bot):
                 users.setdefault(member.id, member)
         return sorted(users.values(), key=lambda u: str(u))[:25]
 
+    def _is_satellite_owner(self, user_id: int, satellite_guild_id: int) -> bool:
+        gid = int(satellite_guild_id)
+        if gid <= 0 or gid == self.settings.admin_guild_id:
+            return False
+        guild = self.get_guild(gid)
+        if guild is None:
+            return False
+        return int(getattr(guild, "owner_id", 0) or 0) == int(user_id)
+
+    def _owned_satellite_ids(self, user_id: int) -> set[int]:
+        out: set[int] = set()
+        servers = self.store.data.get("mirrors", {}).get("servers", {})
+        if not isinstance(servers, dict):
+            return out
+        for guild_id_text in servers.keys():
+            if not str(guild_id_text).isdigit():
+                continue
+            gid = int(guild_id_text)
+            if self._is_satellite_owner(user_id, gid):
+                out.add(gid)
+        return out
+
+    def _can_control_satellite(
+        self,
+        user: discord.abc.User | discord.Member,
+        satellite_guild_id: int,
+        *,
+        min_tier: int,
+    ) -> bool:
+        if self.soc.can_run(user, min_tier):
+            return True
+        return self._is_satellite_owner(int(user.id), int(satellite_guild_id))
+
+    def _can_manage_watcher_target(
+        self,
+        user: discord.abc.User | discord.Member,
+        target_user_id: int,
+    ) -> bool:
+        if self.soc.can_run(user, 70):
+            return True
+        for gid in self._owned_satellite_ids(int(user.id)):
+            guild = self.get_guild(gid)
+            if guild and guild.get_member(int(target_user_id)) is not None:
+                return True
+        return False
+
+    def _visible_watcher_rows_for_user(
+        self,
+        user: discord.abc.User | discord.Member,
+        rows: dict[int, dict[str, Any]],
+    ) -> dict[int, dict[str, Any]]:
+        if self.soc.can_run(user, 50):
+            return rows
+        owned_ids = self._owned_satellite_ids(int(user.id))
+        if not owned_ids:
+            return {}
+        visible: dict[int, dict[str, Any]] = {}
+        for raw_user_id, cfg in rows.items():
+            try:
+                user_id = int(raw_user_id)
+            except (TypeError, ValueError):
+                continue
+            for gid in owned_ids:
+                guild = self.get_guild(gid)
+                if guild and guild.get_member(user_id) is not None:
+                    visible[user_id] = cfg
+                    break
+        return visible
+
     def _run_internal_selfcheck(self) -> dict[str, list[str]]:
         report: dict[str, list[str]] = {"pass": [], "warn": [], "fail": []}
 
@@ -878,7 +984,8 @@ class MandyBot(commands.Bot):
                 "Health Snapshot: quick runtime and load stats.\n"
                 "Refresh Menu Panel: rebuild this panel.\n"
                 "Self Check: run deep internal diagnostics.\n"
-                "Inject Prompt: set global/per-server hard-priority AI behavior."
+                "Inject Prompt: set global/per-server hard-priority AI behavior.\n"
+                "View Prompt: inspect current global/per-server prompt stack."
             )[:1024],
             inline=False,
         )
@@ -1206,9 +1313,6 @@ class MandyBot(commands.Bot):
         learning_mode: str,
         prompt_text: str,
     ) -> None:
-        if not self.soc.can_run(interaction.user, 90):
-            await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
-            return
         target = str(scope or "").strip().casefold()
         if target == "global":
             guild_id = 0
@@ -1220,6 +1324,14 @@ class MandyBot(commands.Bot):
         else:
             await self._send_interaction_message(interaction, "Scope must be `global` or numeric guild id.", ephemeral=True)
             return
+        if guild_id <= 0:
+            if not self.soc.can_run(interaction.user, 90):
+                await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
+                return
+        else:
+            if not self._can_control_satellite(interaction.user, guild_id, min_tier=90):
+                await self._send_interaction_message(interaction, "Not authorized for that satellite scope.", ephemeral=True)
+                return
 
         mode = str(learning_mode or "").strip().casefold()
         if mode not in {"off", "light", "full"}:
@@ -1239,6 +1351,10 @@ class MandyBot(commands.Bot):
         )
         await self.store.save()
         await self._ensure_global_menu_panel(force_refresh=True)
+        if guild_id > 0:
+            guild = self.get_guild(guild_id)
+            if guild:
+                await self._ensure_satellite_debug_panel(guild)
         scope_text = "global" if guild_id <= 0 else f"guild `{guild_id}`"
         await self._send_interaction_message(
             interaction,
@@ -1246,8 +1362,53 @@ class MandyBot(commands.Bot):
             ephemeral=True,
         )
 
+    async def global_menu_show_prompt(
+        self,
+        interaction: discord.Interaction,
+        *,
+        scope: str,
+    ) -> None:
+        target = str(scope or "").strip().casefold()
+        if target == "global":
+            guild_id = 0
+        elif target.isdigit():
+            guild_id = int(target)
+            if guild_id == self.settings.admin_guild_id:
+                await self._send_interaction_message(interaction, "Use `global` for Admin Hub behavior.", ephemeral=True)
+                return
+        else:
+            await self._send_interaction_message(interaction, "Scope must be `global` or numeric guild id.", ephemeral=True)
+            return
+        if guild_id <= 0:
+            if not self.soc.can_run(interaction.user, 70):
+                await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
+                return
+        else:
+            if not self._can_control_satellite(interaction.user, guild_id, min_tier=70):
+                await self._send_interaction_message(interaction, "Not authorized for that satellite scope.", ephemeral=True)
+                return
+        row = self.ai.get_prompt_injection(guild_id)
+        prompt = str(row.get("effective_prompt", "") or "").strip()
+        if not prompt:
+            prompt = "(none configured)"
+        learning_mode = str(row.get("learning_mode", "full"))
+        scope_text = "global" if guild_id <= 0 else f"guild `{guild_id}`"
+        master_chars = len(str(row.get("master_prompt", "") or ""))
+        guild_chars = len(str(row.get("guild_prompt", "") or ""))
+        await self._send_interaction_message(
+            interaction,
+            (
+                f"Prompt scope: {scope_text}\n"
+                f"Learning mode: `{learning_mode}`\n"
+                f"Master chars: `{master_chars}` guild chars: `{guild_chars}`\n"
+                f"Effective chars: `{len(str(row.get('effective_prompt', '') or ''))}`\n"
+                f"Prompt preview:\n{prompt[:1400]}"
+            )[:1900],
+            ephemeral=True,
+        )
+
     async def open_global_satellite_menu(self, interaction: discord.Interaction, satellite_guild_id: int) -> None:
-        if not self.soc.can_run(interaction.user, 50):
+        if not self._can_control_satellite(interaction.user, satellite_guild_id, min_tier=50):
             await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
             return
         if satellite_guild_id == self.settings.admin_guild_id:
@@ -3113,7 +3274,7 @@ class MandyBot(commands.Bot):
         action: str,
         required_tier: int,
     ) -> bool:
-        if self.soc.can_run(user, required_tier):
+        if self._can_control_satellite(user, satellite_guild_id, min_tier=required_tier):
             return True
         return self._consume_one_time_or_permanent_grant(satellite_guild_id, user.id, action)
 

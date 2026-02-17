@@ -96,6 +96,31 @@ class PromptInjectionModal(discord.ui.Modal):
         )
 
 
+class PromptViewModal(discord.ui.Modal):
+    def __init__(self, bot: discord.Client):
+        super().__init__(title="View Prompt")
+        self.bot = bot
+        self.scope = discord.ui.TextInput(
+            label="Scope",
+            placeholder="global or satellite guild id",
+            min_length=1,
+            max_length=30,
+            required=True,
+            default="global",
+        )
+        self.add_item(self.scope)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        handler = getattr(self.bot, "global_menu_show_prompt", None)
+        if handler is None:
+            await interaction.response.send_message("Global menu handler unavailable.", ephemeral=True)
+            return
+        await handler(
+            interaction=interaction,
+            scope=str(self.scope.value or "").strip(),
+        )
+
+
 class GlobalMenuView(discord.ui.View):
     def __init__(self, bot: discord.Client):
         super().__init__(timeout=None)
@@ -188,10 +213,15 @@ class GlobalMenuView(discord.ui.View):
         custom_id="mandy:global_menu:inject_prompt",
     )
     async def inject_prompt(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._can_run(interaction, 90):
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
-            return
         await interaction.response.send_modal(PromptInjectionModal(self.bot))
+
+    @discord.ui.button(
+        label="View Prompt",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mandy:global_menu:view_prompt",
+    )
+    async def view_prompt(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(PromptViewModal(self.bot))
 
     @discord.ui.button(
         label="Self Check",
