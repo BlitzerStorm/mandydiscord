@@ -8,6 +8,7 @@ This build is intentionally lean and optimized for reliable v1 operations.
 
 - Auto-builds and maintains Admin Hub layout.
 - Auto-onboards joined servers into satellite mirror folders.
+- Continuously reconciles satellite mirror/debug structures for every guild the bot is in.
 - Mirrors satellite messages into Admin Hub mirror feeds.
 - Tracks global watcher counters and triggers responses at configurable thresholds.
 - Enforces SOC tier-based access with hard GOD bypass.
@@ -159,6 +160,7 @@ Health/setup:
 - `!setup` (tier >= 90, Admin Hub)
 - `!menupanel` (tier >= 50, Admin Hub)
 - `!housekeep` (tier >= 70, Admin Hub; run cleanup immediately)
+- `!satellitesync` (tier >= 70; force reconcile all satellite channels/roles now)
 - `!syncaccess` (tier >= 90, Admin Hub)
 - `!permlist` (tier >= 90; show pending requests and grants)
 - `!permgrant <satellite_guild_id> <user_id> <action> <once|perm|revoke>` (tier >= 90)

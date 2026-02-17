@@ -38,31 +38,55 @@ class MirrorService:
         self.store.data["mirrors"]["ignored_user_ids"] = sorted(ids)
         self.store.touch()
 
-    async def ensure_satellite(self, bot: discord.Client, satellite_guild: discord.Guild) -> dict[str, int] | None:
+    async def ensure_satellite(self, bot: discord.Client, satellite_guild: discord.Guild) -> dict[str, Any] | None:
         admin_guild = bot.get_guild(self.settings.admin_guild_id)
         if not admin_guild:
+            self.logger.log(
+                "mirror.ensure_skipped",
+                satellite_guild_id=satellite_guild.id,
+                reason="admin_guild_unavailable",
+                admin_guild_id=self.settings.admin_guild_id,
+            )
             return None
         if satellite_guild.id == admin_guild.id:
             return None
         category_name = f"SATELLITES / Active / {satellite_guild.name}"[:95]
         category = discord.utils.get(admin_guild.categories, name=category_name)
+        created_category = False
         if category is None:
             category = await admin_guild.create_category(category_name, reason="Mandy v1 satellite setup")
+            created_category = True
         mirror_feed = discord.utils.get(category.text_channels, name="mirror-feed")
+        created_mirror_feed = False
         if mirror_feed is None:
             mirror_feed = await category.create_text_channel("mirror-feed", reason="Mandy v1 mirror feed")
+            created_mirror_feed = True
         debug_channel = discord.utils.get(category.text_channels, name="debug")
+        created_debug_channel = False
         if debug_channel is None:
             debug_channel = await category.create_text_channel("debug", reason="Mandy v1 debug channel")
+            created_debug_channel = True
 
         server_role_name = self.role_name_for_server(satellite_guild.id)
         server_role = discord.utils.get(admin_guild.roles, name=server_role_name)
+        created_server_role = False
         if server_role is None:
             server_role = await admin_guild.create_role(name=server_role_name, mentionable=False, reason="Mandy v1 SOC role")
+            created_server_role = True
+        admin_role = discord.utils.get(admin_guild.roles, name="ACCESS:Admin")
+        soc_role = discord.utils.get(admin_guild.roles, name="ACCESS:SOC")
         await mirror_feed.set_permissions(admin_guild.default_role, view_channel=False)
         await mirror_feed.set_permissions(server_role, view_channel=True, send_messages=False, read_message_history=True)
+        if admin_role:
+            await mirror_feed.set_permissions(admin_role, view_channel=True, send_messages=False, read_message_history=True)
+        if soc_role:
+            await mirror_feed.set_permissions(soc_role, view_channel=True, send_messages=False, read_message_history=True)
         await debug_channel.set_permissions(admin_guild.default_role, view_channel=False)
         await debug_channel.set_permissions(server_role, view_channel=True, send_messages=False, read_message_history=True)
+        if admin_role:
+            await debug_channel.set_permissions(admin_role, view_channel=True, send_messages=True, read_message_history=True)
+        if soc_role:
+            await debug_channel.set_permissions(soc_role, view_channel=True, send_messages=True, read_message_history=True)
 
         existing = self.store.data["mirrors"]["servers"].get(str(satellite_guild.id), {})
         payload = {
@@ -72,14 +96,31 @@ class MirrorService:
             "debug_dashboard_message_id": int(existing.get("debug_dashboard_message_id", 0) or 0),
             "satellite_invite_url": str(existing.get("satellite_invite_url", "")),
         }
-        self.store.data["mirrors"]["servers"][str(satellite_guild.id)] = payload
-        self.store.touch()
-        self.logger.log(
-            "mirror.satellite_ready",
-            satellite_guild_id=satellite_guild.id,
-            mirror_feed_id=mirror_feed.id,
-            debug_channel_id=debug_channel.id,
+        changed = (
+            created_category
+            or created_mirror_feed
+            or created_debug_channel
+            or created_server_role
+            or not isinstance(existing, dict)
+            or int(existing.get("category_id", 0) or 0) != int(payload["category_id"])
+            or int(existing.get("mirror_feed_id", 0) or 0) != int(payload["mirror_feed_id"])
+            or int(existing.get("debug_channel_id", 0) or 0) != int(payload["debug_channel_id"])
+            or int(existing.get("debug_dashboard_message_id", 0) or 0) != int(payload["debug_dashboard_message_id"])
+            or str(existing.get("satellite_invite_url", "")) != str(payload["satellite_invite_url"])
         )
+        self.store.data["mirrors"]["servers"][str(satellite_guild.id)] = payload
+        if changed:
+            self.store.touch()
+            self.logger.log(
+                "mirror.satellite_ready",
+                satellite_guild_id=satellite_guild.id,
+                mirror_feed_id=mirror_feed.id,
+                debug_channel_id=debug_channel.id,
+                created_category=created_category,
+                created_mirror_feed=created_mirror_feed,
+                created_debug_channel=created_debug_channel,
+                created_server_role=created_server_role,
+            )
         return payload
 
     def role_name_for_server(self, guild_id: int) -> str:
@@ -98,14 +139,18 @@ class MirrorService:
             return
         roles_to_add: list[discord.Role] = []
         for guild_id in self.store.data["mirrors"]["servers"].keys():
-            satellite = bot.get_guild(int(guild_id))
+            try:
+                gid = int(guild_id)
+            except (TypeError, ValueError):
+                continue
+            satellite = bot.get_guild(gid)
             if not satellite:
                 continue
             in_satellite = satellite.get_member(member.id) is not None
             allow = in_satellite or (member.id in bypass_user_ids) or (member.id == SUPER_USER_ID)
             if not allow:
                 continue
-            role = discord.utils.get(admin_guild.roles, name=self.role_name_for_server(int(guild_id)))
+            role = discord.utils.get(admin_guild.roles, name=self.role_name_for_server(gid))
             if role and role not in member.roles:
                 roles_to_add.append(role)
         if roles_to_add:

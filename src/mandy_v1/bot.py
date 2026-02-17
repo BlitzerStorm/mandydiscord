@@ -49,6 +49,7 @@ SEND_ACCESS_PROBE_INTERVAL_SEC = 90
 SEND_RANT_INTERVAL_SEC = 10 * 60
 ONBOARDING_RECHECK_SCAN_INTERVAL_SEC = 60
 HIVE_SYNC_INTERVAL_SEC = 4 * 60
+SATELLITE_RECONCILE_INTERVAL_SEC = 5 * 60
 SELF_AUTOMATION_LOOP_INTERVAL_SEC = 30
 SELF_AUTOMATION_MAX_HISTORY = 600
 SELF_AUTOMATION_MAX_ACTIONS_PER_TASK = 8
@@ -217,6 +218,7 @@ class MandyBot(commands.Bot):
         self._send_probe_task: asyncio.Task | None = None
         self._onboarding_recheck_task: asyncio.Task | None = None
         self._hive_sync_task: asyncio.Task | None = None
+        self._satellite_reconcile_task: asyncio.Task | None = None
         self._self_automation_task: asyncio.Task | None = None
         self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._ai_pending_dm_reply_tasks: dict[int, asyncio.Task] = {}
@@ -250,6 +252,7 @@ class MandyBot(commands.Bot):
         async def health(ctx: commands.Context) -> None:
             uptime = datetime.now(tz=timezone.utc) - self.started_at
             housekeeping_active = bool(self._housekeeping_task and not self._housekeeping_task.done())
+            satellite_reconcile_active = bool(self._satellite_reconcile_task and not self._satellite_reconcile_task.done())
             automation_active = bool(self._self_automation_task and not self._self_automation_task.done())
             automation_count = len(self._self_automation_tasks())
             payload = (
@@ -259,6 +262,7 @@ class MandyBot(commands.Bot):
                 f"Mirror servers: `{len(self.store.data['mirrors']['servers'])}`\n"
                 f"DM bridges: `{len(self.store.data['dm_bridges'])}`\n"
                 f"Housekeeping active: `{housekeeping_active}`\n"
+                f"Satellite reconcile active: `{satellite_reconcile_active}`\n"
                 f"Shadow AI active: `{self.shadow.ai_enabled()}`\n"
                 f"Self automation active: `{automation_active}` tasks=`{automation_count}`"
             )
@@ -545,6 +549,17 @@ class MandyBot(commands.Bot):
             await self._ensure_satellite_debug_panel(ctx.guild, force_invite_refresh=True)
             await ctx.send("Satellite debug panel refreshed.")
 
+        @self.command(name="satellitesync")
+        @self._tier_check(70)
+        async def satellitesync(ctx: commands.Context) -> None:
+            summary = await self._reconcile_satellites_once(force_refresh_dashboards=True)
+            await self._ensure_global_menu_panel(force_refresh=True)
+            await ctx.send(
+                "Satellite sync complete. "
+                f"ensured=`{summary['ensured']}` failed=`{summary['failed']}` "
+                f"pruned_stale=`{summary['pruned']}` access_synced=`{summary['access_synced']}`"
+            )
+
         @self.command(name="housekeep")
         @self._tier_check(70)
         async def housekeep(ctx: commands.Context) -> None:
@@ -803,7 +818,7 @@ class MandyBot(commands.Bot):
             name="Core Commands",
             value=(
                 "`!health` `!selfcheck` `!setup` `!menupanel` `!debugpanel` `!housekeep`\n"
-                "`!watchers` `!watchers add/remove/reset` `!onboarding` `!syncaccess`\n"
+                "`!satellitesync` `!watchers` `!watchers add/remove/reset` `!onboarding` `!syncaccess`\n"
                 "`!socset` `!socrole` `!permgrant` `!permlist` `!selftasks`\n"
                 "`!setguestpass` `!guestpass`"
             )[:1024],
@@ -1058,6 +1073,7 @@ class MandyBot(commands.Bot):
             api_status = "ok" if bool(last_api.get("ok")) else "fail"
         housekeeping_active = bool(self._housekeeping_task and not self._housekeeping_task.done())
         shadow_active = bool(self._shadow_task and not self._shadow_task.done())
+        reconcile_active = bool(self._satellite_reconcile_task and not self._satellite_reconcile_task.done())
         selftasks_count = len(self._self_automation_tasks())
         blocked_guilds = sum(1 for _gid, until in self._send_block_until_by_guild.items() if float(until or 0.0) > time.time())
         feature = self._feature_request_root()
@@ -1079,6 +1095,7 @@ class MandyBot(commands.Bot):
             f"Self automation tasks: `{selftasks_count}`\n"
             f"Housekeeping active: `{housekeeping_active}`\n"
             f"Shadow loop active: `{shadow_active}`\n"
+            f"Satellite reconcile active: `{reconcile_active}`\n"
             f"Send-blocked guilds: `{blocked_guilds}`\n"
             f"AI key configured: `{self.ai.has_api_key()}`\n"
             f"AI last API test: `{api_status}`"
@@ -1129,6 +1146,108 @@ class MandyBot(commands.Bot):
             view=SatelliteDebugView(self, satellite_guild_id),
             embed=embed,
         )
+
+    async def _ensure_satellite_for_guild(
+        self,
+        guild: discord.Guild,
+        *,
+        force_invite_refresh: bool = False,
+        source: str = "runtime",
+    ) -> bool:
+        if guild.id == self.settings.admin_guild_id:
+            return False
+        try:
+            server_cfg = await self.mirrors.ensure_satellite(self, guild)
+            if not isinstance(server_cfg, dict):
+                self.logger.log("mirror.ensure_skipped", guild_id=guild.id, source=source, reason="no_config_returned")
+                return False
+            await self._ensure_satellite_debug_panel(guild, force_invite_refresh=force_invite_refresh)
+            return True
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            self.logger.log("mirror.ensure_failed", guild_id=guild.id, source=source, error=str(exc)[:300])
+            return False
+        except Exception as exc:  # noqa: BLE001
+            self.logger.log("mirror.ensure_failed", guild_id=guild.id, source=source, error=str(exc)[:300])
+            return False
+
+    async def _reconcile_satellites_once(self, *, force_refresh_dashboards: bool = False) -> dict[str, int]:
+        ensured = 0
+        failed = 0
+        pruned = 0
+        access_synced = 0
+        admin_guild = self.get_guild(self.settings.admin_guild_id)
+        if not admin_guild:
+            self.logger.log("mirror.reconcile_skipped", reason="admin_guild_unavailable")
+            return {"ensured": 0, "failed": 0, "pruned": 0, "access_synced": 0}
+
+        active_ids: set[int] = set()
+        for guild in self.guilds:
+            if guild.id == self.settings.admin_guild_id:
+                continue
+            active_ids.add(guild.id)
+            ok = await self._ensure_satellite_for_guild(
+                guild,
+                force_invite_refresh=force_refresh_dashboards,
+                source="reconcile",
+            )
+            if ok:
+                ensured += 1
+            else:
+                failed += 1
+
+        servers = self.store.data.get("mirrors", {}).get("servers", {})
+        if isinstance(servers, dict):
+            stale_keys: list[str] = []
+            for guild_id_text in list(servers.keys()):
+                if not str(guild_id_text).isdigit():
+                    continue
+                guild_id = int(guild_id_text)
+                if guild_id == self.settings.admin_guild_id:
+                    stale_keys.append(guild_id_text)
+                    continue
+                if guild_id not in active_ids:
+                    stale_keys.append(guild_id_text)
+            for key in stale_keys:
+                servers.pop(key, None)
+                pruned += 1
+            if stale_keys:
+                self.store.touch()
+                self.logger.log("mirror.reconcile_pruned", count=len(stale_keys))
+
+        bypass = self.onboarding.bypass_set()
+        for member in admin_guild.members:
+            if member.bot:
+                continue
+            before = len([role for role in member.roles if role.name.startswith("SOC:SERVER:")])
+            try:
+                await self.mirrors.sync_admin_member_access(self, member, bypass)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("mirror.access_sync_failed", user_id=member.id, error=str(exc)[:220])
+                continue
+            after = len([role for role in member.roles if role.name.startswith("SOC:SERVER:")])
+            if after > before:
+                access_synced += 1
+
+        return {"ensured": ensured, "failed": failed, "pruned": pruned, "access_synced": access_synced}
+
+    async def _run_satellite_reconcile_loop(self) -> None:
+        await asyncio.sleep(35)
+        while True:
+            try:
+                summary = await self._reconcile_satellites_once(force_refresh_dashboards=False)
+                if summary["failed"] > 0 or summary["pruned"] > 0 or summary["access_synced"] > 0:
+                    self.logger.log(
+                        "mirror.reconcile",
+                        ensured=summary["ensured"],
+                        failed=summary["failed"],
+                        pruned=summary["pruned"],
+                        access_synced=summary["access_synced"],
+                    )
+                if summary["ensured"] > 0 or summary["pruned"] > 0:
+                    await self._ensure_global_menu_panel(force_refresh=True)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("mirror.reconcile_failed", error=str(exc)[:300])
+            await asyncio.sleep(SATELLITE_RECONCILE_INTERVAL_SEC)
 
     async def _run_ai_startup_scan(self) -> None:
         self.logger.log("ai.warmup_started", guilds=max(0, len(self.guilds) - 1))
@@ -1227,14 +1346,17 @@ class MandyBot(commands.Bot):
                 await self._ensure_global_menu_panel()
             except discord.HTTPException:
                 self.logger.log("admin.layout_setup_failed", guild_id=admin_guild.id)
-        for guild in self.guilds:
-            if guild.id == self.settings.admin_guild_id:
-                continue
-            try:
-                await self.mirrors.ensure_satellite(self, guild)
-                await self._ensure_satellite_debug_panel(guild)
-            except discord.HTTPException:
-                self.logger.log("mirror.ensure_failed", guild_id=guild.id)
+        summary = await self._reconcile_satellites_once(force_refresh_dashboards=True)
+        if summary["failed"] > 0 or summary["pruned"] > 0 or summary["access_synced"] > 0:
+            self.logger.log(
+                "mirror.reconcile_startup",
+                ensured=summary["ensured"],
+                failed=summary["failed"],
+                pruned=summary["pruned"],
+                access_synced=summary["access_synced"],
+            )
+        if summary["ensured"] > 0 or summary["pruned"] > 0:
+            await self._ensure_global_menu_panel(force_refresh=True)
         if self._ai_warmup_task is None or self._ai_warmup_task.done():
             self._ai_warmup_task = asyncio.create_task(self._run_ai_startup_scan(), name="ai-startup-scan")
         if self._housekeeping_task is None or self._housekeeping_task.done():
@@ -1250,6 +1372,11 @@ class MandyBot(commands.Bot):
             )
         if self._hive_sync_task is None or self._hive_sync_task.done():
             self._hive_sync_task = asyncio.create_task(self._run_hive_sync_loop(), name="hive-sync-loop")
+        if self._satellite_reconcile_task is None or self._satellite_reconcile_task.done():
+            self._satellite_reconcile_task = asyncio.create_task(
+                self._run_satellite_reconcile_loop(),
+                name="satellite-reconcile-loop",
+            )
         if self._self_automation_task is None or self._self_automation_task.done():
             self._self_automation_task = asyncio.create_task(self._run_self_automation_loop(), name="self-automation-loop")
         client = self
@@ -1553,11 +1680,10 @@ class MandyBot(commands.Bot):
             except discord.HTTPException:
                 self.logger.log("admin.layout_setup_failed", guild_id=guild.id)
             return
-        try:
-            await self.mirrors.ensure_satellite(self, guild)
-            await self._ensure_satellite_debug_panel(guild, force_invite_refresh=True)
+        ok = await self._ensure_satellite_for_guild(guild, force_invite_refresh=True, source="guild_join")
+        if ok:
             asyncio.create_task(self._warmup_ai_for_guild(guild), name=f"ai-warmup-{guild.id}")
-        except discord.HTTPException:
+        else:
             self.logger.log("guild.join_setup_failed", guild_id=guild.id)
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
