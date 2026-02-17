@@ -163,6 +163,7 @@ Health/setup:
 - `!setup` (tier >= 90, Admin Hub)
 - `!menupanel` (tier >= 50, Admin Hub)
 - `!housekeep` (tier >= 70, Admin Hub; run cleanup immediately)
+- `!housekeephere` (tier >= 70 or satellite owner; deletes command, posts 15s warning, then wipes that channel)
 - `!satellitesync` (tier >= 70; force reconcile all satellite channels/roles now)
 - `!syncaccess` (tier >= 90, Admin Hub)
 - `!setprompt <global|guild_id> <off|light|full> <prompt...>` (global scope: tier >= 90; satellite scope: tier >= 90 or satellite owner)

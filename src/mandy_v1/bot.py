@@ -664,6 +664,57 @@ class MandyBot(commands.Bot):
                 f"channels=`{summary['channels']}` scanned=`{summary['scanned']}` deleted=`{summary['deleted']}`"
             )
 
+        @self.command(name="housekeephere")
+        async def housekeephere(ctx: commands.Context) -> None:
+            if not isinstance(ctx.guild, discord.Guild):
+                await ctx.send("Run this in a server channel.")
+                return
+            if not isinstance(ctx.channel, discord.TextChannel):
+                await ctx.send("Run this in a text channel.")
+                return
+            if not self._can_control_satellite(ctx.author, ctx.guild.id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            me = ctx.guild.me
+            perms = ctx.channel.permissions_for(me) if me else None
+            if not perms or not perms.manage_messages or not perms.read_message_history:
+                await ctx.send("I need `Manage Messages` and `Read Message History` in this channel.")
+                return
+
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                pass
+            except discord.Forbidden:
+                pass
+
+            notice: discord.Message | None = None
+            try:
+                notice = await ctx.channel.send("Cleaning will start in 15 seconds.")
+            except discord.HTTPException:
+                pass
+            except discord.Forbidden:
+                pass
+
+            self.logger.log(
+                "housekeeping.channel_wipe_scheduled",
+                actor_id=ctx.author.id,
+                guild_id=ctx.guild.id,
+                channel_id=ctx.channel.id,
+                delay_sec=15,
+            )
+            await asyncio.sleep(15)
+            scanned, deleted = await self._wipe_channel_messages(ctx.channel)
+            self.logger.log(
+                "housekeeping.channel_wipe_complete",
+                actor_id=ctx.author.id,
+                guild_id=ctx.guild.id,
+                channel_id=ctx.channel.id,
+                scanned=scanned,
+                deleted=deleted,
+                had_notice=bool(notice),
+            )
+
         @self.command(name="setguestpass")
         @self._tier_check(90)
         async def setguestpass(ctx: commands.Context, *, password: str) -> None:
@@ -993,6 +1044,7 @@ class MandyBot(commands.Bot):
             name="Core Commands",
             value=(
                 "`!health` `!selfcheck` `!setup` `!menupanel` `!debugpanel` `!housekeep`\n"
+                "`!housekeephere`\n"
                 "`!satellitesync` `!watchers` `!watchers add/remove/reset` `!onboarding` `!syncaccess`\n"
                 "`!socset` `!socrole` `!permgrant` `!permlist` `!selftasks`\n"
                 "`!setprompt` `!showprompt`\n"
@@ -1226,6 +1278,59 @@ class MandyBot(commands.Bot):
             return deleted
         except discord.Forbidden:
             return 0
+
+    async def _wipe_channel_messages(self, channel: discord.TextChannel, *, max_passes: int = 3) -> tuple[int, int]:
+        total_scanned = 0
+        total_deleted = 0
+        passes = max(1, min(6, int(max_passes)))
+        for _ in range(passes):
+            scanned, deleted = await self._wipe_channel_messages_once(channel)
+            total_scanned += scanned
+            total_deleted += deleted
+            if scanned <= 0 or deleted <= 0:
+                break
+        return total_scanned, total_deleted
+
+    async def _wipe_channel_messages_once(self, channel: discord.TextChannel) -> tuple[int, int]:
+        scanned = 0
+        deleted = 0
+        recent_batch: list[discord.Message] = []
+        two_weeks_ago = datetime.now(tz=timezone.utc) - timedelta(days=14)
+
+        async def flush_recent_batch() -> int:
+            nonlocal recent_batch
+            if not recent_batch:
+                return 0
+            count = await self._delete_bulk_batch(channel, recent_batch)
+            recent_batch = []
+            return count
+
+        try:
+            async for msg in channel.history(limit=None, oldest_first=False):
+                scanned += 1
+                created_at = msg.created_at if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
+                if created_at > two_weeks_ago:
+                    recent_batch.append(msg)
+                    if len(recent_batch) >= 100:
+                        deleted += await flush_recent_batch()
+                    continue
+                deleted += await flush_recent_batch()
+                try:
+                    await msg.delete()
+                    deleted += 1
+                except discord.HTTPException:
+                    continue
+                except discord.Forbidden:
+                    break
+        except discord.HTTPException:
+            deleted += await flush_recent_batch()
+            return scanned, deleted
+        except discord.Forbidden:
+            deleted += await flush_recent_batch()
+            return scanned, deleted
+
+        deleted += await flush_recent_batch()
+        return scanned, deleted
 
     async def global_menu_list_satellites(self) -> str:
         rows: list[str] = []
