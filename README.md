@@ -13,11 +13,14 @@ This build is intentionally lean and optimized for reliable v1 operations.
 - Enforces SOC tier-based access with hard GOD bypass.
 - Supports onboarding invites and guest-password access in Admin Hub.
 - Relays user DMs into staff-visible bridge channels and supports outbound relay.
+- Provides a high-depth global menu with tier-gated controls, satellite picker, and embedded self-check.
 - In AI chat mode, performs startup memory scan and adaptive live decisioning (ignore/react/reply).
 - In AI chat mode, debounces burst prompts so rapid multi-message asks are merged into fewer smarter replies.
 - In AI chat mode, Mandy can respond without wake-word and use image understanding internally; visual breakdown is only exposed when explicitly requested.
 - In AI chat mode, memory is weighted: stable user facts/preferences are pinned, while low-signal chatter decays out.
 - In AI chat mode, Mandy tracks relationship tone and preferred aliases to adapt replies more naturally per user.
+- In AI mode, API spend is reduced with short-lived completion caching, prompt clamping, and failure cooldown backoff.
+- In AI mode, repeated spam bursts are short-circuited locally (no external API call required).
 - Before watcher, roast, and AI chat replies, Mandy shows a random typing delay (2-10s).
 - If a Mandy response exceeds Discord text limits, it auto-continues in follow-up messages.
 - Auto-trims debug/log and mirror channels on a schedule so control channels stay readable.
@@ -45,6 +48,7 @@ Core modules:
 - `src/mandy_v1/services/logger_service.py` structured runtime log sink
 - `src/mandy_v1/ui/mirror_actions.py` interactive mirror action buttons
 - `src/mandy_v1/ui/satellite_debug.py` satellite debug dashboard/menu + permission requests
+- `src/mandy_v1/ui/global_menu.py` global control panel buttons + satellite selector
 
 ## 3) Requirements
 
@@ -151,13 +155,17 @@ Prefix default is `!`.
 
 Health/setup:
 - `!health` (tier >= 50)
+- `!selfcheck [api]` (tier >= 70; deep internal diagnostics, optional live API check)
 - `!setup` (tier >= 90, Admin Hub)
 - `!menupanel` (tier >= 50, Admin Hub)
 - `!housekeep` (tier >= 70, Admin Hub; run cleanup immediately)
 - `!syncaccess` (tier >= 90, Admin Hub)
+- `!permlist` (tier >= 90; show pending requests and grants)
+- `!permgrant <satellite_guild_id> <user_id> <action> <once|perm|revoke>` (tier >= 90)
 
 SOC:
 - `!socset <user_id> <tier>` (tier >= 90)
+- `!socrole <role_name> <tier>` (tier >= 90)
 
 Watchers:
 - `!watchers` (tier >= 50)
@@ -181,15 +189,25 @@ Shadow League:
 - AI plans actions using shared `AIService` memory/model flow.
 - Current autonomous action set: DM invite candidate, set member nickname, remove member, send council update message.
 
+Self automation:
+- `!selftasks` (tier >= 90; list tasks)
+- `!selftasks create <interval> <name...>` (tier >= 90)
+- `!selftasks run <task_id>` (tier >= 90)
+- `!selftasks delete <task_id>` (tier >= 90)
+- `!selftasks enable <task_id> <on|off>` (tier >= 90)
+- `!selftasks prompt <task_id> <prompt...>` (tier >= 90)
+
 Global menu:
-- Admin Hub `menu` channel includes the full control panel and satellite entry menu
+- Admin Hub `menu` channel includes the full control panel and satellite entry menu.
+- Includes quick actions for satellite listing, health snapshot, panel refresh, and self-check.
+- Includes a satellite drop-down selector for faster access (no manual ID paste required when satellites exist).
 
 ## 8) SOC tiers
 
 Default numeric tiers:
 - `1` guest
 - `10` member
-- `50` staff
+- `50` engineer/staff
 - `70` admin
 - `90` soc-admin
 - `100` GOD bypass (hardcoded by `GOD_USER_ID`)
@@ -232,8 +250,26 @@ Mandy records structured runtime events in store and stdout, including:
 Runtime events are also pushed into debug channels (excluding `mirror.*` events) and into Admin Hub `debug-log` (fallback `diagnostics`).
 AI warmup events include startup scan summaries per satellite (`ai.warmup_*`).
 Housekeeping trims old messages in debug/log and mirror channels while preserving pinned/menu/dashboard panels.
+`!selfcheck` runs internal scenario checks for store schema, grants, automation safety guardrails, and path protections.
+`!selfcheck api` includes a live API probe in addition to internal checks.
+Satellite dashboards expose last API status plus failure-streak/cooldown telemetry.
 
-## 12) Discord permission notes
+## 12) AI offload and safety controls
+
+Mandy reduces AI cost/latency and avoids waste using:
+- short-lived completion cache for repeated prompts
+- prompt clamping to cap oversized context before API send
+- model fallback probing with auto-selected successful model retention
+- failure-streak cooldown to avoid hammering dead/unavailable API routes
+- repetitive message burst short-circuit replies (local, no API call)
+
+Self-automation/GOD-mode action safety:
+- `create_file` and `append_file` are constrained to workspace paths
+- path traversal outside workspace is blocked
+- `run_command` is allowlisted and destructive command patterns are blocked
+- command timeout is bounded to avoid runaway shell executions
+
+## 13) Discord permission notes
 
 Bot should have, at minimum:
 - Manage Channels
@@ -247,7 +283,21 @@ Bot should have, at minimum:
 
 If permissions are missing, setup or relay operations will partially fail and log events.
 
-## 13) Troubleshooting
+## 14) Testing and verification
+
+Quick validation commands:
+- `python -m compileall src tests run_bot.py`
+- `python -m pytest -q`
+- In Discord: `!selfcheck` then `!selfcheck api`
+
+What current tests cover:
+- AI completion caching and API cooldown behavior
+- prompt clamping behavior
+- selftask persistence/backing-dict behavior
+- workspace path safety and command allowlist blocking
+- internal self-check baseline scenario coverage
+
+## 15) Troubleshooting
 
 `DISCORD_TOKEN is required in passwords.txt`:
 - Confirm `passwords.txt` exists and key is set.
@@ -267,7 +317,7 @@ Guestpass not granting access:
 - Ensure `!setguestpass` was set by SOC admin.
 - Ensure command is run in Admin Hub.
 
-## 14) v1 non-goals (intentional)
+## 16) v1 non-goals (intentional)
 
 - No SQL dependency
 - No MySQL mode
@@ -275,7 +325,7 @@ Guestpass not granting access:
 - No persistent reaction mapping storage
 - Shadow access is constrained to Admin Hub role/category permissions
 
-## 15) Quick start checklist
+## 17) Quick start checklist
 
 1. Configure `passwords.txt`
 2. Start bot with `python run_bot.py`

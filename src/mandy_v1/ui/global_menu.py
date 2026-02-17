@@ -3,6 +3,29 @@ from __future__ import annotations
 import discord
 
 
+class GlobalSatelliteSelect(discord.ui.Select):
+    def __init__(self, bot: discord.Client, options: list[discord.SelectOption]):
+        super().__init__(
+            placeholder="Pick a satellite",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            custom_id="mandy:global_menu:satellite_select",
+        )
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        raw = self.values[0].strip()
+        if not raw.isdigit():
+            await interaction.response.send_message("Invalid satellite selection.", ephemeral=True)
+            return
+        handler = getattr(self.bot, "open_global_satellite_menu", None)
+        if handler is None:
+            await interaction.response.send_message("Global menu handler unavailable.", ephemeral=True)
+            return
+        await handler(interaction=interaction, satellite_guild_id=int(raw))
+
+
 class GlobalSatellitePickerModal(discord.ui.Modal):
     def __init__(self, bot: discord.Client):
         super().__init__(title="Open Satellite Controls")
@@ -32,6 +55,29 @@ class GlobalMenuView(discord.ui.View):
     def __init__(self, bot: discord.Client):
         super().__init__(timeout=None)
         self.bot = bot
+        self._maybe_add_satellite_select()
+
+    def _can_run(self, interaction: discord.Interaction, min_tier: int) -> bool:
+        soc = getattr(self.bot, "soc", None)
+        if soc is None:
+            return False
+        return bool(soc.can_run(interaction.user, min_tier))
+
+    def _maybe_add_satellite_select(self) -> None:
+        store = getattr(self.bot, "store", None)
+        servers = None
+        if store is not None:
+            servers = store.data.get("mirrors", {}).get("servers", {})
+        if not isinstance(servers, dict) or not servers:
+            return
+        options: list[discord.SelectOption] = []
+        valid_ids = [int(guild_id) for guild_id in servers.keys() if str(guild_id).isdigit()]
+        for gid in sorted(valid_ids):
+            guild = self.bot.get_guild(gid)
+            label = guild.name[:95] if guild else f"Satellite {gid}"
+            options.append(discord.SelectOption(label=label, value=str(gid), description=str(gid)))
+        if options:
+            self.add_item(GlobalSatelliteSelect(self.bot, options))
 
     @discord.ui.button(
         label="Open Satellite Controls",
@@ -47,6 +93,9 @@ class GlobalMenuView(discord.ui.View):
         custom_id="mandy:global_menu:list_satellites",
     )
     async def list_satellites(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self._can_run(interaction, 50):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
         handler = getattr(self.bot, "global_menu_list_satellites", None)
         if handler is None:
             await interaction.response.send_message("Global menu handler unavailable.", ephemeral=True)
@@ -63,6 +112,9 @@ class GlobalMenuView(discord.ui.View):
         custom_id="mandy:global_menu:health",
     )
     async def health_snapshot(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self._can_run(interaction, 50):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
         handler = getattr(self.bot, "global_menu_health_snapshot", None)
         if handler is None:
             await interaction.response.send_message("Global menu handler unavailable.", ephemeral=True)
@@ -80,6 +132,18 @@ class GlobalMenuView(discord.ui.View):
     )
     async def refresh_panel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         handler = getattr(self.bot, "refresh_global_menu_panel", None)
+        if handler is None:
+            await interaction.response.send_message("Global menu handler unavailable.", ephemeral=True)
+            return
+        await handler(interaction=interaction)
+
+    @discord.ui.button(
+        label="Self Check",
+        style=discord.ButtonStyle.danger,
+        custom_id="mandy:global_menu:selfcheck",
+    )
+    async def self_check(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        handler = getattr(self.bot, "global_menu_selfcheck", None)
         if handler is None:
             await interaction.response.send_message("Global menu handler unavailable.", ephemeral=True)
             return

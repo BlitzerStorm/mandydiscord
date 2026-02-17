@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -98,6 +99,10 @@ DM_EVENT_MAX_ROWS = 1800
 HIVE_NOTE_MAX_ROWS = 180
 SELF_EDIT_LOG_MAX_ROWS = 240
 SUPER_USER_ID = 741470965359443970
+COMPLETION_CACHE_MAX_ROWS = 320
+COMPLETION_CACHE_DEFAULT_TTL_SEC = 80
+API_FAILURE_COOLDOWN_BASE_SEC = 20
+API_FAILURE_COOLDOWN_MAX_SEC = 5 * 60
 
 MEMORY_STOPWORDS = {
     "about",
@@ -206,6 +211,10 @@ class AIService:
         )
         self._passwords_cache: dict[str, str] | None = None
         self._rng = random.Random()
+        self._completion_cache: dict[str, dict[str, Any]] = {}
+        self._api_cooldown_until_ts: float = 0.0
+        self._api_failure_streak: int = 0
+        self._http_session: aiohttp.ClientSession | None = None
 
     # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
     def sentience_reflection_line(self) -> str:
@@ -266,6 +275,11 @@ class AIService:
     def has_api_key(self) -> bool:
         key, _source = self._resolve_api_key()
         return bool(key)
+
+    async def close(self) -> None:
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+        self._http_session = None
 
     def is_chat_enabled(self, guild_id: int) -> bool:
         return bool(self._mode_row(guild_id).get("chat_enabled", False))
@@ -678,6 +692,11 @@ class AIService:
     async def generate_dm_reply(self, message: discord.Message) -> str:
         user_id = int(message.author.id)
         recent = self.dm_recent_lines(user_id, limit=10)
+        inbound_recent = [line.split(":", 1)[1].strip() for line in recent if line.startswith("user:")]
+        if self.is_repetitive_user_burst(inbound_recent, min_repeat=3):
+            generated = "I got your repeated message. Send the next request once and I will answer once."
+            self._remember_dm_reply(message.author.id, generated)
+            return generated
         hive_notes = self.hive_recent_notes(limit=6)
         prompt = f"{DM_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
         sentience_line = self.sentience_reflection_line()
@@ -1112,6 +1131,13 @@ class AIService:
     def user_burst_count(self, channel_id: int, user_id: int) -> int:
         return len(self.user_burst_lines(channel_id, user_id, limit=6))
 
+    def is_repetitive_user_burst(self, lines: list[str], *, min_repeat: int = 3) -> bool:
+        cleaned = [" ".join(str(line or "").split()).casefold() for line in lines if str(line or "").strip()]
+        if len(cleaned) < min_repeat:
+            return False
+        tail = cleaned[-min_repeat:]
+        return len(set(tail)) == 1
+
     def reply_delay_seconds(self, message: discord.Message, reason: str, still_talking: bool) -> float:
         burst_count = self.user_burst_count(message.channel.id, message.author.id)
         if reason in ("mention_burst", "continuation_burst", "image_burst", "direct_request_burst") or burst_count >= 3:
@@ -1144,6 +1170,10 @@ class AIService:
         relationship = self._relationship_summary(guild_id, message.author.id)
         preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
         burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
+        if self.is_repetitive_user_burst(burst, min_repeat=3):
+            generated = "I got the repeat. I only need one copy, so send your next point in one message."
+            self._remember_exchange(message, generated)
+            return generated
         image_urls = self._extract_image_urls(message, max_images=2)
         prompt = f"{CHAT_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
         hive_notes = self.hive_recent_notes(limit=6)
@@ -1253,8 +1283,11 @@ class AIService:
                     api_key=api_key,
                     model=model,
                 )
-                self._ai_root()["auto_model"] = model
-                self.store.touch()
+                self._note_api_success()
+                root = self._ai_root()
+                if root.get("auto_model") != model:
+                    root["auto_model"] = model
+                    self.store.touch()
                 latency = int((time.perf_counter() - started) * 1000)
                 result = ApiTestResult(
                     ok=True,
@@ -1264,6 +1297,7 @@ class AIService:
                 self._save_api_test(result)
                 return result
             except Exception as exc:  # noqa: BLE001
+                self._note_api_failure()
                 last_error = str(exc)
                 continue
 
@@ -1314,6 +1348,101 @@ class AIService:
             temperature=0.7,
         )
 
+    def _completion_cache_ttl_sec(self) -> int:
+        raw = self.read_self_config("completion_cache_ttl_sec", COMPLETION_CACHE_DEFAULT_TTL_SEC)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = COMPLETION_CACHE_DEFAULT_TTL_SEC
+        return max(0, min(15 * 60, value))
+
+    def _max_user_prompt_chars(self) -> int:
+        raw = self.read_self_config("max_user_prompt_chars", 6000)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 6000
+        return max(1400, min(12000, value))
+
+    def _clamp_prompt(self, text: str, *, limit: int) -> str:
+        raw = str(text or "").strip()
+        if len(raw) <= limit:
+            return raw
+        head = raw[: int(limit * 0.72)].rstrip()
+        tail = raw[-int(limit * 0.22) :].lstrip()
+        return f"{head}\n...[truncated for token budget]...\n{tail}"
+
+    def _cache_key(
+        self,
+        *,
+        mode: str,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        temperature: float,
+    ) -> str:
+        payload = (
+            f"{mode}\n"
+            f"{max_tokens}\n"
+            f"{round(float(temperature), 3)}\n"
+            f"{system_prompt}\n---\n{user_prompt}"
+        )
+        return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+    def _get_cached_completion(self, key: str) -> str | None:
+        row = self._completion_cache.get(key)
+        if not isinstance(row, dict):
+            return None
+        try:
+            expires_ts = float(row.get("expires_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            expires_ts = 0.0
+        if expires_ts <= time.time():
+            self._completion_cache.pop(key, None)
+            return None
+        value = str(row.get("text", "")).strip()
+        return value or None
+
+    def _put_cached_completion(self, key: str, text: str, *, ttl_sec: int) -> None:
+        if ttl_sec <= 0:
+            return
+        now = time.time()
+        self._completion_cache[key] = {
+            "text": str(text or "")[:5000],
+            "ts": now,
+            "expires_ts": now + ttl_sec,
+        }
+        if len(self._completion_cache) <= COMPLETION_CACHE_MAX_ROWS:
+            return
+        ranked = sorted(
+            self._completion_cache.items(),
+            key=lambda item: float(item[1].get("expires_ts", 0.0) or 0.0),
+        )
+        for stale_key, _row in ranked[: len(self._completion_cache) - COMPLETION_CACHE_MAX_ROWS]:
+            self._completion_cache.pop(stale_key, None)
+
+    def _api_on_cooldown(self) -> bool:
+        return self._api_cooldown_until_ts > time.time()
+
+    def _note_api_success(self) -> None:
+        self._api_failure_streak = 0
+        self._api_cooldown_until_ts = 0.0
+
+    def _note_api_failure(self) -> None:
+        self._api_failure_streak = min(12, int(self._api_failure_streak) + 1)
+        if self._api_failure_streak <= 1:
+            return
+        duration = int(API_FAILURE_COOLDOWN_BASE_SEC * (1.9 ** max(0, self._api_failure_streak - 2)))
+        duration = max(API_FAILURE_COOLDOWN_BASE_SEC, min(API_FAILURE_COOLDOWN_MAX_SEC, duration))
+        self._api_cooldown_until_ts = max(self._api_cooldown_until_ts, time.time() + duration)
+
+    def _client(self) -> aiohttp.ClientSession:
+        if self._http_session and not self._http_session.closed:
+            return self._http_session
+        timeout = aiohttp.ClientTimeout(total=30)
+        self._http_session = aiohttp.ClientSession(timeout=timeout)
+        return self._http_session
+
     async def complete_text(
         self,
         *,
@@ -1321,26 +1450,48 @@ class AIService:
         user_prompt: str,
         max_tokens: int = 220,
         temperature: float = 0.7,
+        cache_ttl_sec: int | None = None,
     ) -> str | None:
         api_key, _source = self._resolve_api_key()
         if not api_key:
+            return None
+        prompt_limit = self._max_user_prompt_chars()
+        safe_system = self._clamp_prompt(system_prompt, limit=max(1200, int(prompt_limit * 0.65)))
+        safe_user = self._clamp_prompt(user_prompt, limit=prompt_limit)
+        ttl = self._completion_cache_ttl_sec() if cache_ttl_sec is None else max(0, int(cache_ttl_sec))
+        cache_key = self._cache_key(
+            mode="text",
+            system_prompt=safe_system,
+            user_prompt=safe_user,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        cached = self._get_cached_completion(cache_key)
+        if cached is not None:
+            return cached
+        if self._api_on_cooldown():
             return None
         for model in self._model_candidates():
             try:
                 output = await self._chat_completion(
                     [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
+                        {"role": "system", "content": safe_system},
+                        {"role": "user", "content": safe_user},
                     ],
                     max_tokens=max_tokens,
                     temperature=temperature,
                     api_key=api_key,
                     model=model,
                 )
-                self._ai_root()["auto_model"] = model
-                self.store.touch()
+                self._note_api_success()
+                root = self._ai_root()
+                if root.get("auto_model") != model:
+                    root["auto_model"] = model
+                    self.store.touch()
+                self._put_cached_completion(cache_key, output, ttl_sec=ttl)
                 return output
             except Exception:  # noqa: BLE001
+                self._note_api_failure()
                 continue
         return None
 
@@ -1357,11 +1508,16 @@ class AIService:
             return None
         if not image_urls:
             return None
-        user_content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+        if self._api_on_cooldown():
+            return None
+        prompt_limit = self._max_user_prompt_chars()
+        safe_system = self._clamp_prompt(system_prompt, limit=max(1200, int(prompt_limit * 0.65)))
+        safe_user = self._clamp_prompt(user_prompt, limit=prompt_limit)
+        user_content: list[dict[str, Any]] = [{"type": "text", "text": safe_user}]
         for image_url in image_urls:
             user_content.append({"type": "image_url", "image_url": {"url": image_url}})
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": safe_system},
             {"role": "user", "content": user_content},
         ]
         for model in self._vision_model_candidates():
@@ -1373,10 +1529,14 @@ class AIService:
                     api_key=api_key,
                     model=model,
                 )
-                self._ai_root()["auto_vision_model"] = model
-                self.store.touch()
+                self._note_api_success()
+                root = self._ai_root()
+                if root.get("auto_vision_model") != model:
+                    root["auto_vision_model"] = model
+                    self.store.touch()
                 return output
             except Exception:  # noqa: BLE001
+                self._note_api_failure()
                 continue
         return None
 
@@ -1407,13 +1567,12 @@ class AIService:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, json=payload) as response:
-                body = await response.text()
-                if response.status >= 400:
-                    raise RuntimeError(f"HTTP {response.status}: {body[:300]}")
-                data = json.loads(body)
+        session = self._client()
+        async with session.post(url, headers=headers, json=payload) as response:
+            body = await response.text()
+            if response.status >= 400:
+                raise RuntimeError(f"HTTP {response.status}: {body[:300]}")
+            data = json.loads(body)
         choices = data.get("choices", [])
         if not choices:
             raise RuntimeError("No choices in response.")
@@ -1439,6 +1598,8 @@ class AIService:
             "ok": result.ok,
             "detail": result.detail[:500],
             "latency_ms": result.latency_ms,
+            "failure_streak": int(self._api_failure_streak),
+            "cooldown_until_ts": float(self._api_cooldown_until_ts),
             "ts": datetime.now(tz=timezone.utc).isoformat(),
         }
         self.store.touch()

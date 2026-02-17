@@ -37,6 +37,8 @@ class ShadowLeagueService:
         node.setdefault("max_actions_per_cycle", 3)
         node.setdefault("last_cycle_ts", 0.0)
         node.setdefault("last_cycle_results", [])
+        node.setdefault("last_structure_sync_ts", 0.0)
+        node.setdefault("structure_sync_min_interval_sec", 20 * 60)
         return node
 
     def ai_enabled(self) -> bool:
@@ -138,7 +140,21 @@ class ShadowLeagueService:
             return False, "invite cooldown active"
         return True, "ok"
 
-    async def ensure_structure(self, guild: discord.Guild) -> None:
+    async def ensure_structure(self, guild: discord.Guild, *, force: bool = False) -> None:
+        root = self.root()
+        now = time.time()
+        try:
+            min_interval = int(root.get("structure_sync_min_interval_sec", 20 * 60) or (20 * 60))
+        except (TypeError, ValueError):
+            min_interval = 20 * 60
+        min_interval = max(60, min(6 * 60 * 60, min_interval))
+        try:
+            last_sync_ts = float(root.get("last_structure_sync_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            last_sync_ts = 0.0
+        if not force and last_sync_ts > 0 and (now - last_sync_ts) < min_interval:
+            return
+
         role = await self._ensure_role(guild)
         for category in guild.categories:
             if category.name == SHADOW_CATEGORY_NAME:
@@ -153,6 +169,7 @@ class ShadowLeagueService:
             else:
                 # Shadow members can only see shadow channels.
                 await category.set_permissions(role, view_channel=False)
+        root["last_structure_sync_ts"] = now
         self.store.touch()
 
     async def send_invite(self, bot: discord.Client, target_user: discord.User | discord.Member) -> str:

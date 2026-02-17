@@ -19,6 +19,10 @@ class SocService:
         user_tier = int(self.store.data["soc"]["user_tiers"].get(str(member.id), 0))
         if isinstance(member, discord.Member):
             role_tiers = self.store.data["soc"]["role_tiers"]
+            # Backward compatibility for older stores that used ACCESS:Staff.
+            if "ACCESS:Engineer" not in role_tiers and "ACCESS:Staff" in role_tiers:
+                role_tiers["ACCESS:Engineer"] = int(role_tiers.get("ACCESS:Staff", 50))
+                self.store.touch()
             role_tier = max((int(role_tiers.get(role.name, 0)) for role in member.roles), default=0)
         else:
             role_tier = 0

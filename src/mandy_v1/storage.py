@@ -14,7 +14,7 @@ DEFAULT_STORE: dict[str, Any] = {
         "role_tiers": {
             "ACCESS:Guest": 1,
             "ACCESS:Member": 10,
-            "ACCESS:Staff": 50,
+            "ACCESS:Engineer": 50,
             "ACCESS:Admin": 70,
             "ACCESS:SOC": 90,
         },

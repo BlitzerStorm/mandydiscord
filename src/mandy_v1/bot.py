@@ -7,6 +7,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 import discord
@@ -53,6 +54,21 @@ SELF_AUTOMATION_MAX_HISTORY = 600
 SELF_AUTOMATION_MAX_ACTIONS_PER_TASK = 8
 # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
 SUPER_USER_ID = 741470965359443970
+MENU_ACTION_TIERS: dict[str, int] = {
+    "refresh_dashboard": 50,
+    "toggle_ai_mode": 70,
+    "toggle_ai_roast": 70,
+    "test_ai_api": 70,
+}
+AUTOMATION_ALLOWED_ACTIONS_TEXT = (
+    "run_housekeeping, refresh_global_menu, ensure_satellite, toggle_ai_chat, toggle_ai_roast, test_ai_api, "
+    "send_message, add_reaction, edit_self_config, gather_guild_stats, shadow_action, invite_user, nickname_user, "
+    "remove_user, send_shadow_message, create_file, append_file, run_command"
+)
+AUTOMATION_BLOCKED_COMMAND_PATTERN = re.compile(
+    r"(^|\s)(del|rm|rmdir|format|shutdown|reboot|restart-computer|stop-computer|Remove-Item)(\s|$)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -217,6 +233,10 @@ class MandyBot(commands.Bot):
         self._autosave_task = asyncio.create_task(self.store.autosave_loop(), name="msgpack-autosave")
         self._register_commands()
 
+    async def close(self) -> None:
+        await self.ai.close()
+        await super().close()
+
     def _tier_check(self, min_tier: int) -> Callable[[commands.Context], bool]:
         async def predicate(ctx: commands.Context) -> bool:
             user = ctx.author
@@ -243,6 +263,32 @@ class MandyBot(commands.Bot):
                 f"Self automation active: `{automation_active}` tasks=`{automation_count}`"
             )
             await ctx.send(payload)
+
+        @self.command(name="selfcheck")
+        @self._tier_check(70)
+        async def selfcheck(ctx: commands.Context, mode: str = "local") -> None:
+            run_api = mode.strip().casefold() in {"api", "deep", "full"}
+            report = self._run_internal_selfcheck()
+            lines: list[str] = [
+                f"Self-check summary: pass=`{len(report['pass'])}` warn=`{len(report['warn'])}` fail=`{len(report['fail'])}`",
+            ]
+            if report["fail"]:
+                lines.append("Failures:")
+                lines.extend(f"- {item}" for item in report["fail"][:8])
+            if report["warn"]:
+                lines.append("Warnings:")
+                lines.extend(f"- {item}" for item in report["warn"][:8])
+            if report["pass"]:
+                lines.append("Passes:")
+                lines.extend(f"- {item}" for item in report["pass"][:8])
+
+            if run_api:
+                result = await self.ai.test_api()
+                lines.append(
+                    f"API check: ok=`{result.ok}` latency_ms=`{result.latency_ms}` detail=`{result.detail[:180]}`"
+                )
+
+            await ctx.send("\n".join(lines)[:1900])
 
         @self.group(name="selftasks", invoke_without_command=True)
         @self._tier_check(90)
@@ -292,6 +338,33 @@ class MandyBot(commands.Bot):
                 self.store.touch()
             await ctx.send(f"Deleted `{task_id}` existed=`{existed}`")
 
+        @selftasks_group.command(name="enable")
+        @self._tier_check(90)
+        async def selftasks_enable(ctx: commands.Context, task_id: str, enabled: str) -> None:
+            tasks = self._self_automation_tasks()
+            row = tasks.get(task_id.strip())
+            if not isinstance(row, dict):
+                await ctx.send(f"Task `{task_id}` not found.")
+                return
+            on = enabled.strip().casefold() in {"1", "on", "true", "yes", "enable", "enabled"}
+            row["enabled"] = on
+            row["updated_ts"] = time.time()
+            self.store.touch()
+            await ctx.send(f"Task `{task_id}` enabled=`{on}`")
+
+        @selftasks_group.command(name="prompt")
+        @self._tier_check(90)
+        async def selftasks_prompt(ctx: commands.Context, task_id: str, *, prompt: str) -> None:
+            tasks = self._self_automation_tasks()
+            row = tasks.get(task_id.strip())
+            if not isinstance(row, dict):
+                await ctx.send(f"Task `{task_id}` not found.")
+                return
+            row["prompt"] = prompt.strip()[:2000]
+            row["updated_ts"] = time.time()
+            self.store.touch()
+            await ctx.send(f"Task `{task_id}` prompt updated (`{len(row['prompt'])}` chars).")
+
         @self.group(name="watchers", invoke_without_command=True)
         @self._tier_check(50)
         async def watchers_group(ctx: commands.Context) -> None:
@@ -332,6 +405,72 @@ class MandyBot(commands.Bot):
             self.store.touch()
             self.logger.log("soc.tier_set", actor_id=ctx.author.id, user_id=user_id, tier=tier)
             await ctx.send(f"SOC tier set: `{user_id}` -> `{tier}`")
+
+        @self.command(name="socrole")
+        @self._tier_check(90)
+        async def socrole(ctx: commands.Context, role_name: str, tier: int) -> None:
+            role_tiers = self.store.data["soc"].setdefault("role_tiers", {})
+            role_tiers[str(role_name).strip()] = int(tier)
+            self.store.touch()
+            self.logger.log("soc.role_tier_set", actor_id=ctx.author.id, role_name=role_name, tier=tier)
+            await ctx.send(f"SOC role tier set: `{role_name}` -> `{tier}`")
+
+        @self.command(name="permgrant")
+        @self._tier_check(90)
+        async def permgrant(ctx: commands.Context, satellite_guild_id: int, user_id: int, action: str, mode: str) -> None:
+            normalized_action = action.strip()
+            if normalized_action not in MENU_ACTION_TIERS:
+                await ctx.send(f"Unknown action `{normalized_action}`.")
+                return
+            normalized_mode = mode.strip().casefold()
+            root = self._feature_request_root()
+            key = self._request_grant_key(satellite_guild_id, user_id, normalized_action)
+            if normalized_mode in {"once", "one"}:
+                once = root["grants"]["once"]
+                once[key] = int(once.get(key, 0) or 0) + 1
+                self.store.touch()
+                await ctx.send(f"Granted once: `{key}`.")
+                return
+            if normalized_mode in {"perm", "permanent", "always"}:
+                root["grants"]["permanent"][key] = True
+                self.store.touch()
+                await ctx.send(f"Granted permanent: `{key}`.")
+                return
+            if normalized_mode in {"revoke", "remove", "off"}:
+                root["grants"]["once"].pop(key, None)
+                root["grants"]["permanent"].pop(key, None)
+                self.store.touch()
+                await ctx.send(f"Revoked: `{key}`.")
+                return
+            await ctx.send("Mode must be one of: `once`, `perm`, `revoke`.")
+
+        @self.command(name="permlist")
+        @self._tier_check(90)
+        async def permlist(ctx: commands.Context) -> None:
+            root = self._feature_request_root()
+            requests = root.get("requests", {})
+            pending_rows: list[str] = []
+            if isinstance(requests, dict):
+                for req_id, req in sorted(requests.items(), key=lambda item: int(item[0]), reverse=True):
+                    if not isinstance(req, dict):
+                        continue
+                    if str(req.get("status", "pending")) != "pending":
+                        continue
+                    pending_rows.append(
+                        f"- `#{req_id}` user=`{req.get('requester_id', 0)}` "
+                        f"sat=`{req.get('satellite_guild_id', 0)}` action=`{req.get('action', '')}`"
+                    )
+                    if len(pending_rows) >= 15:
+                        break
+            grants_perm = root["grants"]["permanent"]
+            grants_once = root["grants"]["once"]
+            lines = [
+                f"Pending requests: `{len(pending_rows)}`",
+                *pending_rows,
+                f"Permanent grants: `{len(grants_perm)}`",
+                f"One-time grants: `{len(grants_once)}`",
+            ]
+            await ctx.send("\n".join(lines)[:1900])
 
         @self.command(name="onboarding")
         @self._tier_check(70)
@@ -376,7 +515,7 @@ class MandyBot(commands.Bot):
                 return
             summary = await self.layout.ensure(ctx.guild)
             await self._ensure_base_access_roles(ctx.guild)
-            await self.shadow.ensure_structure(ctx.guild)
+            await self.shadow.ensure_structure(ctx.guild, force=True)
             await self._ensure_global_menu_panel()
             self.logger.log("admin.setup_command", actor_id=ctx.author.id, guild_id=ctx.guild.id)
             await ctx.send(
@@ -460,6 +599,157 @@ class MandyBot(commands.Bot):
                 users.setdefault(member.id, member)
         return sorted(users.values(), key=lambda u: str(u))[:25]
 
+    def _run_internal_selfcheck(self) -> dict[str, list[str]]:
+        report: dict[str, list[str]] = {"pass": [], "warn": [], "fail": []}
+
+        def ok(text: str) -> None:
+            report["pass"].append(text)
+
+        def warn(text: str) -> None:
+            report["warn"].append(text)
+
+        def fail(text: str) -> None:
+            report["fail"].append(text)
+
+        required_top = (
+            "soc",
+            "watchers",
+            "watcher_counts",
+            "mirrors",
+            "onboarding",
+            "guest_access",
+            "dm_bridges",
+            "feature_requests",
+            "ai",
+            "shadow_league",
+            "ui",
+            "logs",
+        )
+        missing_top = [key for key in required_top if key not in self.store.data]
+        if missing_top:
+            fail(f"store missing keys: {', '.join(missing_top)}")
+        else:
+            ok("store root schema keys present")
+
+        role_tiers = self.store.data.get("soc", {}).get("role_tiers", {})
+        expected_roles = ("ACCESS:Guest", "ACCESS:Member", "ACCESS:Engineer", "ACCESS:Admin", "ACCESS:SOC")
+        missing_roles = [role for role in expected_roles if int(role_tiers.get(role, 0) or 0) <= 0]
+        if missing_roles:
+            fail(f"role_tiers missing/zero: {', '.join(missing_roles)}")
+        else:
+            ok("SOC role_tiers include required access roles")
+
+        feature = self._feature_request_root()
+        requests = feature.get("requests")
+        grants = feature.get("grants")
+        if not isinstance(requests, dict):
+            fail("feature_requests.requests is not a dict")
+        else:
+            ok("feature request queue schema valid")
+        if not isinstance(grants, dict) or not isinstance(grants.get("once"), dict) or not isinstance(grants.get("permanent"), dict):
+            fail("feature request grants schema invalid")
+        else:
+            ok("feature request grants schema valid")
+
+        tasks = self._self_automation_tasks()
+        bad_tasks = 0
+        for _task_id, row in tasks.items():
+            if not isinstance(row, dict):
+                bad_tasks += 1
+                continue
+            interval = self._parse_interval_seconds(row.get("interval_sec", 300), default_seconds=300)
+            if interval < 15:
+                bad_tasks += 1
+        if bad_tasks:
+            fail(f"self automation has invalid tasks: {bad_tasks}")
+        else:
+            ok(f"self automation task schema valid (count={len(tasks)})")
+
+        # Scenario simulation: one-time grant must permit exactly one action execution.
+        probe_key = self._request_grant_key(999_001, 999_002, "refresh_dashboard")
+        once = feature["grants"]["once"]
+        permanent = feature["grants"]["permanent"]
+        had_once = probe_key in once
+        old_once = int(once.get(probe_key, 0) or 0)
+        had_permanent = probe_key in permanent
+        old_permanent = bool(permanent.get(probe_key, False))
+        once[probe_key] = 1
+        permanent.pop(probe_key, None)
+        self.store.touch()
+        first = self._consume_one_time_or_permanent_grant(999_001, 999_002, "refresh_dashboard")
+        second = self._consume_one_time_or_permanent_grant(999_001, 999_002, "refresh_dashboard")
+        if had_once:
+            once[probe_key] = old_once
+        else:
+            once.pop(probe_key, None)
+        if had_permanent:
+            permanent[probe_key] = old_permanent
+        else:
+            permanent.pop(probe_key, None)
+        self.store.touch()
+        if first and not second:
+            ok("scenario: one-time grant consumed exactly once")
+        else:
+            fail("scenario: one-time grant consumption logic failed")
+
+        # Scenario simulation: workspace path guard should reject traversal.
+        try:
+            _ = self._resolve_workspace_path("../outside.txt")
+        except ValueError:
+            ok("scenario: workspace path traversal blocked")
+        else:
+            fail("scenario: workspace path traversal was not blocked")
+
+        try:
+            resolved = self._resolve_workspace_path("data/selfcheck_probe.txt")
+            if resolved.is_absolute():
+                ok("scenario: workspace-relative path resolution works")
+        except Exception as exc:  # noqa: BLE001
+            fail(f"scenario: valid workspace path failed ({str(exc)[:120]})")
+
+        if self._is_allowed_automation_command("python --version"):
+            ok("scenario: allowlisted automation command passes")
+        else:
+            fail("scenario: allowlisted automation command rejected")
+
+        if self._is_allowed_automation_command("rm -rf ."):
+            fail("scenario: dangerous automation command was allowed")
+        else:
+            ok("scenario: dangerous automation command blocked")
+
+        mirror_servers = self.store.data.get("mirrors", {}).get("servers", {})
+        bad_servers = 0
+        if isinstance(mirror_servers, dict):
+            for _gid, row in mirror_servers.items():
+                if not isinstance(row, dict):
+                    bad_servers += 1
+                    continue
+                for key in ("category_id", "mirror_feed_id", "debug_channel_id"):
+                    if int(row.get(key, 0) or 0) <= 0:
+                        bad_servers += 1
+                        break
+        if bad_servers:
+            warn(f"mirror server rows with missing channels: {bad_servers}")
+        else:
+            ok(f"mirror config rows valid (count={len(mirror_servers) if isinstance(mirror_servers, dict) else 0})")
+
+        if self.ai.has_api_key():
+            ok("AI API key is configured")
+        else:
+            warn("AI API key is not configured")
+        last_api = self.store.data.get("ai", {}).get("last_api_test", {})
+        if isinstance(last_api, dict) and last_api:
+            ok("AI API test history exists")
+        else:
+            warn("AI API has not been tested yet")
+
+        if MENU_ACTION_TIERS:
+            ok("menu action tiers loaded")
+        else:
+            fail("menu action tiers missing")
+
+        return report
+
     def _ui_state(self) -> dict[str, Any]:
         root = self.store.data.setdefault("ui", {})
         root.setdefault("global_menu_message_id", 0)
@@ -477,28 +767,44 @@ class MandyBot(commands.Bot):
 
     def _build_global_menu_embed(self, channel: discord.TextChannel) -> discord.Embed:
         total_satellites = len(self.store.data.get("mirrors", {}).get("servers", {}))
+        pending_requests = 0
+        feature = self.store.data.get("feature_requests", {})
+        if isinstance(feature, dict):
+            requests = feature.get("requests", {})
+            if isinstance(requests, dict):
+                pending_requests = sum(
+                    1
+                    for row in requests.values()
+                    if isinstance(row, dict) and str(row.get("status", "pending")) == "pending"
+                )
+        selftasks_count = len(self._self_automation_tasks())
+        role_tiers = self.store.data.get("soc", {}).get("role_tiers", {})
+        engineer_tier = int(role_tiers.get("ACCESS:Engineer", 0) or 0)
+        admin_tier = int(role_tiers.get("ACCESS:Admin", 0) or 0)
+        soc_tier = int(role_tiers.get("ACCESS:SOC", 0) or 0)
         embed = discord.Embed(
             title="Mandy Global Menu",
-            description="Unified control panel for satellite controls, health, and approval workflows.",
+            description="Unified control panel for satellite operations, access approvals, automation, and AI controls.",
             color=0x5865F2,
             timestamp=datetime.now(tz=timezone.utc),
         )
         embed.add_field(
             name="Panel Actions",
             value=(
-                "Open Satellite Controls: choose a server ID and open its full control menu.\n"
-                "List Satellites: see all onboarded satellite IDs.\n"
+                "Open Satellite Controls: choose a server and open full debug controls.\n"
+                "List Satellites: view all onboarded satellite IDs.\n"
                 "Health Snapshot: quick runtime and load stats.\n"
-                "Refresh Menu Panel: rebuild this panel."
+                "Refresh Menu Panel: rebuild this panel.\n"
+                "Self Check: run deep internal diagnostics."
             )[:1024],
             inline=False,
         )
         embed.add_field(
             name="Core Commands",
             value=(
-                "`!health` `!setup` `!menupanel` `!debugpanel` `!housekeep`\n"
-                "`!watchers` `!watchers add/remove/reset`\n"
-                "`!onboarding` `!syncaccess` `!socset`\n"
+                "`!health` `!selfcheck` `!setup` `!menupanel` `!debugpanel` `!housekeep`\n"
+                "`!watchers` `!watchers add/remove/reset` `!onboarding` `!syncaccess`\n"
+                "`!socset` `!socrole` `!permgrant` `!permlist` `!selftasks`\n"
                 "`!setguestpass` `!guestpass`"
             )[:1024],
             inline=False,
@@ -508,11 +814,14 @@ class MandyBot(commands.Bot):
             value=(
                 f"Admin Hub: `{channel.guild.name}` (`{channel.guild.id}`)\n"
                 f"Satellites onboarded: `{total_satellites}`\n"
+                f"Pending permission requests: `{pending_requests}`\n"
+                f"Scheduled selftasks: `{selftasks_count}`\n"
+                f"SOC role tiers: engineer=`{engineer_tier}` admin=`{admin_tier}` soc=`{soc_tier}`\n"
                 f"Prefix: `{self.settings.command_prefix}`"
             ),
             inline=False,
         )
-        embed.set_footer(text="Use the button menu below to access full satellite controls.")
+        embed.set_footer(text="Use the controls below for daily ops, escalation approvals, and diagnostics.")
         return embed
 
     async def _ensure_global_menu_panel(self, force_refresh: bool = False) -> None:
@@ -728,8 +1037,10 @@ class MandyBot(commands.Bot):
 
     async def global_menu_list_satellites(self) -> str:
         rows: list[str] = []
-        for guild_id in sorted(self.store.data["mirrors"]["servers"].keys(), key=lambda x: int(x)):
-            guild = self.get_guild(int(guild_id))
+        numeric_ids = [int(gid) for gid in self.store.data["mirrors"]["servers"].keys() if str(gid).isdigit()]
+        for gid in sorted(numeric_ids):
+            guild_id = str(gid)
+            guild = self.get_guild(gid)
             if guild:
                 rows.append(f"- `{guild.id}` {guild.name}")
             else:
@@ -746,13 +1057,30 @@ class MandyBot(commands.Bot):
         if isinstance(last_api, dict) and last_api:
             api_status = "ok" if bool(last_api.get("ok")) else "fail"
         housekeeping_active = bool(self._housekeeping_task and not self._housekeeping_task.done())
+        shadow_active = bool(self._shadow_task and not self._shadow_task.done())
+        selftasks_count = len(self._self_automation_tasks())
+        blocked_guilds = sum(1 for _gid, until in self._send_block_until_by_guild.items() if float(until or 0.0) > time.time())
+        feature = self._feature_request_root()
+        request_rows = feature.get("requests", {})
+        pending_requests = 0
+        if isinstance(request_rows, dict):
+            pending_requests = sum(
+                1
+                for row in request_rows.values()
+                if isinstance(row, dict) and str(row.get("status", "pending")) == "pending"
+            )
         payload = (
             f"Uptime: `{uptime}`\n"
             f"Guilds: `{len(self.guilds)}`\n"
             f"Satellites: `{len(self.store.data['mirrors']['servers'])}`\n"
             f"Watchers: `{len(self.store.data['watchers'])}`\n"
             f"Logs buffered: `{len(self.store.data['logs'])}`\n"
+            f"Pending permission requests: `{pending_requests}`\n"
+            f"Self automation tasks: `{selftasks_count}`\n"
             f"Housekeeping active: `{housekeeping_active}`\n"
+            f"Shadow loop active: `{shadow_active}`\n"
+            f"Send-blocked guilds: `{blocked_guilds}`\n"
+            f"AI key configured: `{self.ai.has_api_key()}`\n"
             f"AI last API test: `{api_status}`"
         )
         return payload
@@ -763,6 +1091,18 @@ class MandyBot(commands.Bot):
             return
         await self._ensure_global_menu_panel(force_refresh=True)
         await self._send_interaction_message(interaction, "Global menu panel refreshed.", ephemeral=True)
+
+    async def global_menu_selfcheck(self, interaction: discord.Interaction) -> None:
+        if not self.soc.can_run(interaction.user, 70):
+            await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
+            return
+        report = self._run_internal_selfcheck()
+        text = (
+            f"Self-check: pass=`{len(report['pass'])}` warn=`{len(report['warn'])}` fail=`{len(report['fail'])}`\n"
+            f"Top failures: {', '.join(report['fail'][:3]) if report['fail'] else '(none)'}\n"
+            f"Top warnings: {', '.join(report['warn'][:3]) if report['warn'] else '(none)'}"
+        )
+        await self._send_interaction_message(interaction, text[:1900], ephemeral=True)
 
     async def open_global_satellite_menu(self, interaction: discord.Interaction, satellite_guild_id: int) -> None:
         if not self.soc.can_run(interaction.user, 50):
@@ -813,7 +1153,7 @@ class MandyBot(commands.Bot):
         admin_guild = self.get_guild(self.settings.admin_guild_id)
         if not admin_guild:
             return
-        await self.shadow.ensure_structure(admin_guild)
+        await self.shadow.ensure_structure(admin_guild, force=False)
         snapshot = self.shadow.snapshot_for_ai(admin_guild)
         excluded = set(snapshot.get("excluded_user_ids", []))
         candidates = self.ai.shadow_candidate_summaries(excluded_user_ids=excluded, limit=60)
@@ -883,7 +1223,7 @@ class MandyBot(commands.Bot):
             try:
                 await self.layout.ensure(admin_guild)
                 await self._ensure_base_access_roles(admin_guild)
-                await self.shadow.ensure_structure(admin_guild)
+                await self.shadow.ensure_structure(admin_guild, force=True)
                 await self._ensure_global_menu_panel()
             except discord.HTTPException:
                 self.logger.log("admin.layout_setup_failed", guild_id=admin_guild.id)
@@ -925,17 +1265,24 @@ class MandyBot(commands.Bot):
         history = root.setdefault("history", [])
         if not isinstance(history, list):
             root["history"] = []
-        root.setdefault("observations", [])
+        observations = root.setdefault("observations", [])
+        if not isinstance(observations, list):
+            root["observations"] = []
         return root
 
     def _self_automation_tasks(self) -> dict[str, dict[str, Any]]:
         root = self._self_automation_root()
         tasks = root.setdefault("tasks", {})
-        out: dict[str, dict[str, Any]] = {}
-        for key, row in tasks.items():
-            if isinstance(key, str) and isinstance(row, dict):
-                out[key] = row
-        return out
+        if not isinstance(tasks, dict):
+            root["tasks"] = {}
+            self.store.touch()
+            return root["tasks"]
+        invalid_keys = [key for key, row in tasks.items() if not isinstance(key, str) or not isinstance(row, dict)]
+        for key in invalid_keys:
+            tasks.pop(key, None)
+        if invalid_keys:
+            self.store.touch()
+        return tasks
 
     def _parse_interval_seconds(self, raw: Any, *, default_seconds: int = 300) -> int:
         text = str(raw or "").strip().casefold()
@@ -957,6 +1304,43 @@ class MandyBot(commands.Bot):
         if unit == "d":
             return max(15, int(value * 86400))
         return default_seconds
+
+    def _workspace_root(self) -> Path:
+        return Path.cwd().resolve()
+
+    def _resolve_workspace_path(self, raw_path: Any) -> Path:
+        text = str(raw_path or "").strip()
+        if not text:
+            raise ValueError("path is required")
+        candidate = Path(text)
+        if not candidate.is_absolute():
+            candidate = self._workspace_root() / candidate
+        resolved = candidate.resolve()
+        resolved.relative_to(self._workspace_root())
+        return resolved
+
+    def _is_allowed_automation_command(self, command: str) -> bool:
+        text = str(command or "").strip()
+        if not text:
+            return False
+        lowered = text.casefold()
+        if AUTOMATION_BLOCKED_COMMAND_PATTERN.search(lowered):
+            return False
+        allow_prefixes = (
+            "python ",
+            "python3 ",
+            "py ",
+            "pytest",
+            "rg ",
+            "git status",
+            "git diff",
+            "ls",
+            "dir",
+            "echo ",
+            "Get-ChildItem",
+            "Get-Content",
+        )
+        return any(lowered.startswith(prefix.casefold()) for prefix in allow_prefixes)
 
     def _create_self_automation_task(
         self,
@@ -1015,9 +1399,7 @@ class MandyBot(commands.Bot):
         system_prompt = (
             "You are Mandy autonomous scheduler planner. "
             "Return strict JSON only: {\"actions\":[...]}. "
-            "Allowed actions only: run_housekeeping, refresh_global_menu, ensure_satellite, "
-            "toggle_ai_chat, toggle_ai_roast, test_ai_api, send_message, add_reaction, "
-            "edit_self_config, gather_guild_stats, shadow_action, invite_user, nickname_user, remove_user, send_shadow_message. "
+            f"Allowed actions only: {AUTOMATION_ALLOWED_ACTIONS_TEXT}. "
             "Max 6 actions."
         )
         user_prompt = (
@@ -1166,7 +1548,7 @@ class MandyBot(commands.Bot):
             try:
                 await self.layout.ensure(guild)
                 await self._ensure_base_access_roles(guild)
-                await self.shadow.ensure_structure(guild)
+                await self.shadow.ensure_structure(guild, force=True)
                 await self._ensure_global_menu_panel()
             except discord.HTTPException:
                 self.logger.log("admin.layout_setup_failed", guild_id=guild.id)
@@ -1281,6 +1663,9 @@ class MandyBot(commands.Bot):
             "- run_cron_task {task_id}\n"
             "- delete_cron_task {task_id}\n"
             "- list_cron_tasks\n"
+            "- create_file {path,content,overwrite?}\n"
+            "- append_file {path,content}\n"
+            "- run_command {command,timeout_sec?}\n"
             "- gather_guild_stats {guild_id?,channel_id?}\n"
             "- shadow_action {action:'invite_user'|'nickname_user'|'remove_user'|'send_shadow_message', ...}\n"
             "Max 6 actions. If no actions are needed, return empty actions.\n"
@@ -1420,6 +1805,49 @@ class MandyBot(commands.Bot):
                             f"{'on' if bool(task_row.get('enabled', True)) else 'off'}"
                         )
                     notes.append(f"cron tasks: {', '.join(names)}")
+                    continue
+                if action in {"create_file", "append_file"}:
+                    content = str(row.get("content", ""))
+                    if not content:
+                        notes.append(f"{action} skipped (empty content)")
+                        continue
+                    target = self._resolve_workspace_path(row.get("path", ""))
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if action == "create_file":
+                        overwrite = bool(row.get("overwrite", False))
+                        if target.exists() and not overwrite:
+                            notes.append(f"create_file skipped (exists): {target.relative_to(self._workspace_root())}")
+                            continue
+                        target.write_text(content, encoding="utf-8")
+                        notes.append(f"file written: {target.relative_to(self._workspace_root())}")
+                    else:
+                        with target.open("a", encoding="utf-8") as handle:
+                            handle.write(content)
+                        notes.append(f"file appended: {target.relative_to(self._workspace_root())}")
+                    continue
+                if action == "run_command":
+                    command = str(row.get("command", "")).strip()
+                    if not self._is_allowed_automation_command(command):
+                        notes.append("run_command blocked (command not allow-listed)")
+                        continue
+                    timeout_sec = max(5, min(120, int(row.get("timeout_sec", 30) or 30)))
+                    proc = await asyncio.create_subprocess_shell(
+                        command,
+                        cwd=str(self._workspace_root()),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    try:
+                        stdout_raw, stderr_raw = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.wait()
+                        notes.append(f"run_command timeout ({timeout_sec}s): {command[:120]}")
+                        continue
+                    stdout = (stdout_raw or b"").decode("utf-8", errors="replace").strip()
+                    stderr = (stderr_raw or b"").decode("utf-8", errors="replace").strip()
+                    summary = stdout or stderr or "(no output)"
+                    notes.append(f"run_command exit={proc.returncode} output={summary[:220]}")
                     continue
                 if action == "gather_guild_stats":
                     gid = int(row.get("guild_id", 0) or 0) or int(default_guild_id)
@@ -2116,10 +2544,18 @@ class MandyBot(commands.Bot):
             )
         last_test = self.store.data.get("ai", {}).get("last_api_test", {})
         last_test_line = "No API test yet."
+        api_failure_streak = 0
+        api_cooldown_remain = 0
         if isinstance(last_test, dict) and last_test:
             outcome = "OK" if last_test.get("ok") else "FAIL"
             latency = last_test.get("latency_ms")
             last_test_line = f"{outcome} ({latency} ms): {str(last_test.get('detail', ''))[:120]}"
+            api_failure_streak = int(last_test.get("failure_streak", 0) or 0)
+            try:
+                cooldown_until_ts = float(last_test.get("cooldown_until_ts", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                cooldown_until_ts = 0.0
+            api_cooldown_remain = max(0, int(cooldown_until_ts - time.time()))
 
         embed = discord.Embed(
             title=f"Satellite Debug Dashboard: {satellite_guild.name}",
@@ -2148,7 +2584,8 @@ class MandyBot(commands.Bot):
                 f"Memory rows: long-term={memory_stats['long_term_rows']} "
                 f"facts={memory_stats['fact_rows']} users={memory_stats['fact_users']}\n"
                 f"Startup memory scan: {warmup_line}\n"
-                f"Last API test: {last_test_line}"
+                f"Last API test: {last_test_line}\n"
+                f"API failure streak: `{api_failure_streak}` cooldown_remaining_sec=`{api_cooldown_remain}`"
             )[:1024],
             inline=False,
         )
@@ -2195,16 +2632,10 @@ class MandyBot(commands.Bot):
         satellite_guild_id: int,
         action: str,
     ) -> None:
-        action_tiers = {
-            "refresh_dashboard": 50,
-            "toggle_ai_mode": 70,
-            "toggle_ai_roast": 70,
-            "test_ai_api": 70,
-        }
-        if action not in action_tiers:
+        if action not in MENU_ACTION_TIERS:
             await self._send_interaction_message(interaction, "Unknown action.", ephemeral=True)
             return
-        required_tier = action_tiers[action]
+        required_tier = MENU_ACTION_TIERS[action]
         if not self._can_run_menu_action(interaction.user, satellite_guild_id, action, required_tier):
             self.logger.log(
                 "access.menu_denied",
