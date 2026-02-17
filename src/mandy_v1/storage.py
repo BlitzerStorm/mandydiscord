@@ -27,6 +27,7 @@ DEFAULT_STORE: dict[str, Any] = {
     },
     "onboarding": {
         "bypass_user_ids": [],
+        "pending_access_rechecks": {},
     },
     "guest_access": {
         "password": "",

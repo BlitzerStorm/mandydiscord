@@ -46,6 +46,7 @@ SEND_BACKOFF_MAX_SEC = 6 * 60 * 60
 SEND_SUPPRESSION_LOG_INTERVAL_SEC = 60
 SEND_ACCESS_PROBE_INTERVAL_SEC = 90
 SEND_RANT_INTERVAL_SEC = 10 * 60
+ONBOARDING_RECHECK_SCAN_INTERVAL_SEC = 60
 HIVE_SYNC_INTERVAL_SEC = 4 * 60
 SELF_AUTOMATION_LOOP_INTERVAL_SEC = 30
 SELF_AUTOMATION_MAX_HISTORY = 600
@@ -88,8 +89,45 @@ class OnboardingSelect(discord.ui.Select):
 
 class OnboardingView(discord.ui.View):
     def __init__(self, bot: "MandyBot", users: list[discord.User | discord.Member]):
-        super().__init__(timeout=120)
-        self.add_item(OnboardingSelect(bot, users))
+        super().__init__(timeout=180)
+        self.bot = bot
+        if users:
+            self.add_item(OnboardingSelect(bot, users))
+
+    @discord.ui.button(label="Paste User ID", style=discord.ButtonStyle.primary)
+    async def paste_user_id(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(OnboardingInviteModal(self.bot))
+
+
+class OnboardingInviteModal(discord.ui.Modal):
+    def __init__(self, bot: "MandyBot"):
+        super().__init__(title="Manual Onboarding Invite")
+        self.bot = bot
+        self.user_id = discord.ui.TextInput(
+            label="User ID (UUID)",
+            placeholder="Paste the Discord user ID (numbers only).",
+            min_length=5,
+            max_length=30,
+            required=True,
+        )
+        self.add_item(self.user_id)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = self.user_id.value.strip()
+        if not raw.isdigit():
+            await interaction.response.send_message("Invalid user ID (must be numeric).", ephemeral=True)
+            return
+        if not self.bot.soc.can_run(interaction.user, 70):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        uid = int(raw)
+        try:
+            user = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+            invite = await self.bot.onboarding.send_invite(self.bot, user)
+            self.bot.logger.log("onboarding.invite_sent_manual", actor_id=interaction.user.id, user_id=uid)
+            await interaction.response.send_message(f"Invite sent to `{uid}`: {invite}", ephemeral=True)
+        except Exception as exc:  # noqa: BLE001
+            await interaction.response.send_message(f"Onboarding failed: {exc}", ephemeral=True)
 
 
 class InviteShadowModal(discord.ui.Modal):
@@ -161,6 +199,7 @@ class MandyBot(commands.Bot):
         self._housekeeping_task: asyncio.Task | None = None
         self._shadow_task: asyncio.Task | None = None
         self._send_probe_task: asyncio.Task | None = None
+        self._onboarding_recheck_task: asyncio.Task | None = None
         self._hive_sync_task: asyncio.Task | None = None
         self._self_automation_task: asyncio.Task | None = None
         self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
@@ -306,10 +345,7 @@ class MandyBot(commands.Bot):
                     await ctx.send(f"Onboarding failed: {exc}")
                 return
             users = self._collect_onboard_candidates()
-            if not users:
-                await ctx.send("No candidate users found.")
-                return
-            await ctx.send("Select a user to onboard:", view=OnboardingView(self, users))
+            await ctx.send("Select a user to onboard, or click `Paste User ID`:", view=OnboardingView(self, users))
 
         @self.command(name="inviteshadow")
         @self._tier_check(70)
@@ -867,6 +903,11 @@ class MandyBot(commands.Bot):
             self._shadow_task = asyncio.create_task(self._run_shadow_loop(), name="shadow-ai-loop")
         if self._send_probe_task is None or self._send_probe_task.done():
             self._send_probe_task = asyncio.create_task(self._run_send_access_probe_loop(), name="send-access-probe")
+        if self._onboarding_recheck_task is None or self._onboarding_recheck_task.done():
+            self._onboarding_recheck_task = asyncio.create_task(
+                self._run_onboarding_recheck_loop(),
+                name="onboarding-access-recheck",
+            )
         if self._hive_sync_task is None or self._hive_sync_task.done():
             self._hive_sync_task = asyncio.create_task(self._run_hive_sync_loop(), name="hive-sync-loop")
         if self._self_automation_task is None or self._self_automation_task.done():
@@ -1161,6 +1202,7 @@ class MandyBot(commands.Bot):
                 await member.add_roles(guest_role, reason="Mandy v1 guest default")
         bypass = self.onboarding.bypass_set()
         await self.mirrors.sync_admin_member_access(self, member, bypass)
+        await self.onboarding.handle_admin_member_join(self, member)
         self.logger.log("admin.member_join", user_id=member.id)
 
     async def on_reaction_add(self, reaction: discord.Reaction, user: discord.abc.User) -> None:
@@ -1893,6 +1935,15 @@ class MandyBot(commands.Bot):
             except Exception as exc:  # noqa: BLE001
                 self.logger.log("send.probe_failed", error=str(exc)[:300])
             await asyncio.sleep(SEND_ACCESS_PROBE_INTERVAL_SEC)
+
+    async def _run_onboarding_recheck_loop(self) -> None:
+        await asyncio.sleep(20)
+        while True:
+            try:
+                await self.onboarding.process_pending_access_rechecks(self)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("onboarding.recheck_loop_failed", error=str(exc)[:300])
+            await asyncio.sleep(ONBOARDING_RECHECK_SCAN_INTERVAL_SEC)
 
     async def _probe_send_access_once(self) -> None:
         blocked_ids = [gid for gid in self._send_block_until_by_guild.keys() if self._is_send_blocked(gid)]
