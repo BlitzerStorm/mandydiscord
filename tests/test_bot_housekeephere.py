@@ -79,3 +79,19 @@ def test_wipe_channel_messages_deletes_recent_old_and_pinned(tmp_path: Path) -> 
     assert scanned == 3
     assert deleted == 3
     assert channel.messages == []
+
+
+def test_parse_channel_ref_id_supports_numeric_and_mention(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+    assert bot._parse_channel_ref_id("123456789") == 123456789
+    assert bot._parse_channel_ref_id("<#987654321>") == 987654321
+    assert bot._parse_channel_ref_id("  4242  ") == 4242
+
+
+def test_parse_channel_ref_id_rejects_invalid_values(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+    assert bot._parse_channel_ref_id(None) is None
+    assert bot._parse_channel_ref_id("") is None
+    assert bot._parse_channel_ref_id("abc") is None
+    assert bot._parse_channel_ref_id("<#abc>") is None
+    assert bot._parse_channel_ref_id("-100") is None

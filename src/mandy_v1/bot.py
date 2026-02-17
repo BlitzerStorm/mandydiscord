@@ -665,20 +665,40 @@ class MandyBot(commands.Bot):
             )
 
         @self.command(name="housekeephere")
-        async def housekeephere(ctx: commands.Context) -> None:
+        async def housekeephere(ctx: commands.Context, channel_ref: str | None = None) -> None:
             if not isinstance(ctx.guild, discord.Guild):
                 await ctx.send("Run this in a server channel.")
                 return
             if not isinstance(ctx.channel, discord.TextChannel):
                 await ctx.send("Run this in a text channel.")
                 return
-            if not self._can_control_satellite(ctx.author, ctx.guild.id, min_tier=70):
+
+            target_channel: discord.TextChannel = ctx.channel
+            if channel_ref is not None:
+                channel_id = self._parse_channel_ref_id(channel_ref)
+                if channel_id is None:
+                    await ctx.send("Invalid channel reference. Use a numeric channel ID or `<#channel>` mention.")
+                    return
+                resolved = self.get_channel(channel_id)
+                if not isinstance(resolved, discord.TextChannel):
+                    resolved = ctx.guild.get_channel(channel_id)
+                if not isinstance(resolved, discord.TextChannel):
+                    await ctx.send("Target channel not found or not a text channel.")
+                    return
+                if int(resolved.guild.id) != int(ctx.guild.id):
+                    await ctx.send("Target channel must be in this same server.")
+                    return
+                target_channel = resolved
+
+            if not self._can_control_satellite(ctx.author, target_channel.guild.id, min_tier=70):
                 await ctx.send("Not authorized.")
                 return
-            me = ctx.guild.me
-            perms = ctx.channel.permissions_for(me) if me else None
-            if not perms or not perms.manage_messages or not perms.read_message_history:
-                await ctx.send("I need `Manage Messages` and `Read Message History` in this channel.")
+            me = target_channel.guild.me
+            perms = target_channel.permissions_for(me) if me else None
+            if not perms or not perms.manage_messages or not perms.read_message_history or not perms.send_messages:
+                await ctx.send(
+                    "I need `Manage Messages`, `Read Message History`, and `Send Messages` in the target channel."
+                )
                 return
 
             try:
@@ -690,7 +710,7 @@ class MandyBot(commands.Bot):
 
             notice: discord.Message | None = None
             try:
-                notice = await ctx.channel.send("Cleaning will start in 15 seconds.")
+                notice = await target_channel.send("Cleaning will start in 15 seconds.")
             except discord.HTTPException:
                 pass
             except discord.Forbidden:
@@ -699,17 +719,17 @@ class MandyBot(commands.Bot):
             self.logger.log(
                 "housekeeping.channel_wipe_scheduled",
                 actor_id=ctx.author.id,
-                guild_id=ctx.guild.id,
-                channel_id=ctx.channel.id,
+                guild_id=target_channel.guild.id,
+                channel_id=target_channel.id,
                 delay_sec=15,
             )
             await asyncio.sleep(15)
-            scanned, deleted = await self._wipe_channel_messages(ctx.channel)
+            scanned, deleted = await self._wipe_channel_messages(target_channel)
             self.logger.log(
                 "housekeeping.channel_wipe_complete",
                 actor_id=ctx.author.id,
-                guild_id=ctx.guild.id,
-                channel_id=ctx.channel.id,
+                guild_id=target_channel.guild.id,
+                channel_id=target_channel.id,
                 scanned=scanned,
                 deleted=deleted,
                 had_notice=bool(notice),
@@ -825,6 +845,20 @@ class MandyBot(commands.Bot):
                     visible[user_id] = cfg
                     break
         return visible
+
+    def _parse_channel_ref_id(self, raw: str | None) -> int | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        if text.startswith("<#") and text.endswith(">"):
+            text = text[2:-1].strip()
+        if not text.isdigit():
+            return None
+        try:
+            channel_id = int(text)
+        except (TypeError, ValueError):
+            return None
+        return channel_id if channel_id > 0 else None
 
     def _run_internal_selfcheck(self) -> dict[str, list[str]]:
         report: dict[str, list[str]] = {"pass": [], "warn": [], "fail": []}
