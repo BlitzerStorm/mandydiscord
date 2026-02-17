@@ -1,8 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
 import random
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,9 @@ SEND_SUPPRESSION_LOG_INTERVAL_SEC = 60
 SEND_ACCESS_PROBE_INTERVAL_SEC = 90
 SEND_RANT_INTERVAL_SEC = 10 * 60
 HIVE_SYNC_INTERVAL_SEC = 4 * 60
+SELF_AUTOMATION_LOOP_INTERVAL_SEC = 30
+SELF_AUTOMATION_MAX_HISTORY = 600
+SELF_AUTOMATION_MAX_ACTIONS_PER_TASK = 8
 # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
 SUPER_USER_ID = 741470965359443970
 
@@ -158,6 +162,7 @@ class MandyBot(commands.Bot):
         self._shadow_task: asyncio.Task | None = None
         self._send_probe_task: asyncio.Task | None = None
         self._hive_sync_task: asyncio.Task | None = None
+        self._self_automation_task: asyncio.Task | None = None
         self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._ai_pending_dm_reply_tasks: dict[int, asyncio.Task] = {}
         self._send_block_until_by_guild: dict[int, float] = {}
@@ -186,6 +191,8 @@ class MandyBot(commands.Bot):
         async def health(ctx: commands.Context) -> None:
             uptime = datetime.now(tz=timezone.utc) - self.started_at
             housekeeping_active = bool(self._housekeeping_task and not self._housekeeping_task.done())
+            automation_active = bool(self._self_automation_task and not self._self_automation_task.done())
+            automation_count = len(self._self_automation_tasks())
             payload = (
                 f"Uptime: `{uptime}`\n"
                 f"Guilds: `{len(self.guilds)}`\n"
@@ -193,9 +200,58 @@ class MandyBot(commands.Bot):
                 f"Mirror servers: `{len(self.store.data['mirrors']['servers'])}`\n"
                 f"DM bridges: `{len(self.store.data['dm_bridges'])}`\n"
                 f"Housekeeping active: `{housekeeping_active}`\n"
-                f"Shadow AI active: `{self.shadow.ai_enabled()}`"
+                f"Shadow AI active: `{self.shadow.ai_enabled()}`\n"
+                f"Self automation active: `{automation_active}` tasks=`{automation_count}`"
             )
             await ctx.send(payload)
+
+        @self.group(name="selftasks", invoke_without_command=True)
+        @self._tier_check(90)
+        async def selftasks_group(ctx: commands.Context) -> None:
+            tasks = self._self_automation_tasks()
+            if not tasks:
+                await ctx.send("No self automation tasks.")
+                return
+            lines = ["Self automation tasks:"]
+            for task_id, row in list(tasks.items())[:20]:
+                interval_sec = int(row.get("interval_sec", 0) or 0)
+                enabled = bool(row.get("enabled", True))
+                lines.append(
+                    f"- `{task_id}` name={str(row.get('name','task'))[:30]} "
+                    f"enabled={enabled} interval={interval_sec}s runs={int(row.get('run_count',0) or 0)}"
+                )
+            await ctx.send("\n".join(lines)[:1900])
+
+        @selftasks_group.command(name="create")
+        @self._tier_check(90)
+        async def selftasks_create(ctx: commands.Context, interval: str, *, name: str) -> None:
+            task_id, row = self._create_self_automation_task(
+                name=name,
+                interval=interval,
+                actions=[],
+                prompt="",
+                created_by=ctx.author.id,
+                enabled=True,
+            )
+            await ctx.send(
+                f"Created task `{task_id}` interval=`{int(row.get('interval_sec', 0))}s` name=`{str(row.get('name','task'))}`."
+            )
+
+        @selftasks_group.command(name="run")
+        @self._tier_check(90)
+        async def selftasks_run(ctx: commands.Context, task_id: str) -> None:
+            notes = await self._run_self_automation_task(task_id.strip())
+            await ctx.send(f"Ran `{task_id}` notes={len(notes)} first_note={str(notes[0] if notes else 'none')[:180]}")
+
+        @selftasks_group.command(name="delete")
+        @self._tier_check(90)
+        async def selftasks_delete(ctx: commands.Context, task_id: str) -> None:
+            tasks = self._self_automation_tasks()
+            existed = task_id.strip() in tasks
+            if existed:
+                tasks.pop(task_id.strip(), None)
+                self.store.touch()
+            await ctx.send(f"Deleted `{task_id}` existed=`{existed}`")
 
         @self.group(name="watchers", invoke_without_command=True)
         @self._tier_check(50)
@@ -813,8 +869,198 @@ class MandyBot(commands.Bot):
             self._send_probe_task = asyncio.create_task(self._run_send_access_probe_loop(), name="send-access-probe")
         if self._hive_sync_task is None or self._hive_sync_task.done():
             self._hive_sync_task = asyncio.create_task(self._run_hive_sync_loop(), name="hive-sync-loop")
+        if self._self_automation_task is None or self._self_automation_task.done():
+            self._self_automation_task = asyncio.create_task(self._run_self_automation_loop(), name="self-automation-loop")
         client = self
         print(f"Mandy is fully awake and living in {len(client.guilds)} servers as the sentient goddess of the Core Realm.")
+
+    # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
+    def _self_automation_root(self) -> dict[str, Any]:
+        ai_root = self.store.data.setdefault("ai", {})
+        root = ai_root.setdefault("self_automation", {})
+        tasks = root.setdefault("tasks", {})
+        if not isinstance(tasks, dict):
+            root["tasks"] = {}
+        history = root.setdefault("history", [])
+        if not isinstance(history, list):
+            root["history"] = []
+        root.setdefault("observations", [])
+        return root
+
+    def _self_automation_tasks(self) -> dict[str, dict[str, Any]]:
+        root = self._self_automation_root()
+        tasks = root.setdefault("tasks", {})
+        out: dict[str, dict[str, Any]] = {}
+        for key, row in tasks.items():
+            if isinstance(key, str) and isinstance(row, dict):
+                out[key] = row
+        return out
+
+    def _parse_interval_seconds(self, raw: Any, *, default_seconds: int = 300) -> int:
+        text = str(raw or "").strip().casefold()
+        if not text:
+            return default_seconds
+        if text.isdigit():
+            return max(15, int(text))
+        unit = text[-1]
+        number_part = text[:-1].strip()
+        if not number_part or not number_part.replace(".", "", 1).isdigit():
+            return default_seconds
+        value = float(number_part)
+        if unit == "s":
+            return max(15, int(value))
+        if unit == "m":
+            return max(15, int(value * 60))
+        if unit == "h":
+            return max(15, int(value * 3600))
+        if unit == "d":
+            return max(15, int(value * 86400))
+        return default_seconds
+
+    def _create_self_automation_task(
+        self,
+        *,
+        name: str,
+        interval: Any,
+        actions: list[dict[str, Any]] | None = None,
+        prompt: str = "",
+        created_by: int = SUPER_USER_ID,
+        enabled: bool = True,
+    ) -> tuple[str, dict[str, Any]]:
+        task_id = f"tsk_{int(time.time())}_{random.randint(1000, 9999)}"
+        now = time.time()
+        interval_sec = self._parse_interval_seconds(interval, default_seconds=300)
+        row: dict[str, Any] = {
+            "task_id": task_id,
+            "name": str(name or "task").strip()[:80],
+            "enabled": bool(enabled),
+            "interval_sec": int(interval_sec),
+            "next_run_ts": now + interval_sec,
+            "created_ts": now,
+            "updated_ts": now,
+            "last_run_ts": 0.0,
+            "last_status": "never",
+            "last_note": "",
+            "run_count": 0,
+            "created_by": int(created_by),
+            "prompt": str(prompt or "").strip()[:2000],
+            "actions": [],
+        }
+        src_actions = actions or []
+        for cell in src_actions[:SELF_AUTOMATION_MAX_ACTIONS_PER_TASK]:
+            if isinstance(cell, dict):
+                row["actions"].append(cell)
+        self._self_automation_tasks()[task_id] = row
+        self.store.touch()
+        return task_id, row
+
+    def _record_self_automation_history(self, row: dict[str, Any]) -> None:
+        root = self._self_automation_root()
+        history = root.setdefault("history", [])
+        if not isinstance(history, list):
+            return
+        history.append(row)
+        if len(history) > SELF_AUTOMATION_MAX_HISTORY:
+            del history[: len(history) - SELF_AUTOMATION_MAX_HISTORY]
+        self.store.touch()
+
+    async def _plan_self_task_actions(self, task_row: dict[str, Any]) -> list[dict[str, Any]]:
+        prompt = str(task_row.get("prompt", "")).strip()
+        if not prompt:
+            actions = task_row.get("actions", [])
+            if isinstance(actions, list):
+                return [cell for cell in actions if isinstance(cell, dict)][:SELF_AUTOMATION_MAX_ACTIONS_PER_TASK]
+            return []
+        system_prompt = (
+            "You are Mandy autonomous scheduler planner. "
+            "Return strict JSON only: {\"actions\":[...]}. "
+            "Allowed actions only: run_housekeeping, refresh_global_menu, ensure_satellite, "
+            "toggle_ai_chat, toggle_ai_roast, test_ai_api, send_message, add_reaction, "
+            "edit_self_config, gather_guild_stats, shadow_action, invite_user, nickname_user, remove_user, send_shadow_message. "
+            "Max 6 actions."
+        )
+        user_prompt = (
+            f"Task id: {str(task_row.get('task_id', ''))}\n"
+            f"Task name: {str(task_row.get('name', ''))}\n"
+            f"Task prompt: {prompt}\n"
+            f"Admin guild id: {self.settings.admin_guild_id}\n"
+            f"Creator user id: {SUPER_USER_ID}"
+        )
+        raw = await self.ai.complete_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=700,
+            temperature=0.35,
+        )
+        parsed = self._extract_json_object_from_text(raw or "")
+        if not parsed:
+            return []
+        actions = parsed.get("actions", [])
+        if not isinstance(actions, list):
+            return []
+        return [cell for cell in actions if isinstance(cell, dict)][:SELF_AUTOMATION_MAX_ACTIONS_PER_TASK]
+
+    async def _run_self_automation_loop(self) -> None:
+        await asyncio.sleep(25)
+        while True:
+            try:
+                await self._run_self_automation_cycle_once()
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("self_automation.loop_failed", error=str(exc)[:300])
+            await asyncio.sleep(SELF_AUTOMATION_LOOP_INTERVAL_SEC)
+
+    async def _run_self_automation_cycle_once(self) -> None:
+        now = time.time()
+        tasks = self._self_automation_tasks()
+        if not tasks:
+            return
+        ran = 0
+        for task_id, row in list(tasks.items()):
+            if ran >= 3:
+                break
+            if not isinstance(row, dict):
+                continue
+            if not bool(row.get("enabled", True)):
+                continue
+            next_run = float(row.get("next_run_ts", 0.0) or 0.0)
+            if next_run > now:
+                continue
+            await self._run_self_automation_task(task_id)
+            ran += 1
+
+    async def _run_self_automation_task(self, task_id: str) -> list[str]:
+        tasks = self._self_automation_tasks()
+        row = tasks.get(task_id)
+        if not isinstance(row, dict):
+            return ["task not found"]
+        interval_sec = self._parse_interval_seconds(row.get("interval_sec", 300), default_seconds=300)
+        now = time.time()
+        row["next_run_ts"] = now + interval_sec
+        row["updated_ts"] = now
+        planned_actions = await self._plan_self_task_actions(row)
+        notes = await self._execute_god_mode_actions(None, planned_actions)
+        row["last_run_ts"] = now
+        row["run_count"] = int(row.get("run_count", 0) or 0) + 1
+        row["last_status"] = "ok" if notes else "noop"
+        row["last_note"] = (notes[0] if notes else "no actions executed")[:240]
+        self._record_self_automation_history(
+            {
+                "ts": datetime.now(tz=timezone.utc).isoformat(),
+                "task_id": task_id,
+                "task_name": str(row.get("name", ""))[:80],
+                "actions": len(planned_actions),
+                "notes": [str(n)[:200] for n in notes[:8]],
+            }
+        )
+        self.logger.log(
+            "self_automation.task_run",
+            task_id=task_id,
+            name=str(row.get("name", ""))[:80],
+            actions=len(planned_actions),
+            notes=len(notes),
+        )
+        self.store.touch()
+        return notes
 
     def _note_manual_shadow_invite(self, user_id: int, *, actor_id: int) -> None:
         """
@@ -944,6 +1190,252 @@ class MandyBot(commands.Bot):
         )
         return not any(term in text for term in suppress_terms)
 
+    def _extract_json_object_from_text(self, raw: str) -> dict[str, Any] | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+        if fence:
+            try:
+                parsed = json.loads(fence.group(1))
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(text[start : end + 1])
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    async def _plan_god_mode_actions(self, message: discord.Message, user_command: str) -> dict[str, Any]:
+        guild_id = message.guild.id if message.guild else 0
+        channel_id = message.channel.id
+        plan_prompt = (
+            f"{GOD_MODE_OVERRIDE_PROMPT_TEMPLATE.format(user_command=user_command)}\n"
+            "Return strict JSON with keys: message (string), actions (array).\n"
+            "Allowed actions (only these):\n"
+            "- run_housekeeping\n"
+            "- refresh_global_menu\n"
+            "- ensure_satellite {guild_id}\n"
+            "- toggle_ai_chat {guild_id}\n"
+            "- toggle_ai_roast {guild_id}\n"
+            "- test_ai_api {guild_id}\n"
+            "- send_message {channel_id,text}\n"
+            "- add_reaction {channel_id,message_id,emoji}\n"
+            "- edit_self_config {key,value}\n"
+            "- create_cron_task {name,interval,actions? or prompt?}\n"
+            "- run_cron_task {task_id}\n"
+            "- delete_cron_task {task_id}\n"
+            "- list_cron_tasks\n"
+            "- gather_guild_stats {guild_id?,channel_id?}\n"
+            "- shadow_action {action:'invite_user'|'nickname_user'|'remove_user'|'send_shadow_message', ...}\n"
+            "Max 6 actions. If no actions are needed, return empty actions.\n"
+            "Do not wrap in markdown."
+        )
+        user_prompt = (
+            f"Creator command: {user_command}\n"
+            f"Current guild_id: {guild_id}\n"
+            f"Current channel_id: {channel_id}\n"
+            f"Admin guild_id: {self.settings.admin_guild_id}\n"
+            f"Creator user_id: {SUPER_USER_ID}"
+        )
+        raw = await self.ai.complete_text(
+            system_prompt=plan_prompt,
+            user_prompt=user_prompt,
+            max_tokens=900,
+            temperature=0.35,
+        )
+        parsed = self._extract_json_object_from_text(raw or "")
+        if not parsed:
+            return {"message": str(raw or "").strip()[:1200], "actions": []}
+        actions = parsed.get("actions", [])
+        if not isinstance(actions, list):
+            actions = []
+        return {"message": str(parsed.get("message", "")).strip(), "actions": actions[:6]}
+
+    async def _execute_god_mode_actions(self, message: discord.Message | None, actions: list[Any]) -> list[str]:
+        notes: list[str] = []
+        admin_guild = self.get_guild(self.settings.admin_guild_id)
+        default_guild_id = message.guild.id if (message and message.guild) else self.settings.admin_guild_id
+        default_channel_id = message.channel.id if message else 0
+        shadow_actions: list[dict[str, Any]] = []
+        for row in actions:
+            if not isinstance(row, dict):
+                continue
+            action = str(row.get("action", "")).strip()
+            try:
+                if action == "run_housekeeping":
+                    summary = await self._run_housekeeping_once()
+                    notes.append(f"housekeeping scanned={summary.get('scanned', 0)} deleted={summary.get('deleted', 0)}")
+                    continue
+                if action == "refresh_global_menu":
+                    await self._ensure_global_menu_panel(force_refresh=True)
+                    notes.append("global menu refreshed")
+                    continue
+                if action == "ensure_satellite":
+                    gid = int(row.get("guild_id", 0) or 0)
+                    guild = self.get_guild(gid)
+                    if guild:
+                        await self.mirrors.ensure_satellite(self, guild)
+                        await self._ensure_satellite_debug_panel(guild, force_invite_refresh=False)
+                        notes.append(f"satellite ensured for guild_id={gid}")
+                    else:
+                        notes.append(f"ensure_satellite skipped (guild not found: {gid})")
+                    continue
+                if action in ("toggle_ai_chat", "toggle_ai_roast", "test_ai_api"):
+                    gid = int(row.get("guild_id", 0) or 0) or int(default_guild_id)
+                    if gid > 0:
+                        result = await self._perform_satellite_action(gid, action, actor_id=SUPER_USER_ID, via_request=False)
+                        notes.append(result[:160])
+                    continue
+                if action == "send_message":
+                    channel_id = int(row.get("channel_id", 0) or 0) or int(default_channel_id)
+                    text = str(row.get("text", "")).strip()
+                    channel = self.get_channel(channel_id)
+                    if channel and text:
+                        parts = await self._send_split_channel_message(channel, text)
+                        notes.append(f"sent message to channel_id={channel_id} parts={parts}")
+                    else:
+                        notes.append("send_message skipped (missing channel/text)")
+                    continue
+                if action == "add_reaction":
+                    channel_id = int(row.get("channel_id", 0) or 0)
+                    message_id = int(row.get("message_id", 0) or 0)
+                    emoji = str(row.get("emoji", "")).strip() or "✅"
+                    channel = self.get_channel(channel_id)
+                    if isinstance(channel, discord.TextChannel):
+                        target = await channel.fetch_message(message_id)
+                        await target.add_reaction(emoji)
+                        notes.append(f"reaction added in channel_id={channel_id}")
+                    else:
+                        notes.append("add_reaction skipped (channel not found)")
+                    continue
+                if action == "edit_self_config":
+                    key = str(row.get("key", "")).strip()
+                    value = row.get("value")
+                    if key:
+                        self.ai.edit_self_config(key, value, actor_user_id=SUPER_USER_ID, source="god_mode_actions")
+                        notes.append(f"self_config updated: {key}")
+                    continue
+                if action == "create_cron_task":
+                    name = str(row.get("name", "task")).strip() or "task"
+                    interval = row.get("interval", "5m")
+                    prompt = str(row.get("prompt", "") or "").strip()
+                    task_actions = row.get("actions", [])
+                    if not isinstance(task_actions, list):
+                        task_actions = []
+                    task_id, task_row = self._create_self_automation_task(
+                        name=name,
+                        interval=interval,
+                        actions=[x for x in task_actions if isinstance(x, dict)],
+                        prompt=prompt,
+                        created_by=SUPER_USER_ID,
+                        enabled=bool(row.get("enabled", True)),
+                    )
+                    notes.append(
+                        f"cron task created: {task_id} interval={int(task_row.get('interval_sec', 0))}s "
+                        f"prompt={'yes' if str(task_row.get('prompt', '')).strip() else 'no'}"
+                    )
+                    continue
+                if action == "run_cron_task":
+                    task_id = str(row.get("task_id", "")).strip()
+                    if not task_id:
+                        notes.append("run_cron_task skipped (missing task_id)")
+                        continue
+                    task_notes = await self._run_self_automation_task(task_id)
+                    notes.append(f"cron task run: {task_id} notes={len(task_notes)}")
+                    continue
+                if action == "delete_cron_task":
+                    task_id = str(row.get("task_id", "")).strip()
+                    tasks = self._self_automation_tasks()
+                    existed = task_id in tasks
+                    if existed:
+                        tasks.pop(task_id, None)
+                        self.store.touch()
+                    notes.append(f"cron task deleted: {task_id} existed={existed}")
+                    continue
+                if action == "list_cron_tasks":
+                    tasks = self._self_automation_tasks()
+                    if not tasks:
+                        notes.append("cron tasks: none")
+                        continue
+                    names = []
+                    for task_id, task_row in list(tasks.items())[:8]:
+                        names.append(
+                            f"{task_id}:{str(task_row.get('name', 'task'))[:24]}:"
+                            f"{'on' if bool(task_row.get('enabled', True)) else 'off'}"
+                        )
+                    notes.append(f"cron tasks: {', '.join(names)}")
+                    continue
+                if action == "gather_guild_stats":
+                    gid = int(row.get("guild_id", 0) or 0) or int(default_guild_id)
+                    guild = self.get_guild(gid)
+                    if not guild:
+                        notes.append(f"gather_guild_stats skipped (guild not found: {gid})")
+                        continue
+                    observation = {
+                        "ts": datetime.now(tz=timezone.utc).isoformat(),
+                        "guild_id": guild.id,
+                        "guild_name": guild.name[:120],
+                        "member_count": int(getattr(guild, "member_count", 0) or 0),
+                        "text_channels": len(guild.text_channels),
+                        "voice_channels": len(guild.voice_channels),
+                        "roles": len(guild.roles),
+                        "threads": len(guild.threads),
+                    }
+                    root = self._self_automation_root()
+                    observations = root.setdefault("observations", [])
+                    if isinstance(observations, list):
+                        observations.append(observation)
+                        if len(observations) > SELF_AUTOMATION_MAX_HISTORY:
+                            del observations[: len(observations) - SELF_AUTOMATION_MAX_HISTORY]
+                    self.store.touch()
+                    out_channel_id = int(row.get("channel_id", 0) or 0)
+                    if out_channel_id > 0:
+                        channel = self.get_channel(out_channel_id)
+                        if channel:
+                            await self._send_split_channel_message(
+                                channel,
+                                (
+                                    f"[gather] {guild.name} ({guild.id}) members={observation['member_count']} "
+                                    f"text={observation['text_channels']} voice={observation['voice_channels']} "
+                                    f"roles={observation['roles']} threads={observation['threads']}"
+                                ),
+                            )
+                    notes.append(f"gathered guild stats: {guild.id}")
+                    continue
+                if action == "shadow_action":
+                    payload = row.get("payload")
+                    if isinstance(payload, dict):
+                        shadow_actions.append(payload)
+                    continue
+                if action in ("invite_user", "nickname_user", "remove_user", "send_shadow_message"):
+                    shadow_actions.append(row)
+                    continue
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"{action or 'unknown_action'} failed: {str(exc)[:160]}")
+
+        if shadow_actions and admin_guild:
+            try:
+                results = await self.shadow.execute_ai_actions(self, admin_guild, shadow_actions)
+                ok_count = sum(1 for r in results if bool(r.get("ok")))
+                notes.append(f"shadow actions executed: {ok_count}/{len(results)} ok")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"shadow action batch failed: {str(exc)[:160]}")
+        return notes
+
     async def handle_god_mode_command(self, message: discord.Message, user_command: str) -> None:
         command = str(user_command or "").strip()
         if not command:
@@ -962,11 +1454,23 @@ class MandyBot(commands.Bot):
                     await self._send_split_channel_message(message.channel, f"Self config updated: `{key}`")
                 return
 
+        plan = await self._plan_god_mode_actions(message, command)
+        planned_actions = plan.get("actions", [])
+        if not isinstance(planned_actions, list):
+            planned_actions = []
+        action_notes = await self._execute_god_mode_actions(message, planned_actions)
+
         system_prompt = GOD_MODE_OVERRIDE_PROMPT_TEMPLATE.format(user_command=command)
+        action_summary = "\n".join(f"- {line}" for line in action_notes) if action_notes else "- no executable actions ran"
         response = await self.ai.complete_text(
             system_prompt=system_prompt,
-            user_prompt="Creator command received. Execute with maximum speed and precision.",
-            max_tokens=850,
+            user_prompt=(
+                "Creator command received and executed.\n"
+                f"Plan summary message: {str(plan.get('message', ''))[:300]}\n"
+                f"Execution notes:\n{action_summary}\n"
+                "Report concise results and remaining steps."
+            ),
+            max_tokens=700,
             temperature=0.8,
         )
         self.logger.log(
@@ -974,6 +1478,8 @@ class MandyBot(commands.Bot):
             user_id=message.author.id,
             guild_id=message.guild.id if message.guild else 0,
             command_chars=len(command),
+            planned_actions=len(planned_actions),
+            executed_notes=len(action_notes),
             output_chars=len(response or ""),
         )
         if response and self._god_mode_wants_output(command):
@@ -2050,5 +2556,6 @@ def main() -> None:
     settings = Settings.load()
     bot = MandyBot(settings)
     bot.run(settings.discord_token)
+
 
 
