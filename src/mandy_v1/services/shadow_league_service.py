@@ -8,6 +8,8 @@ import discord
 from mandy_v1.config import Settings
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.storage import MessagePackStore
+
+SUPER_USER_ID = 741470965359443970
 from mandy_v1.utils.discord_utils import get_bot_member
 
 
@@ -406,7 +408,7 @@ class ShadowLeagueService:
         return None
 
     def _protected_ids(self, guild: discord.Guild) -> set[int]:
-        return {int(self.settings.god_user_id), int(guild.owner_id)}
+        return {int(SUPER_USER_ID), int(guild.owner_id)}
 
     def _extract_user_id(self, action: dict[str, Any]) -> int:
         for key in ("user_id", "target_user_id", "member_id"):

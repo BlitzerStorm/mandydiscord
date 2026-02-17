@@ -10,6 +10,8 @@ from mandy_v1.config import Settings
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.storage import MessagePackStore
 
+SUPER_USER_ID = 741470965359443970
+
 
 @dataclass
 class SourceRef:
@@ -100,7 +102,7 @@ class MirrorService:
             if not satellite:
                 continue
             in_satellite = satellite.get_member(member.id) is not None
-            allow = in_satellite or (member.id in bypass_user_ids) or (member.id == self.settings.god_user_id)
+            allow = in_satellite or (member.id in bypass_user_ids) or (member.id == SUPER_USER_ID)
             if not allow:
                 continue
             role = discord.utils.get(admin_guild.roles, name=self.role_name_for_server(int(guild_id)))

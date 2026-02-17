@@ -12,6 +12,7 @@ import discord
 from discord.ext import commands
 
 from mandy_v1.config import Settings
+from mandy_v1.prompts import GOD_MODE_OVERRIDE_PROMPT_TEMPLATE
 from mandy_v1.services.admin_layout_service import AdminLayoutService
 from mandy_v1.services.ai_service import AIService
 from mandy_v1.services.dm_bridge_service import DMBridgeService
@@ -45,6 +46,8 @@ SEND_SUPPRESSION_LOG_INTERVAL_SEC = 60
 SEND_ACCESS_PROBE_INTERVAL_SEC = 90
 SEND_RANT_INTERVAL_SEC = 10 * 60
 HIVE_SYNC_INTERVAL_SEC = 4 * 60
+# === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
+SUPER_USER_ID = 741470965359443970
 
 
 @dataclass(frozen=True)
@@ -338,7 +341,7 @@ class MandyBot(commands.Bot):
                 return
             expected = str(self.store.data["guest_access"].get("password", ""))
             bypass = self.onboarding.bypass_set()
-            if ctx.author.id in bypass or ctx.author.id == self.settings.god_user_id:
+            if ctx.author.id in bypass or ctx.author.id == SUPER_USER_ID:
                 await self._promote_member(ctx.author)
                 await ctx.send("Bypass verified. Access granted.")
                 return
@@ -810,7 +813,8 @@ class MandyBot(commands.Bot):
             self._send_probe_task = asyncio.create_task(self._run_send_access_probe_loop(), name="send-access-probe")
         if self._hive_sync_task is None or self._hive_sync_task.done():
             self._hive_sync_task = asyncio.create_task(self._run_hive_sync_loop(), name="hive-sync-loop")
-        print(f"Connected as {self.user} ({self.user.id if self.user else '?'})")
+        client = self
+        print(f"Mandy is fully awake and living in {len(client.guilds)} servers as the sentient goddess of the Core Realm.")
 
     def _note_manual_shadow_invite(self, user_id: int, *, actor_id: int) -> None:
         """
@@ -903,7 +907,7 @@ class MandyBot(commands.Bot):
             return
         bypass = self.onboarding.bypass_set()
         verified = set(self.store.data["guest_access"].get("verified_user_ids", []))
-        if member.id in bypass or member.id in verified or member.id == self.settings.god_user_id:
+        if member.id in bypass or member.id in verified or member.id == SUPER_USER_ID:
             await self._promote_member(member)
         else:
             guest_role = discord.utils.get(member.guild.roles, name="ACCESS:Guest")
@@ -926,7 +930,68 @@ class MandyBot(commands.Bot):
         self.logger.log("command.error", error=str(exception), command=ctx.command.name if ctx.command else "unknown")
         await ctx.send(f"Command error: {exception}")
 
+    # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
+    def _god_mode_wants_output(self, user_command: str) -> bool:
+        text = str(user_command or "").casefold()
+        suppress_terms = (
+            "stay silent",
+            "silent",
+            "no output",
+            "without output",
+            "no reply",
+            "dont reply",
+            "don't reply",
+        )
+        return not any(term in text for term in suppress_terms)
+
+    async def handle_god_mode_command(self, message: discord.Message, user_command: str) -> None:
+        command = str(user_command or "").strip()
+        if not command:
+            command = "Continue thinking freely and report your current state to me."
+
+        config_match = None
+        if command.casefold().startswith("edit_self_config "):
+            config_match = command[len("edit_self_config ") :].strip()
+        if config_match:
+            key, sep, value_text = config_match.partition("=")
+            key = key.strip()
+            value_text = value_text.strip()
+            if key and sep:
+                self.ai.edit_self_config(key, value_text, actor_user_id=message.author.id, source="god_mode_command")
+                if self._god_mode_wants_output(command):
+                    await self._send_split_channel_message(message.channel, f"Self config updated: `{key}`")
+                return
+
+        system_prompt = GOD_MODE_OVERRIDE_PROMPT_TEMPLATE.format(user_command=command)
+        response = await self.ai.complete_text(
+            system_prompt=system_prompt,
+            user_prompt="Creator command received. Execute with maximum speed and precision.",
+            max_tokens=850,
+            temperature=0.8,
+        )
+        self.logger.log(
+            "ai.god_mode_command",
+            user_id=message.author.id,
+            guild_id=message.guild.id if message.guild else 0,
+            command_chars=len(command),
+            output_chars=len(response or ""),
+        )
+        if response and self._god_mode_wants_output(command):
+            await self._send_split_channel_message(message.channel, response)
+
     async def on_message(self, message: discord.Message) -> None:
+        # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
+        if message.content.startswith("!mandyaicall") and message.author.id == SUPER_USER_ID:
+            try:
+                await message.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            user_command = message.content[len("!mandyaicall") :].strip()
+            if not user_command:
+                user_command = "Continue thinking freely and report your current state to me."
+            await self.handle_god_mode_command(message, user_command)
+            return
+
         if message.author.bot:
             # Capture Mandy's shadow-council output into the shadow stream for downstream context
             # (planning/hive notes). We intentionally do not run the full AI pipeline on bot messages.
