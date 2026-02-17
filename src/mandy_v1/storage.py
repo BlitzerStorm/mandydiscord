@@ -51,6 +51,14 @@ DEFAULT_STORE: dict[str, Any] = {
         "profiles": {},
         "memory_facts": {},
         "relationships": {},
+        "guild_style": {},
+        "prompt_injection": {
+            "master_prompt": "",
+            "master_learning_mode": "full",
+            "guild_prompts": {},
+            "guild_learning_modes": {},
+            "audit_log": [],
+        },
         "warmup": {},
         "shadow_brain": {
             "events": [],

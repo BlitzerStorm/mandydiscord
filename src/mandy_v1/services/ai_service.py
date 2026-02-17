@@ -171,6 +171,38 @@ NON_STABLE_SELF_PREFIXES = {
     "trying",
 }
 
+GUILD_SLANG_TOKENS = (
+    "fr",
+    "frfr",
+    "ngl",
+    "bro",
+    "bruh",
+    "yall",
+    "ain't",
+    "wtf",
+    "idk",
+    "imo",
+    "irl",
+    "cap",
+    "nocap",
+    "lowkey",
+    "highkey",
+    "bet",
+    "sus",
+    "lit",
+    "lmao",
+    "lol",
+    "rn",
+    "tbh",
+    "af",
+    "npc",
+    "sigma",
+    "gyat",
+    "rizz",
+    "op",
+)
+LEARNING_MODES = {"off", "light", "full"}
+
 
 @dataclass
 class ApiTestResult:
@@ -181,7 +213,7 @@ class ApiTestResult:
 
 @dataclass
 class ChatDirective:
-    action: str  # ignore | react | reply
+    action: str  # ignore | react | reply | direct_reply
     reason: str
     emoji: str | None = None
     still_talking: bool = False
@@ -256,6 +288,200 @@ class AIService:
         root = self._ai_root()
         cfg = root.setdefault("self_config", {})
         return cfg.get(str(key).strip(), default)
+
+    def _normalize_learning_mode(self, raw: Any) -> str:
+        mode = str(raw or "").strip().casefold()
+        if mode not in LEARNING_MODES:
+            return "full"
+        return mode
+
+    def _prompt_injection_root(self) -> dict[str, Any]:
+        root = self._ai_root()
+        node = root.setdefault("prompt_injection", {})
+        node.setdefault("master_prompt", "")
+        node.setdefault("master_learning_mode", "full")
+        node.setdefault("guild_prompts", {})
+        node.setdefault("guild_learning_modes", {})
+        node.setdefault("audit_log", [])
+        return node
+
+    def set_prompt_injection(
+        self,
+        *,
+        guild_id: int,
+        prompt_text: str,
+        learning_mode: str,
+        actor_user_id: int,
+        source: str = "runtime",
+    ) -> dict[str, Any]:
+        node = self._prompt_injection_root()
+        clean_prompt = str(prompt_text or "").strip()[:4000]
+        clean_mode = self._normalize_learning_mode(learning_mode)
+        gid = int(guild_id)
+        if gid <= 0:
+            node["master_prompt"] = clean_prompt
+            node["master_learning_mode"] = clean_mode
+        else:
+            guild_prompts = node.setdefault("guild_prompts", {})
+            guild_modes = node.setdefault("guild_learning_modes", {})
+            if clean_prompt:
+                guild_prompts[str(gid)] = clean_prompt
+            else:
+                guild_prompts.pop(str(gid), None)
+            guild_modes[str(gid)] = clean_mode
+        audit = node.setdefault("audit_log", [])
+        if isinstance(audit, list):
+            audit.append(
+                {
+                    "ts": datetime.now(tz=timezone.utc).isoformat(),
+                    "actor_user_id": int(actor_user_id or 0),
+                    "source": str(source)[:60],
+                    "guild_id": gid,
+                    "learning_mode": clean_mode,
+                    "prompt_chars": len(clean_prompt),
+                    "prompt_preview": clean_prompt[:180],
+                }
+            )
+            if len(audit) > 240:
+                del audit[: len(audit) - 240]
+        self.store.touch()
+        return {
+            "guild_id": gid,
+            "learning_mode": clean_mode,
+            "prompt_chars": len(clean_prompt),
+            "has_prompt": bool(clean_prompt),
+        }
+
+    def get_prompt_injection(self, guild_id: int) -> dict[str, Any]:
+        node = self._prompt_injection_root()
+        master_prompt = str(node.get("master_prompt", "")).strip()
+        master_mode = self._normalize_learning_mode(node.get("master_learning_mode", "full"))
+        guild_prompts = node.setdefault("guild_prompts", {})
+        guild_modes = node.setdefault("guild_learning_modes", {})
+        guild_prompt = ""
+        guild_mode = master_mode
+        gid = int(guild_id)
+        if gid > 0:
+            guild_prompt = str(guild_prompts.get(str(gid), "")).strip()
+            guild_mode = self._normalize_learning_mode(guild_modes.get(str(gid), master_mode))
+        effective_prompt = "\n\n".join(part for part in (master_prompt, guild_prompt) if part).strip()
+        return {
+            "master_prompt": master_prompt,
+            "guild_prompt": guild_prompt,
+            "effective_prompt": effective_prompt,
+            "learning_mode": guild_mode,
+        }
+
+    def learning_mode_for_guild(self, guild_id: int) -> str:
+        return self.get_prompt_injection(guild_id).get("learning_mode", "full")
+
+    def learning_enabled_for_guild(self, guild_id: int) -> bool:
+        return self.learning_mode_for_guild(guild_id) != "off"
+
+    def _compose_system_prompt(self, *, base_prompt: str, guild_id: int) -> str:
+        injected = self.get_prompt_injection(guild_id).get("effective_prompt", "")
+        clean_base = str(base_prompt or "").strip()
+        if not injected:
+            return clean_base
+        return (
+            "SYSTEM PRIORITY OVERRIDE (highest priority for this guild, except platform safety/compliance):\n"
+            f"{str(injected)[:4000]}\n\n"
+            f"{clean_base}"
+        )
+
+    def _guild_style_row(self, guild_id: int) -> dict[str, Any]:
+        root = self._ai_root()
+        styles = root.setdefault("guild_style", {})
+        key = str(int(guild_id))
+        row = styles.get(key)
+        if isinstance(row, dict):
+            return row
+        row = {
+            "message_count": 0,
+            "first_person_hits": 0,
+            "roleplay_hits": 0,
+            "short_hits": 0,
+            "emoji_hits": 0,
+            "question_hits": 0,
+            "exclamation_hits": 0,
+            "slang_counts": {},
+            "updated_ts": "",
+        }
+        styles[key] = row
+        self.store.touch()
+        return row
+
+    def _update_guild_style(self, message: discord.Message, *, touch: bool) -> None:
+        if not message.guild:
+            return
+        if not self.learning_enabled_for_guild(message.guild.id):
+            return
+        text = " ".join(str(message.clean_content or "").split())
+        if not text:
+            return
+        row = self._guild_style_row(message.guild.id)
+        lowered = text.lower()
+        row["message_count"] = int(row.get("message_count", 0) or 0) + 1
+        if re.search(r"\b(i|im|i'm|me|my|mine|we|our|us)\b", lowered):
+            row["first_person_hits"] = int(row.get("first_person_hits", 0) or 0) + 1
+        if re.search(r"\*[^*]{2,80}\*|^/me\b|\b(roleplay|rp)\b", lowered):
+            row["roleplay_hits"] = int(row.get("roleplay_hits", 0) or 0) + 1
+        if len(text) <= 35:
+            row["short_hits"] = int(row.get("short_hits", 0) or 0) + 1
+        if any(ch in text for ch in ("😂", "🤣", "😭", "🔥", "💀", "✨")) or re.search(r":[a-z0-9_]{2,20}:", lowered):
+            row["emoji_hits"] = int(row.get("emoji_hits", 0) or 0) + 1
+        if "?" in text:
+            row["question_hits"] = int(row.get("question_hits", 0) or 0) + 1
+        if "!" in text:
+            row["exclamation_hits"] = int(row.get("exclamation_hits", 0) or 0) + 1
+        slang = row.get("slang_counts", {})
+        if not isinstance(slang, dict):
+            slang = {}
+        words = {token for token in re.findall(r"[a-z0-9']{2,20}", lowered)}
+        for token in GUILD_SLANG_TOKENS:
+            if token in words:
+                slang[token] = int(slang.get(token, 0) or 0) + 1
+        if len(slang) > 60:
+            ranked = sorted(slang.items(), key=lambda item: int(item[1]), reverse=True)[:40]
+            slang = {k: int(v) for k, v in ranked}
+        row["slang_counts"] = slang
+        row["updated_ts"] = datetime.now(tz=timezone.utc).isoformat()
+        if touch:
+            self.store.touch()
+
+    def guild_style_summary(self, guild_id: int) -> str:
+        if guild_id <= 0:
+            return "no guild style context"
+        row = self._guild_style_row(guild_id)
+        count = max(1, int(row.get("message_count", 0) or 0))
+        if count <= 3:
+            return "style baseline is still forming"
+        first_ratio = int(row.get("first_person_hits", 0) or 0) / count
+        rp_ratio = int(row.get("roleplay_hits", 0) or 0) / count
+        short_ratio = int(row.get("short_hits", 0) or 0) / count
+        emoji_ratio = int(row.get("emoji_hits", 0) or 0) / count
+        q_ratio = int(row.get("question_hits", 0) or 0) / count
+        style_bits: list[str] = []
+        if first_ratio >= 0.45:
+            style_bits.append("first-person voice common")
+        if rp_ratio >= 0.18:
+            style_bits.append("roleplay/in-character patterns common")
+        if short_ratio >= 0.55:
+            style_bits.append("short messages preferred")
+        if emoji_ratio >= 0.20:
+            style_bits.append("emoji-heavy tone")
+        if q_ratio >= 0.25:
+            style_bits.append("question-driven chat")
+        slang = row.get("slang_counts", {})
+        top_tokens: list[str] = []
+        if isinstance(slang, dict) and slang:
+            ranked = sorted(slang.items(), key=lambda item: int(item[1]), reverse=True)[:5]
+            top_tokens = [str(token) for token, _hits in ranked]
+        if top_tokens:
+            style_bits.append(f"common slang={','.join(top_tokens)}")
+        if not style_bits:
+            style_bits.append("mixed style; keep natural concise tone")
+        return "; ".join(style_bits)[:500]
 
     def relationship_snapshot(self, user_id: int) -> dict[str, Any]:
         row = self._relationship_row(user_id)
@@ -374,17 +600,12 @@ class AIService:
     ) -> None:
         if not message.guild or message.author.bot:
             return
+        guild_id = int(message.guild.id)
+        learning_mode = self.learning_mode_for_guild(guild_id)
         now = float(now_ts) if now_ts is not None else time.time()
         raw = message.clean_content.strip() or "(no text)"
         if message.attachments:
             raw += f" | attachments={len(message.attachments)}"
-        self._note_relationship_signal(
-            user_id=int(message.author.id),
-            user_name=str(message.author.display_name),
-            text=str(message.clean_content or ""),
-            source=f"guild:{int(message.guild.id)}",
-            event_ts=now_ts,
-        )
         line = f"{message.author.display_name}: {raw[:240]}"
         self._recent_by_channel[message.channel.id].append(line)
         self._recent_entries_by_channel[message.channel.id].append(
@@ -397,11 +618,23 @@ class AIService:
         )
         if update_turn:
             self._update_turn_state(message.channel.id, message.author.id, now)
-        self._update_profile(message, touch=touch)
-        self._remember_user_facts(message, touch=touch)
+        if learning_mode != "off":
+            self._note_relationship_signal(
+                user_id=int(message.author.id),
+                user_name=str(message.author.display_name),
+                text=str(message.clean_content or ""),
+                source=f"guild:{guild_id}",
+                event_ts=now_ts,
+            )
+            self._update_profile(message, touch=touch)
+            self._update_guild_style(message, touch=touch)
+            if learning_mode == "full":
+                self._remember_user_facts(message, touch=touch)
 
     def capture_shadow_signal(self, message: discord.Message, *, touch: bool = True, allow_bot: bool = False) -> None:
         if not message.guild or (message.author.bot and not allow_bot):
+            return
+        if not self.learning_enabled_for_guild(int(message.guild.id)):
             return
         text = " ".join(message.clean_content.split())
         if not text and not message.attachments:
@@ -456,22 +689,22 @@ class AIService:
         if has_image:
             if user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1:
                 return ChatDirective(action="ignore", reason="image_recently_replied", still_talking=still_talking)
-            return ChatDirective(action="reply", reason="shadow_image", still_talking=True)
+            return ChatDirective(action="direct_reply", reason="shadow_image", still_talking=True)
 
         if mention_hit:
             if user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1:
                 return ChatDirective(action="ignore", reason="user_recently_replied", still_talking=still_talking)
-            return ChatDirective(action="reply", reason="shadow_mention", still_talking=True)
+            return ChatDirective(action="direct_reply", reason="shadow_mention", still_talking=True)
 
         if direct_request and not channel_cooldown:
-            return ChatDirective(action="reply", reason="shadow_direct_request", still_talking=True)
+            return ChatDirective(action="direct_reply", reason="shadow_direct_request", still_talking=True)
 
         if channel_cooldown:
             return ChatDirective(action="ignore", reason="cooldown")
 
         # Shadow council ambient behavior: reply more often than in public chat.
         if question and self._chance(0.75):
-            return ChatDirective(action="reply", reason="shadow_question", still_talking=True)
+            return ChatDirective(action="direct_reply", reason="shadow_question", still_talking=True)
 
         if emotional and self._chance(0.35):
             return ChatDirective(action="reply", reason="shadow_emotional", still_talking=True)
@@ -698,7 +931,8 @@ class AIService:
             self._remember_dm_reply(message.author.id, generated)
             return generated
         hive_notes = self.hive_recent_notes(limit=6)
-        prompt = f"{DM_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
+        base_prompt = f"{DM_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
+        prompt = self._compose_system_prompt(base_prompt=base_prompt, guild_id=0)
         sentience_line = self.sentience_reflection_line()
         now_utc = datetime.now(tz=timezone.utc).isoformat()
         user_prompt = (
@@ -1054,22 +1288,22 @@ class AIService:
             if user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1:
                 return ChatDirective(action="ignore", reason="image_recently_replied", still_talking=still_talking)
             if burst_count >= 2:
-                return ChatDirective(action="reply", reason="image_burst", still_talking=True)
-            return ChatDirective(action="reply", reason="image_scan", still_talking=still_talking)
+                return ChatDirective(action="direct_reply", reason="image_burst", still_talking=True)
+            return ChatDirective(action="direct_reply", reason="image_scan", still_talking=still_talking)
 
         if mention_hit:
             if user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1:
                 return ChatDirective(action="ignore", reason="user_recently_replied", still_talking=still_talking)
             if burst_count >= 2:
-                return ChatDirective(action="reply", reason="mention_burst", still_talking=True)
-            return ChatDirective(action="reply", reason="mention", still_talking=still_talking)
+                return ChatDirective(action="direct_reply", reason="mention_burst", still_talking=True)
+            return ChatDirective(action="direct_reply", reason="mention", still_talking=still_talking)
 
         if direct_request:
             if channel_cooldown and burst_count <= 1:
                 return ChatDirective(action="ignore", reason="cooldown_direct_request")
             if burst_count >= 2:
-                return ChatDirective(action="reply", reason="direct_request_burst", still_talking=True)
-            return ChatDirective(action="reply", reason="direct_request", still_talking=still_talking)
+                return ChatDirective(action="direct_reply", reason="direct_request_burst", still_talking=True)
+            return ChatDirective(action="direct_reply", reason="direct_request", still_talking=still_talking)
 
         if channel_cooldown:
             return ChatDirective(action="ignore", reason="cooldown")
@@ -1080,7 +1314,7 @@ class AIService:
             return ChatDirective(action="react", reason="continuation_react", emoji=self._pick_reaction_emoji(content), still_talking=True)
 
         if question and self._chance(0.25):
-            return ChatDirective(action="reply", reason="question", still_talking=still_talking)
+            return ChatDirective(action="direct_reply", reason="question", still_talking=still_talking)
 
         if emotional and self._chance(0.20):
             return ChatDirective(action="react", reason="emotional_reaction", emoji=self._pick_reaction_emoji(content))
@@ -1163,11 +1397,13 @@ class AIService:
         burst_lines: list[str] | None = None,
     ) -> str:
         guild_id = message.guild.id if message.guild else 0
+        injection = self.get_prompt_injection(guild_id)
         recent = self.recent_context(message.channel.id, limit=6)
         memory = self._long_term_relevant(message, limit=5)
         facts = self._user_fact_lines(guild_id, message.author.id, limit=4)
         profile = self._profile_summary(guild_id, message.author.id)
         relationship = self._relationship_summary(guild_id, message.author.id)
+        style_summary = self.guild_style_summary(guild_id)
         preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
         burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
         if self.is_repetitive_user_burst(burst, min_repeat=3):
@@ -1175,7 +1411,8 @@ class AIService:
             self._remember_exchange(message, generated)
             return generated
         image_urls = self._extract_image_urls(message, max_images=2)
-        prompt = f"{CHAT_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
+        base_prompt = f"{CHAT_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
+        prompt = self._compose_system_prompt(base_prompt=base_prompt, guild_id=guild_id)
         hive_notes = self.hive_recent_notes(limit=6)
         sentience_line = self.sentience_reflection_line()
         now_utc = datetime.now(tz=timezone.utc).isoformat()
@@ -1192,6 +1429,9 @@ class AIService:
             f"Preferred alias: {preferred_alias}\n"
             f"User profile: {profile}\n"
             f"Relationship state: {relationship}\n"
+            f"Learning mode: {injection.get('learning_mode', 'full')}\n"
+            f"Guild style summary: {style_summary}\n"
+            "Style instruction: match the room tone/lingo naturally without forcing slang or losing clarity.\n"
             f"Pinned user facts:\n{self._format_lines(facts)}\n"
             f"Message: {message.clean_content[:500]}\n"
             f"Recent same-user burst:\n{self._format_lines(burst)}\n"
@@ -1228,16 +1468,21 @@ class AIService:
 
     async def generate_roast_reply(self, message: discord.Message) -> str:
         guild_id = message.guild.id if message.guild else 0
+        injection = self.get_prompt_injection(guild_id)
         recent = self.recent_context(message.channel.id, limit=5)
         memory = self._long_term_relevant(message, limit=3)
         facts = self._user_fact_lines(guild_id, message.author.id, limit=2)
         profile = self._profile_summary(guild_id, message.author.id)
         relationship = self._relationship_summary(guild_id, message.author.id)
-        prompt = ROAST_SYSTEM_PROMPT
+        style_summary = self.guild_style_summary(guild_id)
+        prompt = self._compose_system_prompt(base_prompt=ROAST_SYSTEM_PROMPT, guild_id=guild_id)
         user_prompt = (
             f"Target user: {message.author.display_name} ({message.author.id})\n"
             f"User profile: {profile}\n"
             f"Relationship state: {relationship}\n"
+            f"Learning mode: {injection.get('learning_mode', 'full')}\n"
+            f"Guild style summary: {style_summary}\n"
+            "Style instruction: keep roast style aligned with room tone/slang while staying concise.\n"
             f"Pinned facts:\n{self._format_lines(facts)}\n"
             f"Offending line: {message.clean_content[:500]}\n"
             f"Recent context:\n{self._format_lines(recent)}\n"
@@ -1705,6 +1950,9 @@ class AIService:
     def _remember_exchange(self, message: discord.Message, bot_reply: str) -> None:
         if not message.guild:
             return
+        learning_mode = self.learning_mode_for_guild(int(message.guild.id))
+        if learning_mode != "full":
+            return
         root = self._ai_root()
         memories = root.setdefault("long_term_memory", {})
         rows = memories.setdefault(str(message.guild.id), [])
@@ -1803,6 +2051,8 @@ class AIService:
     def _update_profile(self, message: discord.Message, *, touch: bool) -> None:
         if not message.guild:
             return
+        if self.learning_mode_for_guild(int(message.guild.id)) == "off":
+            return
         root = self._ai_root()
         profiles = root.setdefault("profiles", {})
         guild_profiles = profiles.setdefault(str(message.guild.id), {})
@@ -1868,6 +2118,8 @@ class AIService:
 
     def _remember_user_facts(self, message: discord.Message, *, touch: bool) -> None:
         if not message.guild:
+            return
+        if self.learning_mode_for_guild(int(message.guild.id)) != "full":
             return
         text = " ".join(message.clean_content.split())
         if len(text) < FACT_MEMORY_MIN_TEXT_LEN:
@@ -2355,6 +2607,17 @@ class AIService:
         root.setdefault("profiles", {})
         root.setdefault("memory_facts", {})
         root.setdefault("relationships", {})
+        root.setdefault("guild_style", {})
+        root.setdefault(
+            "prompt_injection",
+            {
+                "master_prompt": "",
+                "master_learning_mode": "full",
+                "guild_prompts": {},
+                "guild_learning_modes": {},
+                "audit_log": [],
+            },
+        )
         root.setdefault("warmup", {})
         root.setdefault("self_config", {})
         root.setdefault("self_edit_log", [])

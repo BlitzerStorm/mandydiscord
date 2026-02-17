@@ -51,6 +51,51 @@ class GlobalSatellitePickerModal(discord.ui.Modal):
         await handler(interaction=interaction, satellite_guild_id=int(raw))
 
 
+class PromptInjectionModal(discord.ui.Modal):
+    def __init__(self, bot: discord.Client):
+        super().__init__(title="Inject Prompt")
+        self.bot = bot
+        self.scope = discord.ui.TextInput(
+            label="Scope",
+            placeholder="global or satellite guild id",
+            min_length=1,
+            max_length=30,
+            required=True,
+            default="global",
+        )
+        self.learning_mode = discord.ui.TextInput(
+            label="Learning Mode",
+            placeholder="off | light | full",
+            min_length=2,
+            max_length=10,
+            required=True,
+            default="full",
+        )
+        self.prompt_text = discord.ui.TextInput(
+            label="Prompt (Hard Priority)",
+            style=discord.TextStyle.paragraph,
+            placeholder="Highest-priority behavior instructions for Mandy in this scope.",
+            min_length=0,
+            max_length=4000,
+            required=False,
+        )
+        self.add_item(self.scope)
+        self.add_item(self.learning_mode)
+        self.add_item(self.prompt_text)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        handler = getattr(self.bot, "global_menu_inject_prompt", None)
+        if handler is None:
+            await interaction.response.send_message("Global menu handler unavailable.", ephemeral=True)
+            return
+        await handler(
+            interaction=interaction,
+            scope=str(self.scope.value or "").strip(),
+            learning_mode=str(self.learning_mode.value or "").strip(),
+            prompt_text=str(self.prompt_text.value or ""),
+        )
+
+
 class GlobalMenuView(discord.ui.View):
     def __init__(self, bot: discord.Client):
         super().__init__(timeout=None)
@@ -136,6 +181,17 @@ class GlobalMenuView(discord.ui.View):
             await interaction.response.send_message("Global menu handler unavailable.", ephemeral=True)
             return
         await handler(interaction=interaction)
+
+    @discord.ui.button(
+        label="Inject Prompt",
+        style=discord.ButtonStyle.primary,
+        custom_id="mandy:global_menu:inject_prompt",
+    )
+    async def inject_prompt(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self._can_run(interaction, 90):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        await interaction.response.send_modal(PromptInjectionModal(self.bot))
 
     @discord.ui.button(
         label="Self Check",

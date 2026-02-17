@@ -419,6 +419,61 @@ class MandyBot(commands.Bot):
             self.logger.log("soc.role_tier_set", actor_id=ctx.author.id, role_name=role_name, tier=tier)
             await ctx.send(f"SOC role tier set: `{role_name}` -> `{tier}`")
 
+        @self.command(name="setprompt")
+        @self._tier_check(90)
+        async def setprompt(ctx: commands.Context, scope: str, learning_mode: str, *, prompt_text: str) -> None:
+            target = scope.strip().casefold()
+            if target == "global":
+                guild_id = 0
+            elif target.isdigit():
+                guild_id = int(target)
+            else:
+                await ctx.send("Scope must be `global` or a numeric satellite guild id.")
+                return
+            mode = learning_mode.strip().casefold()
+            if mode not in {"off", "light", "full"}:
+                await ctx.send("Learning mode must be one of: `off`, `light`, `full`.")
+                return
+            row = self.ai.set_prompt_injection(
+                guild_id=guild_id,
+                prompt_text=prompt_text,
+                learning_mode=mode,
+                actor_user_id=ctx.author.id,
+                source="command.setprompt",
+            )
+            await self.store.save()
+            await self._ensure_global_menu_panel(force_refresh=True)
+            scope_text = "global" if guild_id <= 0 else f"guild `{guild_id}`"
+            await ctx.send(
+                f"Prompt updated for {scope_text}. learning_mode=`{row['learning_mode']}` chars=`{row['prompt_chars']}`"
+            )
+
+        @self.command(name="showprompt")
+        @self._tier_check(70)
+        async def showprompt(ctx: commands.Context, scope: str = "global") -> None:
+            target = scope.strip().casefold()
+            if target == "global":
+                guild_id = 0
+            elif target.isdigit():
+                guild_id = int(target)
+            else:
+                await ctx.send("Scope must be `global` or numeric guild id.")
+                return
+            row = self.ai.get_prompt_injection(guild_id)
+            prompt = str(row.get("effective_prompt", "") or "").strip()
+            if not prompt:
+                prompt = "(none configured)"
+            learning_mode = str(row.get("learning_mode", "full"))
+            scope_text = "global" if guild_id <= 0 else f"guild `{guild_id}`"
+            await ctx.send(
+                (
+                    f"Prompt scope: {scope_text}\n"
+                    f"Learning mode: `{learning_mode}`\n"
+                    f"Prompt chars: `{len(str(row.get('effective_prompt', '') or ''))}`\n"
+                    f"Prompt preview:\n{prompt[:1500]}"
+                )[:1900]
+            )
+
         @self.command(name="permgrant")
         @self._tier_check(90)
         async def permgrant(ctx: commands.Context, satellite_guild_id: int, user_id: int, action: str, mode: str) -> None:
@@ -752,6 +807,11 @@ class MandyBot(commands.Bot):
             ok("AI API key is configured")
         else:
             warn("AI API key is not configured")
+        prompt_cfg = self.store.data.get("ai", {}).get("prompt_injection", {})
+        if isinstance(prompt_cfg, dict):
+            ok("AI prompt injection schema present")
+        else:
+            fail("AI prompt injection schema missing")
         last_api = self.store.data.get("ai", {}).get("last_api_test", {})
         if isinstance(last_api, dict) and last_api:
             ok("AI API test history exists")
@@ -797,6 +857,13 @@ class MandyBot(commands.Bot):
         engineer_tier = int(role_tiers.get("ACCESS:Engineer", 0) or 0)
         admin_tier = int(role_tiers.get("ACCESS:Admin", 0) or 0)
         soc_tier = int(role_tiers.get("ACCESS:SOC", 0) or 0)
+        prompt_cfg = self.store.data.get("ai", {}).get("prompt_injection", {})
+        master_prompt_chars = len(str(prompt_cfg.get("master_prompt", "") or "")) if isinstance(prompt_cfg, dict) else 0
+        guild_prompt_count = 0
+        if isinstance(prompt_cfg, dict):
+            guild_prompts = prompt_cfg.get("guild_prompts", {})
+            if isinstance(guild_prompts, dict):
+                guild_prompt_count = len(guild_prompts)
         embed = discord.Embed(
             title="Mandy Global Menu",
             description="Unified control panel for satellite operations, access approvals, automation, and AI controls.",
@@ -810,7 +877,8 @@ class MandyBot(commands.Bot):
                 "List Satellites: view all onboarded satellite IDs.\n"
                 "Health Snapshot: quick runtime and load stats.\n"
                 "Refresh Menu Panel: rebuild this panel.\n"
-                "Self Check: run deep internal diagnostics."
+                "Self Check: run deep internal diagnostics.\n"
+                "Inject Prompt: set global/per-server hard-priority AI behavior."
             )[:1024],
             inline=False,
         )
@@ -820,6 +888,7 @@ class MandyBot(commands.Bot):
                 "`!health` `!selfcheck` `!setup` `!menupanel` `!debugpanel` `!housekeep`\n"
                 "`!satellitesync` `!watchers` `!watchers add/remove/reset` `!onboarding` `!syncaccess`\n"
                 "`!socset` `!socrole` `!permgrant` `!permlist` `!selftasks`\n"
+                "`!setprompt` `!showprompt`\n"
                 "`!setguestpass` `!guestpass`"
             )[:1024],
             inline=False,
@@ -831,6 +900,7 @@ class MandyBot(commands.Bot):
                 f"Satellites onboarded: `{total_satellites}`\n"
                 f"Pending permission requests: `{pending_requests}`\n"
                 f"Scheduled selftasks: `{selftasks_count}`\n"
+                f"Prompt injection: master_chars=`{master_prompt_chars}` guild_overrides=`{guild_prompt_count}`\n"
                 f"SOC role tiers: engineer=`{engineer_tier}` admin=`{admin_tier}` soc=`{soc_tier}`\n"
                 f"Prefix: `{self.settings.command_prefix}`"
             ),
@@ -1075,6 +1145,12 @@ class MandyBot(commands.Bot):
         shadow_active = bool(self._shadow_task and not self._shadow_task.done())
         reconcile_active = bool(self._satellite_reconcile_task and not self._satellite_reconcile_task.done())
         selftasks_count = len(self._self_automation_tasks())
+        prompt_cfg = self.store.data.get("ai", {}).get("prompt_injection", {})
+        guild_prompt_count = 0
+        if isinstance(prompt_cfg, dict):
+            guild_prompts = prompt_cfg.get("guild_prompts", {})
+            if isinstance(guild_prompts, dict):
+                guild_prompt_count = len(guild_prompts)
         blocked_guilds = sum(1 for _gid, until in self._send_block_until_by_guild.items() if float(until or 0.0) > time.time())
         feature = self._feature_request_root()
         request_rows = feature.get("requests", {})
@@ -1093,6 +1169,7 @@ class MandyBot(commands.Bot):
             f"Logs buffered: `{len(self.store.data['logs'])}`\n"
             f"Pending permission requests: `{pending_requests}`\n"
             f"Self automation tasks: `{selftasks_count}`\n"
+            f"Guild prompt overrides: `{guild_prompt_count}`\n"
             f"Housekeeping active: `{housekeeping_active}`\n"
             f"Shadow loop active: `{shadow_active}`\n"
             f"Satellite reconcile active: `{reconcile_active}`\n"
@@ -1120,6 +1197,54 @@ class MandyBot(commands.Bot):
             f"Top warnings: {', '.join(report['warn'][:3]) if report['warn'] else '(none)'}"
         )
         await self._send_interaction_message(interaction, text[:1900], ephemeral=True)
+
+    async def global_menu_inject_prompt(
+        self,
+        interaction: discord.Interaction,
+        *,
+        scope: str,
+        learning_mode: str,
+        prompt_text: str,
+    ) -> None:
+        if not self.soc.can_run(interaction.user, 90):
+            await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
+            return
+        target = str(scope or "").strip().casefold()
+        if target == "global":
+            guild_id = 0
+        elif target.isdigit():
+            guild_id = int(target)
+            if guild_id == self.settings.admin_guild_id:
+                await self._send_interaction_message(interaction, "Use `global` for Admin Hub behavior.", ephemeral=True)
+                return
+        else:
+            await self._send_interaction_message(interaction, "Scope must be `global` or numeric guild id.", ephemeral=True)
+            return
+
+        mode = str(learning_mode or "").strip().casefold()
+        if mode not in {"off", "light", "full"}:
+            await self._send_interaction_message(
+                interaction,
+                "Learning mode must be one of: `off`, `light`, `full`.",
+                ephemeral=True,
+            )
+            return
+
+        row = self.ai.set_prompt_injection(
+            guild_id=guild_id,
+            prompt_text=prompt_text,
+            learning_mode=mode,
+            actor_user_id=interaction.user.id,
+            source="global_menu.inject_prompt",
+        )
+        await self.store.save()
+        await self._ensure_global_menu_panel(force_refresh=True)
+        scope_text = "global" if guild_id <= 0 else f"guild `{guild_id}`"
+        await self._send_interaction_message(
+            interaction,
+            f"Prompt hard-saved for {scope_text}. learning_mode=`{row['learning_mode']}` chars=`{row['prompt_chars']}`",
+            ephemeral=True,
+        )
 
     async def open_global_satellite_menu(self, interaction: discord.Interaction, satellite_guild_id: int) -> None:
         if not self.soc.can_run(interaction.user, 50):
@@ -1688,6 +1813,26 @@ class MandyBot(commands.Bot):
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         self.logger.log("guild.removed", guild_id=guild.id, guild_name=guild.name)
+        if guild.id == self.settings.admin_guild_id:
+            return
+        mirrors = self.store.data.get("mirrors", {}).get("servers", {})
+        if isinstance(mirrors, dict):
+            removed = mirrors.pop(str(guild.id), None) is not None
+            if removed:
+                self.store.touch()
+                self.logger.log("mirror.server_pruned_on_guild_remove", guild_id=guild.id)
+        admin_guild = self.get_guild(self.settings.admin_guild_id)
+        if not admin_guild:
+            return
+        bypass = self.onboarding.bypass_set()
+        for member in admin_guild.members:
+            if member.bot:
+                continue
+            try:
+                await self.mirrors.sync_admin_member_access(self, member, bypass)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("mirror.access_sync_failed", user_id=member.id, error=str(exc)[:220])
+        await self._ensure_global_menu_panel(force_refresh=True)
 
     async def on_member_join(self, member: discord.Member) -> None:
         if member.guild.id != self.settings.admin_guild_id:
@@ -2240,13 +2385,14 @@ class MandyBot(commands.Bot):
                 except discord.HTTPException:
                     self.logger.log("ai.shadow_chat_react_failed", guild_id=guild_id, user_id=message.author.id, emoji=emoji)
                 return
-            if directive.action == "reply":
+            if directive.action in {"reply", "direct_reply"}:
                 delay = self.ai.reply_delay_seconds(message, reason=directive.reason, still_talking=True)
                 self._schedule_ai_reply(
                     message,
                     reason=directive.reason,
                     still_talking=True,
                     delay_sec=delay,
+                    response_mode=directive.action,
                 )
             return
 
@@ -2293,13 +2439,14 @@ class MandyBot(commands.Bot):
                 except discord.HTTPException:
                     self.logger.log("ai.chat_react_failed", guild_id=guild_id, user_id=message.author.id, emoji=emoji)
                 return
-            if directive.action == "reply":
+            if directive.action in {"reply", "direct_reply"}:
                 delay = self.ai.reply_delay_seconds(message, reason=directive.reason, still_talking=directive.still_talking)
                 self._schedule_ai_reply(
                     message,
                     reason=directive.reason,
                     still_talking=directive.still_talking,
                     delay_sec=delay,
+                    response_mode=directive.action,
                 )
 
     async def _maybe_handle_ai_dm_message(self, message: discord.Message) -> None:
@@ -2336,6 +2483,7 @@ class MandyBot(commands.Bot):
         reason: str,
         still_talking: bool,
         delay_sec: float,
+        response_mode: str = "direct_reply",
     ) -> None:
         key = (message.channel.id, message.author.id)
         existing = self._ai_pending_reply_tasks.get(key)
@@ -2362,7 +2510,10 @@ class MandyBot(commands.Bot):
                     burst_lines=burst,
                 )
                 typing_delay = await self._simulate_typing_delay(message.channel)
-                parts = await self._send_split_reply(message, reply, mention_author=False)
+                if response_mode == "reply":
+                    parts = await self._send_split_channel_message(message.channel, reply)
+                else:
+                    parts = await self._send_split_reply(message, reply, mention_author=False)
                 if guild_id > 0:
                     self._note_send_success(guild_id)
                 self.ai.note_bot_action(message.channel.id, "reply", user_id=message.author.id)
@@ -2374,6 +2525,7 @@ class MandyBot(commands.Bot):
                     still_talking=still_talking,
                     delay_sec=round(delay_sec, 2),
                     burst_count=len(burst),
+                    response_mode=response_mode,
                     typing_delay_sec=typing_delay,
                     parts=parts,
                 )
@@ -2400,6 +2552,7 @@ class MandyBot(commands.Bot):
             guild_id=message.guild.id if message.guild else 0,
             user_id=message.author.id,
             reason=reason,
+            response_mode=response_mode,
             delay_sec=round(delay_sec, 2),
         )
 
@@ -2659,6 +2812,10 @@ class MandyBot(commands.Bot):
 
         chat_enabled = self.ai.is_chat_enabled(satellite_guild.id)
         roast_enabled = self.ai.is_roast_enabled(satellite_guild.id)
+        injection = self.ai.get_prompt_injection(satellite_guild.id)
+        learning_mode = str(injection.get("learning_mode", "full"))
+        prompt_chars = len(str(injection.get("effective_prompt", "") or ""))
+        style_summary = self.ai.guild_style_summary(satellite_guild.id)
         memory_stats = self.ai.memory_stats(satellite_guild.id)
         warmup = self.ai.warmup_status(satellite_guild.id) or {}
         warmup_line = "not run"
@@ -2707,6 +2864,8 @@ class MandyBot(commands.Bot):
                 f"AI chat mode: `{chat_enabled}`\n"
                 f"AI roast mode: `{roast_enabled}`\n"
                 f"Alibaba key configured: `{self.ai.has_api_key()}`\n"
+                f"Prompt chars: `{prompt_chars}` learning_mode=`{learning_mode}`\n"
+                f"Style profile: {style_summary[:120]}\n"
                 f"Memory rows: long-term={memory_stats['long_term_rows']} "
                 f"facts={memory_stats['fact_rows']} users={memory_stats['fact_users']}\n"
                 f"Startup memory scan: {warmup_line}\n"

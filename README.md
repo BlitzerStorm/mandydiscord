@@ -16,12 +16,15 @@ This build is intentionally lean and optimized for reliable v1 operations.
 - Relays user DMs into staff-visible bridge channels and supports outbound relay.
 - Provides a high-depth global menu with tier-gated controls, satellite picker, and embedded self-check.
 - In AI chat mode, performs startup memory scan and adaptive live decisioning (ignore/react/reply).
+- In AI chat mode, Mandy can choose per message: ignore, emoji react, channel reply, or direct message-reply style response.
 - In AI chat mode, debounces burst prompts so rapid multi-message asks are merged into fewer smarter replies.
 - In AI chat mode, Mandy can respond without wake-word and use image understanding internally; visual breakdown is only exposed when explicitly requested.
 - In AI chat mode, memory is weighted: stable user facts/preferences are pinned, while low-signal chatter decays out.
 - In AI chat mode, Mandy tracks relationship tone and preferred aliases to adapt replies more naturally per user.
 - In AI mode, API spend is reduced with short-lived completion caching, prompt clamping, and failure cooldown backoff.
 - In AI mode, repeated spam bursts are short-circuited locally (no external API call required).
+- Supports hard-saved prompt injection: global master prompt + per-server prompt overrides + learning mode (`off|light|full`).
+- AI adapts to each server's speaking style (slang, first-person/roleplay tendencies, message cadence) and mirrors tone naturally.
 - Before watcher, roast, and AI chat replies, Mandy shows a random typing delay (2-10s).
 - If a Mandy response exceeds Discord text limits, it auto-continues in follow-up messages.
 - Auto-trims debug/log and mirror channels on a schedule so control channels stay readable.
@@ -162,6 +165,8 @@ Health/setup:
 - `!housekeep` (tier >= 70, Admin Hub; run cleanup immediately)
 - `!satellitesync` (tier >= 70; force reconcile all satellite channels/roles now)
 - `!syncaccess` (tier >= 90, Admin Hub)
+- `!setprompt <global|guild_id> <off|light|full> <prompt...>` (tier >= 90)
+- `!showprompt [global|guild_id]` (tier >= 70)
 - `!permlist` (tier >= 90; show pending requests and grants)
 - `!permgrant <satellite_guild_id> <user_id> <action> <once|perm|revoke>` (tier >= 90)
 
@@ -203,6 +208,7 @@ Global menu:
 - Admin Hub `menu` channel includes the full control panel and satellite entry menu.
 - Includes quick actions for satellite listing, health snapshot, panel refresh, and self-check.
 - Includes a satellite drop-down selector for faster access (no manual ID paste required when satellites exist).
+- Includes `Inject Prompt` modal to set hard-priority global/per-server AI prompt + learning mode and hard-save immediately.
 
 ## 8) SOC tiers
 
@@ -270,6 +276,11 @@ Self-automation/GOD-mode action safety:
 - path traversal outside workspace is blocked
 - `run_command` is allowlisted and destructive command patterns are blocked
 - command timeout is bounded to avoid runaway shell executions
+
+Learning mode behavior:
+- `full`: normal memory/profile/fact learning for that scope.
+- `light`: keeps live context/profile/style adaptation but skips heavy long-term/fact capture.
+- `off`: no persistent guild learning updates for that scope.
 
 ## 13) Discord permission notes
 

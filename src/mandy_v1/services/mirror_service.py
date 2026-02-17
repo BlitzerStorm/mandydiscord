@@ -137,6 +137,8 @@ class MirrorService:
             return
         if member.bot:
             return
+        allowed_role_ids: set[int] = set()
+        managed_roles = [role for role in member.roles if role.name.startswith("SOC:SERVER:")]
         roles_to_add: list[discord.Role] = []
         for guild_id in self.store.data["mirrors"]["servers"].keys():
             try:
@@ -151,10 +153,16 @@ class MirrorService:
             if not allow:
                 continue
             role = discord.utils.get(admin_guild.roles, name=self.role_name_for_server(gid))
-            if role and role not in member.roles:
+            if not role:
+                continue
+            allowed_role_ids.add(int(role.id))
+            if role not in member.roles:
                 roles_to_add.append(role)
+        roles_to_remove = [role for role in managed_roles if int(role.id) not in allowed_role_ids]
         if roles_to_add:
             await member.add_roles(*roles_to_add, reason="Mandy v1 SOC access sync")
+        if roles_to_remove:
+            await member.remove_roles(*roles_to_remove, reason="Mandy v1 SOC access sync prune")
 
     async def mirror_message(
         self,
