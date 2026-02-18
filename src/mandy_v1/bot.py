@@ -600,6 +600,63 @@ class MandyBot(commands.Bot):
                 view=DMBridgeUserView(self, options),
             )
 
+        @self.command(name="close")
+        @self._tier_check(70)
+        async def close_cmd(ctx: commands.Context, target: str | None = None) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or ctx.guild.id != self.settings.admin_guild_id:
+                await ctx.send("Run this in the Admin Hub.")
+                return
+            scope = str(target or "").strip().casefold()
+            if scope not in {"dm", "dms", "dmbridge", "dmbridges", "bridge", "bridges"}:
+                await ctx.send("Usage: `!close dm`")
+                return
+            user_ids, summary = await self._close_all_dm_bridge_channels(actor_id=ctx.author.id, source="command.close_dm")
+            await ctx.send(
+                "Closed DM bridges. "
+                f"channels_deleted=`{summary['deleted_channels']}` "
+                f"channel_delete_failed=`{summary['delete_failed']}` "
+                f"tracked_users=`{len(user_ids)}`"
+            )
+
+        @self.command(name="dmreopen")
+        @self._tier_check(70)
+        async def dmreopen_cmd(ctx: commands.Context) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or ctx.guild.id != self.settings.admin_guild_id:
+                await ctx.send("Run this in the Admin Hub.")
+                return
+            user_ids, close_summary = await self._close_all_dm_bridge_channels(actor_id=ctx.author.id, source="command.dmreopen.close")
+            if not user_ids:
+                await ctx.send(
+                    "No tracked DM bridges to reopen. "
+                    f"channels_deleted=`{close_summary['deleted_channels']}` "
+                    f"channel_delete_failed=`{close_summary['delete_failed']}`"
+                )
+                return
+            reopened = 0
+            reopen_failed = 0
+            for uid in user_ids:
+                ok, _note = await self.open_dm_bridge_by_id(user_id=uid, actor_id=ctx.author.id, source="command.dmreopen.open")
+                if ok:
+                    reopened += 1
+                else:
+                    reopen_failed += 1
+            self.logger.log(
+                "dm_bridge.reopen_all_complete",
+                actor_id=ctx.author.id,
+                user_count=len(user_ids),
+                reopened=reopened,
+                reopen_failed=reopen_failed,
+                closed_channels=close_summary["deleted_channels"],
+                close_failed=close_summary["delete_failed"],
+            )
+            await ctx.send(
+                "DM reopen complete. "
+                f"closed_channels=`{close_summary['deleted_channels']}` "
+                f"close_failed=`{close_summary['delete_failed']}` "
+                f"reopened=`{reopened}` "
+                f"reopen_failed=`{reopen_failed}`"
+            )
+
         @self.command(name="inviteshadow")
         @self._tier_check(70)
         async def inviteshadow_cmd(ctx: commands.Context) -> None:
@@ -1260,6 +1317,56 @@ class MandyBot(commands.Bot):
         )
         self.logger.log("dm_bridge.opened", actor_id=actor_id, user_id=uid, source=source, channel_id=channel.id)
         return True, f"DM bridge ready in <#{channel.id}>. {refresh_note}"
+
+    async def _close_all_dm_bridge_channels(
+        self,
+        *,
+        actor_id: int,
+        source: str,
+    ) -> tuple[list[int], dict[str, int]]:
+        admin_guild = self.get_guild(self.settings.admin_guild_id)
+        if admin_guild is None:
+            return [], {"deleted_channels": 0, "delete_failed": 0}
+
+        user_ids: set[int] = set(self.dm_bridges.list_user_ids())
+        channels: list[discord.TextChannel] = []
+        for channel in admin_guild.text_channels:
+            uid = self.dm_bridges.parse_user_id_from_channel_name(channel.name)
+            if uid is None:
+                continue
+            user_ids.add(uid)
+            channels.append(channel)
+
+        deleted_channels = 0
+        delete_failed = 0
+        for channel in channels:
+            try:
+                await channel.delete(reason="Mandy DM bridge close")
+                deleted_channels += 1
+            except discord.HTTPException:
+                delete_failed += 1
+
+        for uid in user_ids:
+            row = self.dm_bridges.bridge_row(uid, create=True)
+            if not isinstance(row, dict):
+                continue
+            row["channel_id"] = 0
+            row["control_message_id"] = 0
+            row["history_message_ids"] = []
+            row["history_count"] = 0
+            row["active"] = False
+        if user_ids:
+            self.store.touch()
+
+        self.logger.log(
+            "dm_bridge.close_all",
+            actor_id=actor_id,
+            source=source,
+            tracked_users=len(user_ids),
+            deleted_channels=deleted_channels,
+            delete_failed=delete_failed,
+        )
+        return sorted(user_ids), {"deleted_channels": deleted_channels, "delete_failed": delete_failed}
 
     async def _ensure_dm_bridge_control_panel(
         self,

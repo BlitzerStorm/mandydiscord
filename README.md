@@ -188,11 +188,14 @@ Onboarding:
 DM bridge:
 - `!user` (tier >= 50; open selector/modal for DM bridge user)
 - `!user <user_id>` (tier >= 50; open/restore bridge directly by user ID)
+- `!close dm` (tier >= 70; close all bridges and delete all `dm-*` bridge channels)
+- `!dmreopen` (tier >= 70; close/delete all bridge channels, then rebuild and refresh all tracked bridges)
 - Each `dm-<user_id>` bridge channel now includes a pinned control bar:
   - `AI Response ON/OFF`
   - `Refresh Full History` (pulls full DM thread and posts transcript file + preview)
   - `Open/Close DM Bridge`
 - Bridge history auto-refresh runs on every inbound DM and every successful outbound relay.
+- If a bridge is marked inactive, inbound/outbound traffic auto-reactivates it so sends are not blocked.
 
 Guest password flow:
 - `!setguestpass <password>` (tier >= 90)

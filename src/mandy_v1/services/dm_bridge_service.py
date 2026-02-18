@@ -330,8 +330,8 @@ class DMBridgeService:
         if not channel:
             return False
         if not self.is_active(int(message.author.id)):
-            self.logger.log("dm_bridge.inbound_skipped", user_id=message.author.id, channel_id=channel.id, reason="inactive")
-            return False
+            self.set_active(int(message.author.id), True)
+            self.logger.log("dm_bridge.reactivated", user_id=message.author.id, channel_id=channel.id, reason="inbound")
         self.logger.log("dm_bridge.inbound", user_id=message.author.id, channel_id=channel.id)
         return True
 
@@ -342,8 +342,8 @@ class DMBridgeService:
         if user_id is None:
             return False
         if not self.is_active(user_id):
-            self.logger.log("dm_bridge.outbound_skipped", user_id=user_id, source_channel_id=message.channel.id, reason="inactive")
-            return False
+            self.set_active(user_id, True)
+            self.logger.log("dm_bridge.reactivated", user_id=user_id, source_channel_id=message.channel.id, reason="outbound")
         text = self._render_message_text(message.content, message.attachments, message.stickers)
         if not text:
             self.logger.log(
