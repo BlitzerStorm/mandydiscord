@@ -1,1 +1,1 @@
-__all__ = ["mirror_actions", "satellite_debug", "global_menu"]
+__all__ = ["mirror_actions", "satellite_debug", "global_menu", "dm_bridge"]

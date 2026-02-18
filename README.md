@@ -185,6 +185,15 @@ Onboarding:
 - `!onboarding` (tier >= 70; selector mode)
 - `!onboarding <user_id>` (tier >= 70; direct invite)
 
+DM bridge:
+- `!user` (tier >= 50; open selector/modal for DM bridge user)
+- `!user <user_id>` (tier >= 50; open/restore bridge directly by user ID)
+- Each `dm-<user_id>` bridge channel now includes a pinned control bar:
+  - `AI Response ON/OFF`
+  - `Refresh Full History` (pulls full DM thread and posts transcript file + preview)
+  - `Open/Close DM Bridge`
+- Bridge history auto-refresh runs on every inbound DM and every successful outbound relay.
+
 Guest password flow:
 - `!setguestpass <password>` (tier >= 90)
 - `!guestpass <password>` (Admin Hub members use this to verify)

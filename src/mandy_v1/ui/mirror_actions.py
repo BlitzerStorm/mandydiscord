@@ -93,7 +93,23 @@ class MirrorActionView(discord.ui.View):
                 await user.send(text)
                 self.logger.log("mirror.dm_user", staff_id=i.user.id, target_user_id=user.id)
                 await i.response.send_message("DM sent.", ephemeral=True)
-            except discord.HTTPException:
+            except discord.Forbidden as exc:
+                self.logger.log(
+                    "mirror.dm_user_failed",
+                    staff_id=i.user.id,
+                    target_user_id=user.id,
+                    reason="forbidden",
+                    error=str(exc)[:200],
+                )
+                await i.response.send_message("Failed to send DM (user may have DMs blocked).", ephemeral=True)
+            except discord.HTTPException as exc:
+                self.logger.log(
+                    "mirror.dm_user_failed",
+                    staff_id=i.user.id,
+                    target_user_id=user.id,
+                    reason="http_error",
+                    error=str(exc)[:200],
+                )
                 await i.response.send_message("Failed to send DM.", ephemeral=True)
 
         await interaction.response.send_modal(SendTextModal("DM User", submit_fn))

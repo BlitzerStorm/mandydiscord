@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import io
 import json
 import random
 import re
@@ -25,6 +26,7 @@ from mandy_v1.services.shadow_league_service import SHADOW_CHANNEL_PRIORITY, Sha
 from mandy_v1.services.soc_service import SocService
 from mandy_v1.services.watcher_service import WatcherService
 from mandy_v1.storage import MessagePackStore
+from mandy_v1.ui.dm_bridge import DMBridgeControlView, DMBridgeUserView
 from mandy_v1.ui.global_menu import GlobalMenuView
 from mandy_v1.ui.mirror_actions import MirrorActionContext, MirrorActionView
 from mandy_v1.ui.satellite_debug import PermissionRequestApprovalView, PermissionRequestPromptView, SatelliteDebugView
@@ -582,6 +584,22 @@ class MandyBot(commands.Bot):
             users = self._collect_onboard_candidates()
             await ctx.send("Select a user to onboard, or click `Paste User ID`:", view=OnboardingView(self, users))
 
+        @self.command(name="user")
+        @self._tier_check(50)
+        async def user_bridge_cmd(ctx: commands.Context, user_id: int | None = None) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or ctx.guild.id != self.settings.admin_guild_id:
+                await ctx.send("Run this in the Admin Hub.")
+                return
+            if user_id is not None:
+                _ok, note = await self.open_dm_bridge_by_id(user_id=user_id, actor_id=ctx.author.id, source="command.user")
+                await ctx.send(note)
+                return
+            options = self._build_dm_bridge_user_options()
+            await ctx.send(
+                "Select a user to open DM bridge, or click `Paste User ID`:",
+                view=DMBridgeUserView(self, options),
+            )
+
         @self.command(name="inviteshadow")
         @self._tier_check(70)
         async def inviteshadow_cmd(ctx: commands.Context) -> None:
@@ -776,6 +794,22 @@ class MandyBot(commands.Bot):
                     continue
                 users.setdefault(member.id, member)
         return sorted(users.values(), key=lambda u: str(u))[:25]
+
+    def _collect_dm_bridge_candidates(self) -> list[discord.User | discord.Member]:
+        users: dict[int, discord.User | discord.Member] = {}
+        for guild in self.guilds:
+            for member in guild.members:
+                if member.bot:
+                    continue
+                users.setdefault(int(member.id), member)
+        return sorted(users.values(), key=lambda row: str(row).casefold())
+
+    def _build_dm_bridge_user_options(self) -> list[discord.SelectOption]:
+        options: list[discord.SelectOption] = []
+        for user in self._collect_dm_bridge_candidates()[:25]:
+            label = f"{user} ({int(user.id)})"[:100]
+            options.append(discord.SelectOption(label=label, value=str(int(user.id))))
+        return options
 
     def _is_satellite_owner(self, user_id: int, satellite_guild_id: int) -> bool:
         gid = int(satellite_guild_id)
@@ -1079,7 +1113,7 @@ class MandyBot(commands.Bot):
             value=(
                 "`!health` `!selfcheck` `!setup` `!menupanel` `!debugpanel` `!housekeep`\n"
                 "`!housekeephere`\n"
-                "`!satellitesync` `!watchers` `!watchers add/remove/reset` `!onboarding` `!syncaccess`\n"
+                "`!satellitesync` `!watchers` `!watchers add/remove/reset` `!onboarding` `!user` `!syncaccess`\n"
                 "`!socset` `!socrole` `!permgrant` `!permlist` `!selftasks`\n"
                 "`!setprompt` `!showprompt`\n"
                 "`!setguestpass` `!guestpass`"
@@ -1125,6 +1159,254 @@ class MandyBot(commands.Bot):
         posted = await channel.send(embed=embed, view=view)
         state["global_menu_message_id"] = posted.id
         self.store.touch()
+
+    async def handle_dm_bridge_user_pick(self, interaction: discord.Interaction, raw_user_id: str) -> None:
+        if not self.soc.can_run(interaction.user, 50):
+            await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
+            return
+        if not interaction.guild or interaction.guild.id != self.settings.admin_guild_id:
+            await self._send_interaction_message(interaction, "Run this in the Admin Hub.", ephemeral=True)
+            return
+        raw = str(raw_user_id or "").strip()
+        if not raw.isdigit():
+            await self._send_interaction_message(interaction, "Invalid user ID (must be numeric).", ephemeral=True)
+            return
+        ok, note = await self.open_dm_bridge_by_id(
+            user_id=int(raw),
+            actor_id=interaction.user.id,
+            source="dm_bridge.user_picker",
+        )
+        await self._send_interaction_message(interaction, note, ephemeral=True)
+        if ok:
+            self.logger.log("dm_bridge.opened_manual", actor_id=interaction.user.id, user_id=int(raw), source="user_picker")
+
+    async def handle_dm_bridge_control_action(
+        self,
+        interaction: discord.Interaction,
+        user_id: int,
+        action: str,
+    ) -> None:
+        if not self.soc.can_run(interaction.user, 50):
+            await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
+            return
+        uid = int(user_id)
+        if uid <= 0:
+            await self._send_interaction_message(interaction, "Invalid user id.", ephemeral=True)
+            return
+        channel: discord.TextChannel | None = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+        if channel is None:
+            channel = await self.dm_bridges.resolve_channel(self, uid)
+
+        if action == "toggle_ai":
+            enabled = self.dm_bridges.toggle_ai_enabled(uid)
+            user = await self.dm_bridges.resolve_user(self, uid)
+            if user is not None and isinstance(channel, discord.TextChannel):
+                await self._ensure_dm_bridge_control_panel(user=user, channel=channel)
+            self.logger.log("dm_bridge.ai_toggled", actor_id=interaction.user.id, user_id=uid, enabled=enabled)
+            await self._send_interaction_message(interaction, f"DM AI response set to `{enabled}` for `{uid}`.", ephemeral=True)
+            return
+
+        if action == "toggle_open":
+            active_now = self.dm_bridges.is_active(uid)
+            new_active = self.dm_bridges.set_active(uid, not active_now)
+            user = await self.dm_bridges.resolve_user(self, uid)
+            if user is not None and isinstance(channel, discord.TextChannel):
+                await self._ensure_dm_bridge_control_panel(user=user, channel=channel)
+            self.logger.log("dm_bridge.active_toggled", actor_id=interaction.user.id, user_id=uid, active=new_active)
+            if new_active:
+                _ok, note = await self.refresh_dm_bridge_history(
+                    user_id=uid,
+                    channel=channel,
+                    reason="control.toggle_open",
+                )
+                await self._send_interaction_message(interaction, f"DM bridge opened. {note}", ephemeral=True)
+            else:
+                await self._send_interaction_message(interaction, "DM bridge closed.", ephemeral=True)
+            return
+
+        if action == "refresh":
+            _ok, note = await self.refresh_dm_bridge_history(
+                user_id=uid,
+                channel=channel,
+                reason="control.refresh",
+            )
+            await self._send_interaction_message(interaction, note, ephemeral=True)
+            return
+
+        await self._send_interaction_message(interaction, "Unknown DM bridge action.", ephemeral=True)
+
+    async def open_dm_bridge_by_id(
+        self,
+        *,
+        user_id: int,
+        actor_id: int,
+        source: str,
+    ) -> tuple[bool, str]:
+        uid = int(user_id)
+        if uid <= 0:
+            return False, "Invalid user id."
+        user = await self.dm_bridges.resolve_user(self, uid)
+        if user is None:
+            return False, f"User `{uid}` not found."
+        channel = await self.dm_bridges.ensure_channel(self, user)
+        if channel is None:
+            return False, "Admin Hub or DM bridge channel unavailable."
+        self.dm_bridges.set_active(uid, True)
+        await self._ensure_dm_bridge_control_panel(user=user, channel=channel)
+        _ok, refresh_note = await self.refresh_dm_bridge_history(
+            user_id=uid,
+            channel=channel,
+            reason=f"{source}.open",
+        )
+        self.logger.log("dm_bridge.opened", actor_id=actor_id, user_id=uid, source=source, channel_id=channel.id)
+        return True, f"DM bridge ready in <#{channel.id}>. {refresh_note}"
+
+    async def _ensure_dm_bridge_control_panel(
+        self,
+        *,
+        user: discord.abc.User,
+        channel: discord.TextChannel,
+    ) -> discord.Message | None:
+        row = self.dm_bridges.bridge_row(int(user.id), create=True)
+        message_id = self.dm_bridges.control_message_id(int(user.id))
+        existing: discord.Message | None = None
+        if message_id > 0:
+            try:
+                existing = await channel.fetch_message(message_id)
+            except discord.HTTPException:
+                existing = None
+        view = DMBridgeControlView(self, int(user.id))
+        embed = self.dm_bridges.build_control_embed(user, row=row)
+        if existing is not None:
+            try:
+                await existing.edit(embed=embed, view=view)
+                return existing
+            except discord.HTTPException:
+                existing = None
+        try:
+            posted = await channel.send(embed=embed, view=view)
+        except discord.HTTPException:
+            return None
+        self.dm_bridges.set_control_message_id(int(user.id), int(posted.id))
+        try:
+            await posted.pin(reason="Mandy DM bridge controls")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        return posted
+
+    async def _delete_dm_bridge_history_messages(
+        self,
+        channel: discord.TextChannel,
+        message_ids: list[int],
+        *,
+        keep_message_id: int = 0,
+    ) -> None:
+        for mid in message_ids:
+            if int(mid) <= 0 or int(mid) == int(keep_message_id):
+                continue
+            try:
+                row = await channel.fetch_message(int(mid))
+            except discord.HTTPException:
+                continue
+            try:
+                await row.delete()
+            except discord.HTTPException:
+                continue
+
+    async def refresh_dm_bridge_history(
+        self,
+        *,
+        user_id: int,
+        channel: discord.TextChannel | None = None,
+        reason: str = "manual",
+    ) -> tuple[bool, str]:
+        uid = int(user_id)
+        if uid <= 0:
+            return False, "Invalid user id."
+        user = await self.dm_bridges.resolve_user(self, uid)
+        if user is None:
+            return False, f"User `{uid}` not found."
+        target_channel = channel or await self.dm_bridges.resolve_channel(self, uid)
+        if not isinstance(target_channel, discord.TextChannel):
+            return False, "DM bridge channel not found."
+        await self._ensure_dm_bridge_control_panel(user=user, channel=target_channel)
+        old_ids = self.dm_bridges.history_message_ids(uid)
+        control_id = self.dm_bridges.control_message_id(uid)
+
+        try:
+            pulled_user, rows = await self.dm_bridges.pull_full_history(self, user_id=uid)
+            user = pulled_user
+        except Exception as exc:  # noqa: BLE001
+            self.logger.log("dm_bridge.history_refresh_failed", user_id=uid, reason=reason, error=str(exc)[:240])
+            return False, f"Failed to pull DM history for `{uid}`: {str(exc)[:180]}"
+
+        transcript, preview = self.dm_bridges.render_history_text(user=user, rows=rows)
+        preview_text = (preview or "").strip() or "(no messages yet)"
+        if len(preview_text) > 1200:
+            preview_text = f"{preview_text[:1197]}..."
+        payload = (
+            f"DM history refreshed for <@{uid}> (`{uid}`). "
+            f"messages=`{len(rows)}` reason=`{reason}`\n"
+            f"Latest preview:\n```text\n{preview_text}\n```"
+        )
+        history_ids: list[int] = []
+        try:
+            file_payload = io.BytesIO(transcript.encode("utf-8", errors="replace"))
+            history_row = await target_channel.send(
+                payload[:1900],
+                file=discord.File(file_payload, filename=f"dm-{uid}-history.txt"),
+            )
+            history_ids.append(int(history_row.id))
+        except discord.HTTPException as exc:
+            fallback_text = transcript[-1300:] if transcript else "(no transcript)"
+            try:
+                fallback_row = await target_channel.send(
+                    (
+                        f"History pulled but transcript upload failed for `{uid}` "
+                        f"(error=`{str(exc)[:80]}`).\n```text\n{fallback_text}\n```"
+                    )[:1900]
+                )
+                history_ids.append(int(fallback_row.id))
+            except discord.HTTPException:
+                self.logger.log("dm_bridge.history_post_failed", user_id=uid, reason=reason, rows=len(rows))
+                return False, f"Pulled `{len(rows)}` messages but failed to post history."
+
+        await self._delete_dm_bridge_history_messages(target_channel, old_ids, keep_message_id=control_id)
+        self.dm_bridges.set_history_snapshot(
+            uid,
+            message_ids=history_ids,
+            history_count=len(rows),
+            reason=reason,
+        )
+        await self._ensure_dm_bridge_control_panel(user=user, channel=target_channel)
+        self.logger.log(
+            "dm_bridge.history_refreshed",
+            user_id=uid,
+            channel_id=target_channel.id,
+            rows=len(rows),
+            reason=reason,
+        )
+        return True, f"DM bridge refreshed for `{uid}` with `{len(rows)}` messages."
+
+    async def _restore_dm_bridge_control_panels(self) -> None:
+        restored = 0
+        failed = 0
+        for user_id in self.dm_bridges.list_user_ids():
+            user = await self.dm_bridges.resolve_user(self, user_id)
+            if user is None:
+                failed += 1
+                continue
+            channel = await self.dm_bridges.resolve_channel(self, user_id)
+            if not isinstance(channel, discord.TextChannel):
+                failed += 1
+                continue
+            panel = await self._ensure_dm_bridge_control_panel(user=user, channel=channel)
+            if panel is None:
+                failed += 1
+                continue
+            restored += 1
+        if restored > 0 or failed > 0:
+            self.logger.log("dm_bridge.control_panels_restored", restored=restored, failed=failed)
 
     async def _run_housekeeping_loop(self) -> None:
         await asyncio.sleep(20)
@@ -1769,6 +2051,7 @@ class MandyBot(commands.Bot):
                 await self._ensure_base_access_roles(admin_guild)
                 await self.shadow.ensure_structure(admin_guild, force=True)
                 await self._ensure_global_menu_panel()
+                await self._restore_dm_bridge_control_panels()
             except discord.HTTPException:
                 self.logger.log("admin.layout_setup_failed", guild_id=admin_guild.id)
         summary = await self._reconcile_satellites_once(force_refresh_dashboards=True)
@@ -2555,9 +2838,12 @@ class MandyBot(commands.Bot):
             return
         if isinstance(message.channel, discord.DMChannel):
             await self.ai.warmup_dm_history(message.channel, message.author, before=message, limit=100)
-            await self.dm_bridges.relay_inbound(self, message)
+            bridged = await self.dm_bridges.relay_inbound(self, message)
+            if bridged:
+                await self.refresh_dm_bridge_history(user_id=message.author.id, reason="inbound_dm")
             self.ai.capture_dm_signal(message)
-            await self._maybe_handle_ai_dm_message(message)
+            if self.dm_bridges.is_active(message.author.id) and self.dm_bridges.is_ai_enabled(message.author.id):
+                await self._maybe_handle_ai_dm_message(message)
             await self.process_commands(message)
             return
 
@@ -2605,19 +2891,31 @@ class MandyBot(commands.Bot):
 
         if message.guild and message.guild.id == self.settings.admin_guild_id:
             if isinstance(message.channel, discord.TextChannel) and message.channel.name.startswith("dm-"):
-                if self.soc.can_run(message.author, 50):
+                if self.soc.can_run(message.author, 50) and not message.content.startswith(self.settings.command_prefix):
                     sent = await self.dm_bridges.relay_outbound(self, message)
+                    target_uid = self.dm_bridges.parse_user_id_from_channel_name(message.channel.name) or 0
                     if sent:
-                        parts = message.channel.name.split("-", 1)
-                        if len(parts) == 2 and parts[1].isdigit():
-                            user_id = int(parts[1])
-                            user = self.get_user(user_id)
+                        if target_uid > 0:
+                            user = self.get_user(target_uid)
                             self.ai.capture_dm_outbound(
-                                user_id=user_id,
+                                user_id=target_uid,
                                 user_name=str(user.name if user else ""),
                                 text=str(message.content or ""),
                             )
-                        await message.add_reaction("\u2705")
+                            await self.refresh_dm_bridge_history(
+                                user_id=target_uid,
+                                channel=message.channel,
+                                reason="outbound_dm",
+                            )
+                        try:
+                            await message.add_reaction("\u2705")
+                        except discord.HTTPException:
+                            pass
+                    else:
+                        try:
+                            await message.add_reaction("\u274c")
+                        except discord.HTTPException:
+                            pass
 
         await self.process_commands(message)
 
