@@ -1,67 +1,90 @@
-# Mandy v1 (Discord Control Plane)
+# Mandy v1
 
-Mandy v1 is a centralized Discord SOC/control-plane bot for multi-server monitoring, access control, mirrors, onboarding, and staff DM relay.
+Mandy v1 is a Discord control-plane bot with mirrored satellite management, SOC-tier access control, DM relay, watcher automation, and a layered AI persona system built around persistent MessagePack state.
 
-This build is intentionally lean and optimized for reliable v1 operations.
+This repo now includes the original control-plane features plus the sentience/autonomy layer implemented in code:
+- emotional state
+- episodic memory
+- identity/opinions
+- per-user persona adaptation
+- per-server culture adaptation
+- attention gating
+- internal thought logging
+- proactive initiative loops
+- autonomous server-action planning
+- expansion/invite workflows
 
-## 1) What Mandy v1 does
+## Overview
 
-- Auto-builds and maintains Admin Hub layout.
-- Auto-onboards joined servers into satellite mirror folders.
-- Continuously reconciles satellite mirror/debug structures for every guild the bot is in.
-- Mirrors satellite messages into Admin Hub mirror feeds.
-- Tracks global watcher counters and triggers responses at configurable thresholds.
-- Enforces SOC tier-based access with hard GOD bypass.
-- Supports onboarding invites and guest-password access in Admin Hub.
-- Relays user DMs into staff-visible bridge channels and supports outbound relay.
-- Provides a high-depth global menu with tier-gated controls, satellite picker, and embedded self-check.
-- In AI chat mode, performs startup memory scan and adaptive live decisioning (ignore/react/reply).
-- In AI chat mode, Mandy can choose per message: ignore, emoji react, channel reply, or direct message-reply style response.
-- In AI chat mode, debounces burst prompts so rapid multi-message asks are merged into fewer smarter replies.
-- In AI chat mode, Mandy can respond without wake-word and use image understanding internally; visual breakdown is only exposed when explicitly requested.
-- In AI chat mode, memory is weighted: stable user facts/preferences are pinned, while low-signal chatter decays out.
-- In AI chat mode, Mandy tracks relationship tone and preferred aliases to adapt replies more naturally per user.
-- In AI mode, API spend is reduced with short-lived completion caching, prompt clamping, and failure cooldown backoff.
-- In AI mode, repeated spam bursts are short-circuited locally (no external API call required).
-- Supports hard-saved prompt injection: global master prompt + per-server prompt overrides + learning mode (`off|light|full`).
-- AI adapts to each server's speaking style (slang, first-person/roleplay tendencies, message cadence) and mirrors tone naturally.
-- Before watcher, roast, and AI chat replies, Mandy shows a random typing delay (2-10s).
-- If a Mandy response exceeds Discord text limits, it auto-continues in follow-up messages.
-- Auto-trims debug/log and mirror channels on a schedule so control channels stay readable.
-- Includes a private Shadow League subsystem for invite-only channels in the Admin Hub.
-- Shadow members are restricted to Shadow League visibility; other Admin Hub categories remain hidden.
-- Shadow League runs an autonomous AI loop that evaluates cross-server activity and can send DM invites.
-- Stores runtime state in MessagePack only (no JSON DB, no SQL).
+Mandy currently does all of the following:
 
-## 2) v1 architecture
+- Maintains an Admin Hub layout and satellite debug/mirror structure.
+- Mirrors satellite traffic into Admin Hub views.
+- Enforces SOC-style access tiers with a hard GOD override.
+- Supports guest-password onboarding and invite workflows.
+- Runs DM bridge channels for staff-visible DM relay.
+- Tracks watcher thresholds and sends configured responses.
+- Runs AI chat and roast behavior with cached completions, warmup scans, and learning modes.
+- Learns lightweight relationship/profile/style state from live traffic.
+- Tracks a persistent emotional state and injects it into prompts.
+- Records episodic memories per guild and recalls them into future prompts.
+- Seeds and evolves Mandy opinions/interests/dislikes.
+- Builds per-user persona profiles, relationship arcs, inside references, and slang absorption.
+- Builds per-server culture profiles and assigns Mandy a role per guild.
+- Scores attention before deciding whether to ignore, react, or reply.
+- Logs reply reasoning into a private `mandy-thoughts` engineering channel.
+- Plans optional autonomous server actions alongside replies.
+- Runs proactive loops for callbacks, absent-user mentions, curiosity bursts, lore callbacks, relationship maintenance, and self-nickname changes.
+- Tracks expansion targets and invite/distribution state for cross-server growth.
+
+All persistent runtime data is stored in MessagePack through `src/mandy_v1/storage.py`. There is no SQL layer.
+
+## Architecture
 
 Main runtime:
 - `run_bot.py`
 - `src/mandy_v1/bot.py`
 
-Core modules:
-- `src/mandy_v1/storage.py` MessagePack state + atomic autosave
-- `src/mandy_v1/services/soc_service.py` SOC tiers and permission checks
-- `src/mandy_v1/services/admin_layout_service.py` Admin Hub layout/bootstrap
-- `src/mandy_v1/services/mirror_service.py` satellite provisioning + mirror pipeline
-- `src/mandy_v1/services/watcher_service.py` global watcher counters/triggers
-- `src/mandy_v1/services/ai_service.py` AI chat/roast mode and Alibaba API test
-- `src/mandy_v1/services/shadow_league_service.py` invite-only shadow role/channel management
-- `src/mandy_v1/services/onboarding_service.py` onboarding invites + bypass state
-- `src/mandy_v1/services/dm_bridge_service.py` DM bridge open/relay
-- `src/mandy_v1/services/logger_service.py` structured runtime log sink
-- `src/mandy_v1/ui/mirror_actions.py` interactive mirror action buttons
-- `src/mandy_v1/ui/satellite_debug.py` satellite debug dashboard/menu + permission requests
-- `src/mandy_v1/ui/global_menu.py` global control panel buttons + satellite selector
+Core persistence/config:
+- `src/mandy_v1/storage.py`
+- `src/mandy_v1/config.py`
+- `src/mandy_v1/prompts.py`
 
-## 3) Requirements
+Operational services:
+- `src/mandy_v1/services/logger_service.py`
+- `src/mandy_v1/services/soc_service.py`
+- `src/mandy_v1/services/admin_layout_service.py`
+- `src/mandy_v1/services/mirror_service.py`
+- `src/mandy_v1/services/onboarding_service.py`
+- `src/mandy_v1/services/dm_bridge_service.py`
+- `src/mandy_v1/services/watcher_service.py`
+- `src/mandy_v1/services/shadow_league_service.py`
 
-- Python 3.11+ (tested in this repo with Python 3.13)
-- Discord bot token
-- Bot added to Admin Hub and satellite servers
-- Discord intents enabled in Developer Portal:
-  - `MESSAGE CONTENT INTENT`
-  - `SERVER MEMBERS INTENT`
+AI and sentience services:
+- `src/mandy_v1/services/ai_service.py`
+- `src/mandy_v1/services/emotion_service.py`
+- `src/mandy_v1/services/episodic_memory_service.py`
+- `src/mandy_v1/services/identity_service.py`
+- `src/mandy_v1/services/persona_service.py`
+- `src/mandy_v1/services/culture_service.py`
+- `src/mandy_v1/services/server_control_service.py`
+- `src/mandy_v1/services/expansion_service.py`
+- `src/mandy_v1/services/proactive_service.py`
+
+UI helpers:
+- `src/mandy_v1/ui/global_menu.py`
+- `src/mandy_v1/ui/satellite_debug.py`
+- `src/mandy_v1/ui/mirror_actions.py`
+- `src/mandy_v1/ui/dm_bridge.py`
+
+## Requirements
+
+- Python 3.11+
+- A Discord bot token
+- A Discord Admin Hub guild ID
+- Discord developer portal intents enabled:
+- `MESSAGE CONTENT INTENT`
+- `SERVER MEMBERS INTENT`
 
 Install:
 
@@ -69,31 +92,24 @@ Install:
 pip install -r requirements.txt
 ```
 
-## 4) Configuration (`passwords.txt`)
+## Configuration
 
-Mandy v1 reads config from `passwords.txt` in repo root.
+Mandy reads config from `passwords.txt` in the repo root.
 
 1. Copy `passwords.example.txt` to `passwords.txt`
-2. Fill values
+2. Fill in values
 
-Required keys:
+Required:
 - `DISCORD_TOKEN`
 - `ADMIN_GUILD_ID`
 
-Optional keys:
-- `GOD_USER_ID` (default `741470965359443970`)
-- `COMMAND_PREFIX` (default `!`)
-- `STORE_PATH` (default `data/mandy_v1.msgpack`)
-- `ALIBABA_API_KEY` (for AI mode + roast mode API calls)
-- `ALIBABA_BASE_URL` (default `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`)
-- `ALIBABA_MODEL` (default `qwen-plus`)
-
-AI key auto-probing:
-- API test and AI calls probe these sources automatically in order:
-  1) `ALIBABA_API_KEY` from settings
-  2) environment vars (`ALIBABA_API_KEY`, `DASHSCOPE_API_KEY`, `QWEN_API_KEY`, `AI_API_KEY`)
-  3) `passwords.txt` keys (`ALIBABA_API_KEY`, `DASHSCOPE_API_KEY`, `QWEN_API_KEY`, `AI_API_KEY`, `API_KEY`)
-- Model is auto-selected from available candidates and cached after successful API test.
+Optional:
+- `GOD_USER_ID` default `741470965359443970`
+- `COMMAND_PREFIX` default `!`
+- `STORE_PATH` default `data/mandy_v1.msgpack`
+- `ALIBABA_API_KEY`
+- `ALIBABA_BASE_URL` default `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`
+- `ALIBABA_MODEL` default `qwen-plus`
 
 Example:
 
@@ -108,23 +124,28 @@ ALIBABA_BASE_URL=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
 ALIBABA_MODEL=qwen-plus
 ```
 
-Security:
-- `passwords.txt` is gitignored.
-- Do not commit real secrets.
+AI key probing order:
+1. `ALIBABA_API_KEY` from settings
+2. environment vars `ALIBABA_API_KEY`, `DASHSCOPE_API_KEY`, `QWEN_API_KEY`, `AI_API_KEY`
+3. `passwords.txt` keys `ALIBABA_API_KEY`, `DASHSCOPE_API_KEY`, `QWEN_API_KEY`, `AI_API_KEY`, `API_KEY`
 
-## 5) Run
+## Running Mandy
 
 ```bash
 python run_bot.py
 ```
 
-On first successful `on_ready`, Mandy auto-runs Admin Hub layout ensure + satellite ensure.
+On startup Mandy:
+- loads MessagePack state
+- starts autosave
+- ensures Admin Hub structure
+- reconciles satellites
+- restores DM bridge panels
+- starts housekeeping, shadow, onboarding recheck, send-probe, hive-sync, satellite reconcile, self-automation, and proactive loops
 
-## 6) Auto-setup behavior
+## Admin Hub Layout
 
-### Admin Hub self-setup
-
-Mandy ensures categories:
+Default categories:
 - `WELCOME`
 - `OPERATIONS`
 - `SHADOW LEAGUE`
@@ -133,234 +154,465 @@ Mandy ensures categories:
 - `ENGINEERING`
 - `GOD CORE`
 
-Mandy ensures channels (per blueprint), applies topics, and keeps signature-pinned panels updated.
-Mandy also maintains a unified control panel message in `OPERATIONS/menu`.
+Key engineering/control channels:
+- `system-log`
+- `audit-log`
+- `debug-log`
+- `mirror-log`
+- `data-lab`
+- `dm-bridges`
+- `mandy-thoughts`
 
-Mandy ensures access roles:
-- `ACCESS:Guest`
-- `ACCESS:Member`
-- `ACCESS:Engineer`
-- `ACCESS:Admin`
-- `ACCESS:SOC`
-- `SHADOW:Associate`
+`mandy-thoughts` is private to SOC-tier users. Mandy writes internal pre-reply thought summaries there before replying.
 
-### Satellite self-setup
+## Core Runtime Behavior
 
-For each non-admin guild:
-- Creates/ensures `SATELLITES / Active / <Server Name>` category in Admin Hub
-- Creates `mirror-feed` and `debug` channels
-- Creates/ensures role `SOC:SERVER:<guild_id>`
-- Applies visibility permissions for mirror/debug channels
-- Maintains a debug dashboard + button menu in each satellite `debug` channel
+### Satellite management
 
-## 7) Commands
+For each non-admin guild Mandy:
+- ensures Admin Hub satellite mirror/debug channels
+- maintains debug dashboards
+- syncs access visibility
+- warms up AI context from recent visible history
+
+### Watchers
+
+Watchers are persistent counters with threshold-triggered responses. They are global in store, but filtered by permission context in commands/UI.
+
+### DM bridge
+
+DMs can be opened into `dm-<user_id>` channels in Admin Hub. Each bridge exposes:
+- AI response toggle
+- open/close toggle
+- history refresh
+
+### Shadow League
+
+Shadow League remains active and autonomous. It uses existing shadow planning plus the broader AI memory/context layers.
+
+## Sentience and Autonomy Features
+
+### Emotion state
+
+Stored under `emotion`:
+
+```python
+"emotion": {
+    "state": "neutral",
+    "intensity": 0.5,
+    "last_updated": 0,
+    "event_log": []
+}
+```
+
+Implemented behavior:
+- mood fetch via `EmotionService.get_mood()`
+- state shifts via `shift(trigger, delta)`
+- prompt tag injection via `mood_tag()`
+- decay toward neutral over idle time
+- tracked triggers for spam, warm interactions, interest hits, ignored messages, reply sends, quiet periods, and guild joins
+
+### Episodic memory
+
+Stored under `episodic`:
+
+```python
+"episodic": {
+    "episodes": {}
+}
+```
+
+Implemented behavior:
+- rolling per-channel buffers in `bot.py`
+- flush every 10 messages with up to 15 buffered entries
+- per-guild episode storage capped to 200
+- search, weighted recall, and boost
+- top matching memories injected as `[MEMORY]` blocks into AI prompts
+
+### Identity and opinions
+
+Stored under `identity`:
+
+```python
+"identity": {
+    "seeded": False,
+    "opinions": {},
+    "interests": [],
+    "dislikes": []
+}
+```
+
+Implemented behavior:
+- seed opinions/interests/dislikes on first boot
+- build an identity block for every prompt
+- optionally form new opinions from episodic records
+
+### Persona profiles
+
+Stored under `personas` keyed by user id.
+
+Tracked profile fields include:
+- aliases
+- communication style
+- average message length
+- vocab complexity
+- cared-about topics
+- emotional register
+- response-to-Mandy mode
+- relationship depth
+- inside references
+- total interactions
+- notable moments
+- arc
+- absorbed slang
+
+Implemented behavior:
+- per-message profile updates
+- relationship depth growth
+- arc transitions
+- inside-reference capture
+- slang absorption and cross-server reuse thresholds
+- prompt voice block per user
+
+### Culture profiles
+
+Stored under `culture` keyed by guild id.
+
+Tracked profile fields include:
+- detected tone
+- dominant topics
+- activity peaks
+- humor style
+- formality
+- average message length
+- emoji density
+- lore refs
+- dominant language style
+- Mandy adopted persona
+- calibration state
+
+Implemented behavior:
+- passive observation on every readable guild message
+- calibration after 50 observed messages
+- AI/fallback persona assignment per server
+- culture block injection per prompt
+
+### Attention gating
+
+Before public AI replies Mandy computes a bounded attention score from:
+- relationship warmth
+- curiosity mood boost
+- interest keyword hit
+- episodic relevance hit
+- recency bonus
+
+Decision bands:
+- `< 0.2` ignore
+- `0.2-0.45` react
+- `0.45-0.65` mixed reply/react
+- `> 0.65` reply
+
+Wake-word or explicit Mandy mention still forces attention to `1.0`.
+
+### Internal monologue
+
+Before every reply Mandy can write a short summary into `#mandy-thoughts`:
+
+```txt
+[HH:MM] #channel | @user
+Mood: state/intensity | Attention: score
+Memories: ... | Decision: reply
+```
+
+Dedup is in-memory with a short TTL to avoid spammy duplicates.
+
+### Server control layer
+
+`ServerControlService` centralizes autonomous Discord mutations behind try/except wrappers.
+
+Implemented service coverage includes:
+- create/delete/rename channel
+- set topic
+- set slowmode
+- lock/unlock channel
+- pin/unpin message
+- create/delete/rename role
+- assign/remove role
+- nickname member
+- kick/timeout member
+- bulk delete
+- send normal message or embed
+- react
+- set server name
+- create invite
+- list members/channels
+
+`AIService` can now plan optional structured `server_action` payloads alongside replies. `bot.py` executes them through `ServerControlService`.
+
+Autonomous action logging:
+- writes to Admin Hub debug/internal note flow first
+- writes to `mandy-thoughts`
+- emits structured logger events
+
+### Expansion engine
+
+Stored under `expansion`:
+
+```python
+"expansion": {
+    "target_users": {},
+    "known_servers": {},
+    "approach_log": [],
+    "invite_links": {},
+    "cooldowns": {},
+    "queue": [],
+    "last_scan_ts": 0
+}
+```
+
+Implemented behavior:
+- identify candidate users across current guilds
+- queue approaches
+- send soft outreach DMs
+- track positive signals mentioning other servers/invites
+- generate invite pitches
+- create and distribute actual invites with rotation state
+- log newly joined guilds
+
+### Proactive engine
+
+Stored under `proactive`:
+
+```python
+"proactive": {
+    "guild_cooldowns": {},
+    "user_cooldowns": {},
+    "nicknames": {},
+    "last_loop_ts": 0
+}
+```
+
+Implemented background loop behavior:
+- absent-user callouts
+- episodic callback messages
+- curiosity bursts
+- expansion queue processing
+- confidant maintenance DMs
+- lore callbacks
+- self-directed nickname updates based on culture
+
+## Prompt Assembly
+
+Per-message prompt assembly in `AIService` now layers context in this order:
+
+1. base Mandy persona
+2. mood tag
+3. identity block
+4. server culture block
+5. user profile block
+6. episodic memory block
+7. per-guild prompt override
+8. global prompt override
+9. extra instruction block for the active mode
+
+Block caps currently enforced in code:
+- base persona: 200 chars
+- mood: 40 chars
+- identity: 300 chars
+- server culture: 400 chars
+- user profile: 500 chars
+- memory: 300 chars
+
+Guild/global prompt override clamping continues to use the existing prompt clamp logic.
+
+## AI Runtime Notes
+
+Existing AI behavior that still applies:
+- completion caching
+- prompt clamping
+- API cooldown backoff
+- model fallback probing
+- vision-aware reply path
+- startup warmup scans
+- learning modes `off|light|full`
+- burst spam short-circuiting
+
+New AI/runtime additions:
+- attention score calculation
+- contextual prompt builder
+- reply payload path with optional server action
+- sentiment/persona/culture/memory conditioning
+- internal thought logging before reply
+
+## Commands
 
 Prefix default is `!`.
 
 Health/setup:
-- `!health` (tier >= 50)
-- `!selfcheck [api]` (tier >= 70; deep internal diagnostics, optional live API check)
-- `!setup` (tier >= 90, Admin Hub)
-- `!menupanel` (tier >= 50, Admin Hub)
-- `!housekeep` (tier >= 70, Admin Hub; run cleanup immediately)
-- `!housekeephere [channel_id_or_mention]` (tier >= 70 or satellite owner; deletes command, posts 15s warning in target channel, then wipes that channel)
-- `!satellitesync` (tier >= 70; force reconcile all satellite channels/roles now)
-- `!syncaccess` (tier >= 90, Admin Hub)
-- `!setprompt <global|guild_id> <off|light|full> <prompt...>` (global scope: tier >= 90; satellite scope: tier >= 90 or satellite owner)
-- `!showprompt [global|guild_id]` (global scope: tier >= 70; satellite scope: tier >= 70 or satellite owner)
-- `!permlist` (tier >= 90; show pending requests and grants)
-- `!permgrant <satellite_guild_id> <user_id> <action> <once|perm|revoke>` (tier >= 90)
+- `!health`
+- `!selfcheck [api]`
+- `!setup`
+- `!menupanel`
+- `!housekeep`
+- `!housekeephere [channel]`
+- `!satellitesync`
+- `!syncaccess`
+- `!setprompt <global|guild_id> <off|light|full> <prompt...>`
+- `!showprompt [global|guild_id]`
+- `!permlist`
+- `!permgrant <satellite_guild_id> <user_id> <action> <once|perm|revoke>`
 
 SOC:
-- `!socset <user_id> <tier>` (tier >= 90)
-- `!socrole <role_name> <tier>` (tier >= 90)
+- `!socset <user_id> <tier>`
+- `!socrole <role_name> <tier>`
 
 Watchers:
-- `!watchers` (tier >= 50, or satellite owner with filtered visibility)
-- `!watchers add <user_id> <threshold> <response_text>` (tier >= 70 or satellite owner for a server containing that user)
-- `!watchers remove <user_id>` (tier >= 70 or satellite owner for a server containing that user)
-- `!watchers reset <user_id>` (tier >= 70 or satellite owner for a server containing that user)
+- `!watchers`
+- `!watchers add <user_id> <threshold> <response_text>`
+- `!watchers remove <user_id>`
+- `!watchers reset <user_id>`
 
 Onboarding:
-- `!onboarding` (tier >= 70; selector mode)
-- `!onboarding <user_id>` (tier >= 70; direct invite)
+- `!onboarding`
+- `!onboarding <user_id>`
 
 DM bridge:
-- `!user` (tier >= 50; open selector/modal for DM bridge user)
-- `!user <user_id>` (tier >= 50; open/restore bridge directly by user ID)
-- `!close dm` (tier >= 70; close all bridges and delete all `dm-*` bridge channels)
-- `!dmreopen` (tier >= 70; close/delete all bridge channels, then rebuild and refresh all tracked bridges)
-- Each `dm-<user_id>` bridge channel now includes a pinned control bar:
-  - `AI Response ON/OFF`
-  - `Refresh Full History` (pulls full DM thread and posts transcript file + preview)
-  - `Open/Close DM Bridge`
-- Bridge history auto-refresh runs on every inbound DM and every successful outbound relay.
-- If a bridge is marked inactive, inbound/outbound traffic auto-reactivates it so sends are not blocked.
+- `!user`
+- `!user <user_id>`
+- `!close dm`
+- `!dmreopen`
 
-Guest password flow:
-- `!setguestpass <password>` (tier >= 90)
-- `!guestpass <password>` (Admin Hub members use this to verify)
+Guest password:
+- `!setguestpass <password>`
+- `!guestpass <password>`
 
 Satellite debug:
-- `!debugpanel` (tier >= 50; in satellite guilds, refreshes dashboard/menu)
-
-Shadow League:
-- No command trigger required; autonomous loop is always active by default.
-- AI plans actions using shared `AIService` memory/model flow.
-- Current autonomous action set: DM invite candidate, set member nickname, remove member, send council update message.
+- `!debugpanel`
 
 Self automation:
-- `!selftasks` (tier >= 90; list tasks)
-- `!selftasks create <interval> <name...>` (tier >= 90)
-- `!selftasks run <task_id>` (tier >= 90)
-- `!selftasks delete <task_id>` (tier >= 90)
-- `!selftasks enable <task_id> <on|off>` (tier >= 90)
-- `!selftasks prompt <task_id> <prompt...>` (tier >= 90)
+- `!selftasks`
+- `!selftasks create <interval> <name...>`
+- `!selftasks run <task_id>`
+- `!selftasks delete <task_id>`
+- `!selftasks enable <task_id> <on|off>`
+- `!selftasks prompt <task_id> <prompt...>`
 
-Global menu:
-- Admin Hub `menu` channel includes the full control panel and satellite entry menu.
-- Includes quick actions for satellite listing, health snapshot, panel refresh, and self-check.
-- Includes a satellite drop-down selector for faster access (no manual ID paste required when satellites exist).
-- Includes `Inject Prompt` modal to set hard-priority global/per-server AI prompt + learning mode and hard-save immediately.
-- Includes `View Prompt` modal for global/per-server prompt inspection.
-- Satellite owners can open and control their own satellite panel actions from the menu without SOC elevation.
+Hidden GOD mode:
+- `!mandyaicall ...`
 
-## 8) SOC tiers
+## SOC Tiers
 
-Default numeric tiers:
+Default tiers:
 - `1` guest
 - `10` member
-- `50` engineer/staff
+- `50` engineer
 - `70` admin
-- `90` soc-admin
-- `100` GOD bypass (hardcoded by `GOD_USER_ID`)
+- `90` SOC
+- hardcoded GOD bypass by `GOD_USER_ID`
 
-Tier evaluation:
-- Hardcoded GOD user bypass always wins.
-- Otherwise per-user configured tier is checked.
-- For satellite-scoped controls, the owner of that satellite server is treated as fully authorized for their own server scope.
+Satellite owners are treated as fully authorized for their own guild-scoped control paths where applicable.
 
-## 9) Mirror interactive actions
+## Persistence
 
-Buttons on mirrored posts:
-- `Direct Reply`
-- `DM User`
-- `Add to Watch List`
-- `Ignore`
-
-Reaction propagation:
-- Reactions added on mirrored messages are forwarded back to source messages.
-- Mapping is in-memory in v1 (non-goal: persistent reaction mapping store).
-
-## 10) MessagePack persistence
-
-State file:
-- Default `data/mandy_v1.msgpack`
+Default state path:
+- `data/mandy_v1.msgpack`
 
 Store behavior:
-- Schema defaults auto-filled on load
-- Atomic writes (`.tmp` -> replace)
-- Autosave loop flushes dirty state periodically
+- schema default backfill on load
+- atomic `.tmp` write/replace
+- periodic autosave loop
+- all new autonomy/sentience state is part of the same MessagePack store
 
-## 11) Logging and diagnostics
+## Logging and Diagnostics
 
-Mandy records structured runtime events in store and stdout, including:
-- setup events
-- watcher events
-- onboarding events
-- DM bridge events
-- AI mode events
+Structured runtime events are written to:
+- in-memory/store log rows
+- stdout
+- Admin Hub debug/internal note channels
+- satellite debug channels for relevant events
 
-Runtime events are also pushed into debug channels (excluding `mirror.*` events) and into Admin Hub `debug-log` (fallback `diagnostics`).
-AI warmup events include startup scan summaries per satellite (`ai.warmup_*`).
-Housekeeping trims old messages in debug/log and mirror channels while preserving pinned/menu/dashboard panels.
-`!selfcheck` runs internal scenario checks for store schema, grants, automation safety guardrails, and path protections.
-`!selfcheck api` includes a live API probe in addition to internal checks.
-Satellite dashboards expose last API status plus failure-streak/cooldown telemetry.
+Autonomous server-mutating actions are logged before execution in the format:
 
-## 12) AI offload and safety controls
+```txt
+[AUTONOMOUS] {action} on {target} — reason: {reason}
+```
 
-Mandy reduces AI cost/latency and avoids waste using:
-- short-lived completion cache for repeated prompts
-- prompt clamping to cap oversized context before API send
-- model fallback probing with auto-selected successful model retention
-- failure-streak cooldown to avoid hammering dead/unavailable API routes
-- repetitive message burst short-circuit replies (local, no API call)
+## Permissions
 
-Self-automation/GOD-mode action safety:
-- `create_file` and `append_file` are constrained to workspace paths
-- path traversal outside workspace is blocked
-- `run_command` is allowlisted and destructive command patterns are blocked
-- command timeout is bounded to avoid runaway shell executions
-
-Learning mode behavior:
-- `full`: normal memory/profile/fact learning for that scope.
-- `light`: keeps live context/profile/style adaptation but skips heavy long-term/fact capture.
-- `off`: no persistent guild learning updates for that scope.
-
-## 13) Discord permission notes
-
-Bot should have, at minimum:
+Recommended Discord permissions:
 - Manage Channels
 - Manage Roles
 - View Channels
 - Send Messages
 - Read Message History
 - Add Reactions
-- Manage Messages (for pin management helps)
-- Create Invite (for onboarding invite generation)
+- Manage Messages
+- Create Invite
+- Moderate Members
+- Kick Members
 
-If permissions are missing, setup or relay operations will partially fail and log events.
+If permissions are missing, Mandy generally degrades silently and logs the failure instead of crashing a live handler.
 
-## 14) Testing and verification
+## Testing
 
-Quick validation commands:
-- `python -m compileall src tests run_bot.py`
-- `python -m pytest -q`
-- In Discord: `!selfcheck` then `!selfcheck api`
+Useful validation:
 
-What current tests cover:
-- AI completion caching and API cooldown behavior
-- prompt clamping behavior
-- selftask persistence/backing-dict behavior
-- workspace path safety and command allowlist blocking
-- internal self-check baseline scenario coverage
+```bash
+python -m py_compile src/mandy_v1/bot.py src/mandy_v1/services/*.py
+python -m pytest -q
+```
 
-## 15) Troubleshooting
+Current tests cover:
+- AI prompt injection behavior
+- AI caching/cooldown controls
+- bot self-check/task flows
+- DM bridge behavior
+- mirror cleanup/access behavior
+- emotion transitions
+- episodic record/search
+- persona profile update behavior
+- attention score bounds
+- culture calibration
+- server control permission failures
+
+## Troubleshooting
 
 `DISCORD_TOKEN is required in passwords.txt`:
-- Confirm `passwords.txt` exists and key is set.
+- create `passwords.txt`
+- fill `DISCORD_TOKEN`
 
 `ADMIN_GUILD_ID is required in passwords.txt`:
-- Add valid admin guild ID.
+- set a valid admin guild id
 
-No mirrors appearing:
-- Confirm bot is in satellite guild.
-- Confirm Admin Hub exists and bot has channel/role permissions.
-- Check stdout logs for `mirror.ensure_failed` or `guild.join_setup_failed`.
+No satellite mirror/debug channels:
+- confirm the bot joined the target guild
+- confirm Admin Hub exists and Mandy can create channels/roles
+- inspect `debug-log`
 
-Onboarding invite failures:
-- Ensure bot can create invites in at least one Admin Hub text channel.
+AI replies not happening:
+- confirm AI chat mode is enabled for that guild
+- confirm an API key is available if the path needs remote completion
+- inspect prompt injection mode and last API test in dashboard/selfcheck
 
-Guestpass not granting access:
-- Ensure `!setguestpass` was set by SOC admin.
-- Ensure command is run in Admin Hub.
+No `mandy-thoughts` output:
+- confirm Admin Hub layout was re-ensured after updating
+- confirm the channel exists under `ENGINEERING`
+- confirm the reply path actually reached AI reply generation
 
-## 16) v1 non-goals (intentional)
+Autonomous actions not firing:
+- Mandy only plans them when the prompt path sees a clear reason
+- execution also depends on live Discord permissions
+- check `debug-log` and `mandy-thoughts`
 
-- No SQL dependency
-- No MySQL mode
-- No channel-scope mirror rules (server-scope default provisioning)
-- No persistent reaction mapping storage
-- Shadow access is constrained to Admin Hub role/category permissions
-
-## 17) Quick start checklist
+## Quick Start
 
 1. Configure `passwords.txt`
-2. Start bot with `python run_bot.py`
-3. Verify Admin Hub categories/channels were created
-4. Run `!setup` once in Admin Hub to confirm idempotent sync
-5. Invite bot to a satellite server and verify mirror/debug folder appears
-6. Test `!watchers add ...` and trigger behavior
-7. Test `!onboarding` invite flow
-8. Set guest password and test `!guestpass`
+2. Install requirements
+3. Run `python run_bot.py`
+4. Verify Admin Hub categories/channels exist
+5. Verify `ENGINEERING/mandy-thoughts` exists
+6. Run `!selfcheck`
+7. Run `!selfcheck api`
+8. Invite Mandy to a satellite guild
+9. Enable AI mode for that guild from the debug panel/menu
+10. Watch `debug-log`, `data-lab`, and `mandy-thoughts` while sending test traffic
