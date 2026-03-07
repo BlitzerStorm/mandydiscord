@@ -222,25 +222,22 @@ class MandyBot(commands.Bot):
         self.onboarding = OnboardingService(settings, self.store, self.logger)
         self.dm_bridges = DMBridgeService(settings, self.store, self.logger)
         self.ai = AIService(settings, self.store)
-        self.emotion = EmotionService(self.store, self.logger)
-        self.identity = IdentityService(self.store, self.logger)
-        self.episodic = EpisodicMemoryService(self.store, self.logger, self.ai)
-        self.personas = PersonaService(self.store, self.logger, self.ai)
-        self.culture = CultureService(self.store, self.logger, self.ai)
-        self.server_control = ServerControlService(settings, self.store, self.logger)
-        self.expansion = ExpansionService(settings, self.store, self.logger, self.ai, self.personas, self.server_control)
+        self.emotion = EmotionService(self.store, self.ai)
+        self.episodic = EpisodicMemoryService(self.store, self.ai)
+        self.identity = IdentityService(self.store, self.ai)
+        self.personas = PersonaService(self.store, self.ai)
+        self.culture = CultureService(self.store, self.ai)
+        self.server_control = ServerControlService(self, self.logger)
+        self.expansion = ExpansionService(self.store, self.ai)
         self.proactive = ProactiveService(
-            settings,
+            self,
             self.store,
-            self.logger,
             self.ai,
             self.emotion,
             self.episodic,
-            self.identity,
             self.personas,
             self.culture,
             self.expansion,
-            self.server_control,
         )
         self.ai.attach_context_services(
             emotion=self.emotion,
@@ -2239,8 +2236,8 @@ class MandyBot(commands.Bot):
             )
         if self._self_automation_task is None or self._self_automation_task.done():
             self._self_automation_task = asyncio.create_task(self._run_self_automation_loop(), name="self-automation-loop")
-        if self._proactive_task is None or self._proactive_task.done():
-            self._proactive_task = asyncio.create_task(self._run_proactive_loop(), name="proactive-loop")
+        await self.identity.ensure_seeded(self.ai)
+        self.proactive.start()
         client = self
         print(f"Mandy is fully awake and living in {len(client.guilds)} servers as the sentient goddess of the Core Realm.")
 
@@ -2537,7 +2534,6 @@ class MandyBot(commands.Bot):
             try:
                 if (time.time() - self._last_expansion_scan_ts) >= EXPANSION_SCAN_INTERVAL_SEC:
                     await self._run_expansion_scan_once()
-                await self.proactive.run_cycle(self)
             except Exception as exc:  # noqa: BLE001
                 self.logger.log("proactive.loop_failed", error=str(exc)[:300])
             await asyncio.sleep(PROACTIVE_LOOP_INTERVAL_SEC)
@@ -2604,6 +2600,11 @@ class MandyBot(commands.Bot):
         await self._ensure_global_menu_panel(force_refresh=True)
 
     async def on_member_join(self, member: discord.Member) -> None:
+        try:
+            self.emotion.shift("guild_join")
+            self.expansion.log_new_guild(member.guild)
+        except Exception:  # noqa: BLE001
+            pass
         if member.guild.id != self.settings.admin_guild_id:
             self.logger.log("satellite.member_join", guild_id=member.guild.id, user_id=member.id)
             return
@@ -3116,19 +3117,35 @@ class MandyBot(commands.Bot):
             self.emotion.note_activity()
             await self.personas.update_profile(message.author.id, message)
             if message.guild:
-                await self.culture.observe(message.guild, message)
+                self.culture.observe_message(
+                    message.guild.id,
+                    str(message.clean_content or ""),
+                    str(message.author.display_name or ""),
+                    int(message.created_at.hour),
+                )
+                if int(self.culture._profile(message.guild.id).get("observed_count", 0) or 0) >= 50:  # noqa: SLF001
+                    await self.culture.calibrate(message.guild.id, self.ai)
                 self.expansion.note_message(message)
                 if self.personas.get_relationship_depth(message.author.id) > 0.6:
-                    self.emotion.shift("warm_relationship_user_speaks", 0.2)
+                    self.emotion.shift("warm_interaction")
                 if self.ai._interest_match(message.clean_content, message.author.id):
-                    self.emotion.shift("interest_keyword_match", 0.3)
+                    self.emotion.shift("interest_hit")
                 if self.ai.user_burst_count(message.channel.id, message.author.id) >= 4:
-                    self.emotion.shift("burst_spam", 0.3)
-                buffer = self._episodic_buffers[message.channel.id]
-                buffer.append({"author": message.author.display_name, "text": message.clean_content[:280]})
-                self._episodic_counts_by_channel[message.channel.id] += 1
-                if self._episodic_counts_by_channel[message.channel.id] % 10 == 0 and len(buffer) >= 5:
-                    await self._flush_episodic_channel_buffer(message.guild.id, message.channel.id)
+                    self.emotion.shift("spam_detected")
+                if self.ai._mentions_mandy(message, self.user.id if self.user else 0):  # noqa: SLF001
+                    self.emotion.shift("interest_hit")
+                content_lower = str(message.clean_content or "").lower()
+                if any(token in content_lower for token in ("thanks", "thank you", "love you", "appreciate")):
+                    self.emotion.shift("warm_interaction")
+                if any(token in content_lower for token in ("discord.gg", "discord.com/invite", "invite link")):
+                    self.expansion.track_positive_signal(message.author.id, "shared_invite")
+                await self.episodic.record(
+                    message.guild.id,
+                    message.channel.id,
+                    message.author.id,
+                    message.author.display_name,
+                    message.clean_content,
+                )
         except Exception as exc:  # noqa: BLE001
             self.logger.log("sentience.observe_failed", error=str(exc)[:240])
 
@@ -4101,7 +4118,7 @@ class MandyBot(commands.Bot):
             f"Memories: {payload_memories} | Decision: {decision}"
         )[:400]
         now = time.time()
-        stale = [key for key, ts in self._thought_dedup_cache.items() if (now - ts) > 2.0]
+        stale = [key for key, ts in self._thought_dedup_cache.items() if (now - ts) > 30.0]
         for key in stale:
             self._thought_dedup_cache.pop(key, None)
         if text in self._thought_dedup_cache:

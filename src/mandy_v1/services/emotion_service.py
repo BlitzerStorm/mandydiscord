@@ -1,156 +1,211 @@
 from __future__ import annotations
 
+import logging
+import random
 import time
 from typing import Any
 
-from mandy_v1.services.logger_service import LoggerService
-from mandy_v1.storage import MessagePackStore
 
-
-NEUTRAL_INTENSITY = 0.5
-DECAY_PER_MINUTE = 0.05
-STATE_BY_TRIGGER = {
-    "burst_spam": "irritated",
-    "quiet": "bored",
-    "warm_relationship_user_speaks": "warm",
-    "interest_keyword_match": "curious",
-    "successful_expansion_event": "mischievous",
-    "reply_sent": "neutral",
-    "ignored": "bored",
-    "new_server_joined": "curious",
+LOGGER = logging.getLogger("mandy.emotion")
+DECAY_PER_SECOND = 0.00005
+VALID_STATES = {
+    "neutral",
+    "curious",
+    "playful",
+    "warm",
+    "protective",
+    "energetic",
+    "reflective",
+    "mischievous",
+    "proud",
+    "irritated",
+    "bored",
+    "excited",
+    "melancholy",
+    "focused",
+}
+TRIGGERS: dict[str, tuple[str, float]] = {
+    "spam_detected": ("irritated", 0.4),
+    "warm_interaction": ("warm", 0.3),
+    "interest_hit": ("curious", 0.25),
+    "ignored_message": ("bored", 0.15),
+    "reply_sent": ("neutral", -0.05),
+    "quiet_period": ("reflective", 0.2),
+    "guild_join": ("excited", 0.6),
+    "goal_achieved": ("proud", 0.5),
+    "lurker_responded": ("warm", 0.4),
+    "negative_message": ("protective", 0.3),
+    "fun_event": ("playful", 0.5),
+    "deep_conversation": ("reflective", 0.35),
+}
+TRIGGER_ALIASES = {
+    "new_server_joined": "guild_join",
+    "successful_expansion_event": "goal_achieved",
+    "warm_relationship_user_speaks": "warm_interaction",
+    "interest_keyword_match": "interest_hit",
+    "burst_spam": "spam_detected",
+    "ignored": "ignored_message",
 }
 
 
 class EmotionService:
-    def __init__(self, store: MessagePackStore, logger: LoggerService) -> None:
-        self.store = store
-        self.logger = logger
+    """Manages Mandy's persistent emotional state and mood drift/decay."""
 
-    def root(self) -> dict[str, Any]:
-        node = self.store.data.setdefault("emotion", {})
+    def __init__(self, storage: Any, ai_service: Any | None = None) -> None:
+        """Store dependencies and initialize random source."""
+        self.storage = storage
+        self.ai_service = ai_service
+        self._rng = random.Random()
+
+    def _root(self) -> dict[str, Any]:
+        """Return the emotion node, ensuring schema defaults."""
+        node = self.storage.data.setdefault("emotion", {})
         node.setdefault("state", "neutral")
-        node.setdefault("intensity", NEUTRAL_INTENSITY)
-        node.setdefault("last_updated", 0)
+        node.setdefault("intensity", 0.5)
+        node.setdefault("last_updated", int(time.time()))
         node.setdefault("event_log", [])
-        node.setdefault("last_activity", 0)
-        node.setdefault("last_quiet_triggered", 0)
         return node
 
-    def note_activity(self, *, ts: int | None = None) -> None:
-        try:
-            row = self.root()
-            row["last_activity"] = int(ts or time.time())
-            self.store.touch()
-        except Exception as exc:  # noqa: BLE001
-            self.logger.log("emotion.note_activity_failed", error=str(exc)[:220])
+    def _mark_dirty(self) -> None:
+        """Mark storage dirty using whichever method exists on the store."""
+        if hasattr(self.storage, "mark_dirty"):
+            self.storage.mark_dirty()
+        elif hasattr(self.storage, "touch"):
+            self.storage.touch()
+
+    def _decay(self, now_ts: int | None = None) -> None:
+        """Decay intensity toward baseline and normalize state after idle time."""
+        now = int(now_ts or time.time())
+        row = self._root()
+        last_updated = int(row.get("last_updated", now) or now)
+        elapsed = max(0, now - last_updated)
+        intensity = float(row.get("intensity", 0.5) or 0.5)
+        if elapsed > 0:
+            delta = DECAY_PER_SECOND * elapsed
+            if intensity > 0.5:
+                intensity = max(0.5, intensity - delta)
+            elif intensity < 0.5:
+                intensity = min(0.5, intensity + delta)
+        intensity = max(0.0, min(1.0, intensity))
+        row["intensity"] = round(intensity, 4)
+        row["last_updated"] = now
+        if intensity < 0.2:
+            row["state"] = "neutral"
 
     def get_mood(self) -> dict[str, Any]:
+        """Return current mood after applying decay."""
         try:
-            row = self.root()
-            now = int(time.time())
-            changed = self._apply_decay(row, now)
-            last_activity = int(row.get("last_activity", 0) or 0)
-            last_quiet = int(row.get("last_quiet_triggered", 0) or 0)
-            if last_activity > 0 and (now - last_activity) >= (30 * 60) and (now - last_quiet) >= (30 * 60):
-                self._shift_unlocked(row, "quiet", 0.2, now=now)
-                row["last_quiet_triggered"] = now
-                changed = True
-            if changed:
-                self.store.touch()
+            self._decay()
+            row = self._root()
             return {
                 "state": str(row.get("state", "neutral")),
-                "intensity": round(float(row.get("intensity", NEUTRAL_INTENSITY) or NEUTRAL_INTENSITY), 3),
+                "intensity": float(row.get("intensity", 0.5) or 0.5),
                 "last_updated": int(row.get("last_updated", 0) or 0),
-                "event_log": list(row.get("event_log", []))[-20:],
+                "event_log": list(row.get("event_log", []))[-100:],
             }
-        except Exception as exc:  # noqa: BLE001
-            self.logger.log("emotion.get_mood_failed", error=str(exc)[:220])
-            return {
-                "state": "neutral",
-                "intensity": NEUTRAL_INTENSITY,
-                "last_updated": 0,
-                "event_log": [],
-            }
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to read mood.")
+            return {"state": "neutral", "intensity": 0.5, "last_updated": 0, "event_log": []}
 
-    def shift(self, trigger: str, delta: float) -> dict[str, Any]:
-        try:
-            row = self.root()
-            now = int(time.time())
-            self._apply_decay(row, now)
-            self._shift_unlocked(row, trigger, delta, now=now)
-            row["last_activity"] = now
-            self.store.touch()
-            return {
-                "state": str(row.get("state", "neutral")),
-                "intensity": round(float(row.get("intensity", NEUTRAL_INTENSITY) or NEUTRAL_INTENSITY), 3),
-                "last_updated": int(row.get("last_updated", 0) or 0),
-                "event_log": list(row.get("event_log", []))[-20:],
-            }
-        except Exception as exc:  # noqa: BLE001
-            self.logger.log("emotion.shift_failed", trigger=str(trigger)[:60], error=str(exc)[:220])
-            return self.get_mood()
+    def get_state(self) -> str:
+        """Return current emotion state."""
+        return str(self.get_mood().get("state", "neutral"))
+
+    def get_intensity(self) -> float:
+        """Return current emotion intensity."""
+        return float(self.get_mood().get("intensity", 0.5) or 0.5)
 
     def mood_tag(self) -> str:
-        try:
-            mood = self.get_mood()
-            return f"[MOOD: {mood['state']}/{float(mood['intensity']):.1f}]"
-        except Exception as exc:  # noqa: BLE001
-            self.logger.log("emotion.mood_tag_failed", error=str(exc)[:220])
-            return "[MOOD: neutral/0.5]"
+        """Return compact mood tag for prompt injection (<= 40 chars)."""
+        mood = self.get_mood()
+        tag = f"[mood:{mood['state']}/{float(mood['intensity']):.2f}]"
+        return tag[:40]
 
-    def _apply_decay(self, row: dict[str, Any], now: int) -> bool:
+    def shift(self, trigger: str, delta_override: float | None = None) -> dict[str, Any]:
+        """Apply a named emotional trigger."""
         try:
-            last_updated = int(row.get("last_updated", 0) or 0)
-            if last_updated <= 0 or now <= last_updated:
-                row["last_updated"] = now
-                return False
-            elapsed_minutes = (now - last_updated) / 60.0
-            decay = max(0.0, elapsed_minutes * DECAY_PER_MINUTE)
-            current = float(row.get("intensity", NEUTRAL_INTENSITY) or NEUTRAL_INTENSITY)
-            distance = current - NEUTRAL_INTENSITY
-            if abs(distance) <= decay:
-                next_intensity = NEUTRAL_INTENSITY
-            elif distance > 0:
-                next_intensity = current - decay
+            normalized = TRIGGER_ALIASES.get(str(trigger), str(trigger))
+            state, delta = TRIGGERS.get(normalized, ("neutral", 0.0))
+            if delta_override is not None:
+                delta = float(delta_override)
+            self._decay()
+            row = self._root()
+            current = float(row.get("intensity", 0.5) or 0.5)
+            intensity = max(0.0, min(1.0, current + float(delta)))
+            row["state"] = state if state in VALID_STATES else "neutral"
+            row["intensity"] = round(intensity, 4)
+            row["last_updated"] = int(time.time())
+            log = row.setdefault("event_log", [])
+            log.append({"ts": row["last_updated"], "trigger": normalized, "state": row["state"], "delta": delta})
+            if len(log) > 100:
+                del log[: len(log) - 100]
+            self._mark_dirty()
+            return self.get_mood()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to shift mood with trigger=%s", trigger)
+            return self.get_mood()
+
+    def note_activity(self, ts: int | None = None) -> None:
+        """Compatibility hook for call sites that mark active cadence."""
+        try:
+            row = self._root()
+            row["last_updated"] = int(ts or time.time())
+            self._mark_dirty()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to note activity.")
+
+    def shift_raw(self, state: str, intensity: float) -> None:
+        """Force emotion state/intensity explicitly."""
+        try:
+            row = self._root()
+            clean_state = str(state).strip().lower()
+            row["state"] = clean_state if clean_state in VALID_STATES else "neutral"
+            row["intensity"] = round(max(0.0, min(1.0, float(intensity))), 4)
+            row["last_updated"] = int(time.time())
+            log = row.setdefault("event_log", [])
+            log.append({"ts": row["last_updated"], "trigger": "shift_raw", "state": row["state"], "delta": 0.0})
+            if len(log) > 100:
+                del log[: len(log) - 100]
+            self._mark_dirty()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed to force mood state.")
+
+    def spontaneous_drift(self) -> None:
+        """Apply occasional time-of-day drift with 15% probability."""
+        try:
+            if self._rng.random() > 0.15:
+                return
+            hour = int(time.gmtime().tm_hour)
+            if 0 <= hour < 6:
+                target = self._rng.choice(("reflective", "melancholy"))
+            elif 6 <= hour < 12:
+                target = self._rng.choice(("focused", "energetic"))
+            elif 12 <= hour < 18:
+                target = self._rng.choice(("curious", "focused", "playful"))
             else:
-                next_intensity = current + decay
-            changed = abs(next_intensity - current) >= 0.001
-            row["intensity"] = round(max(0.0, min(1.0, next_intensity)), 3)
-            if abs(float(row["intensity"]) - NEUTRAL_INTENSITY) <= 0.03:
-                row["state"] = "neutral"
-            row["last_updated"] = now
-            return changed
-        except Exception:
-            row["last_updated"] = now
-            return False
+                target = self._rng.choice(("warm", "playful", "reflective"))
+            self._decay()
+            row = self._root()
+            row["state"] = target
+            row["intensity"] = round(max(0.0, min(1.0, float(row.get("intensity", 0.5) or 0.5) + 0.06)), 4)
+            row["last_updated"] = int(time.time())
+            events = row.setdefault("event_log", [])
+            events.append({"ts": row["last_updated"], "trigger": "spontaneous_drift", "state": target, "delta": 0.06})
+            if len(events) > 100:
+                del events[: len(events) - 100]
+            self._mark_dirty()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed spontaneous mood drift.")
 
-    def _shift_unlocked(self, row: dict[str, Any], trigger: str, delta: float, *, now: int) -> None:
-        current = float(row.get("intensity", NEUTRAL_INTENSITY) or NEUTRAL_INTENSITY)
-        next_intensity = max(0.0, min(1.0, current + float(delta)))
-        state = str(row.get("state", "neutral") or "neutral")
-        target_state = STATE_BY_TRIGGER.get(trigger, state)
-
-        if trigger == "new_server_joined":
-            state = "playful" if next_intensity >= 0.8 else "curious"
-        elif trigger == "reply_sent" and next_intensity <= 0.55:
-            state = "neutral"
-        elif trigger == "ignored" and next_intensity >= 0.55:
-            state = "bored"
-        elif delta > 0 and next_intensity >= 0.55:
-            state = target_state
-        elif abs(next_intensity - NEUTRAL_INTENSITY) <= 0.05:
-            state = "neutral"
-
-        if state == "curious" and next_intensity >= 0.85:
-            state = "playful"
-
-        row["state"] = state
-        row["intensity"] = round(next_intensity, 3)
-        row["last_updated"] = now
-        events = row.setdefault("event_log", [])
+    def recent_events(self, n: int = 5) -> list[dict[str, Any]]:
+        """Return the most recent `n` mood events."""
+        row = self._root()
+        events = row.get("event_log", [])
         if not isinstance(events, list):
-            events = []
-            row["event_log"] = events
-        events.append({"ts": now, "trigger": str(trigger)[:80], "delta": round(float(delta), 3)})
-        if len(events) > 20:
-            del events[: len(events) - 20]
+            return []
+        return [event for event in events[-max(1, int(n)) :] if isinstance(event, dict)]
+
+    def summary(self) -> str:
+        """Return compact textual mood summary."""
+        mood = self.get_mood()
+        return f"{mood['state']} ({float(mood['intensity']):.2f})"

@@ -1,20 +1,48 @@
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 from typing import Any
 
 import discord
 
-from mandy_v1.config import Settings
-from mandy_v1.services.logger_service import LoggerService
-from mandy_v1.storage import MessagePackStore
+
+LOGGER = logging.getLogger("mandy.server_control")
 
 
 class ServerControlService:
-    def __init__(self, settings: Settings, store: MessagePackStore, logger: LoggerService) -> None:
-        self.settings = settings
-        self.store = store
-        self.logger = logger
+    """Central wrapper for autonomous Discord server mutation actions."""
+
+    def __init__(self, bot: Any, logger_service: Any | None = None, maybe_logger: Any | None = None) -> None:
+        """Store bot/logger dependencies used by all control operations."""
+        if maybe_logger is not None:
+            # Compatibility with legacy signature: (settings, store, logger)
+            self.bot = bot
+            self.logger_service = maybe_logger
+        else:
+            self.bot = bot
+            self.logger_service = logger_service
+
+    async def _log_action(self, action_name: str, target: str, reason: str = "autonomous") -> None:
+        """Write autonomous action logs to logger service and mandy-thoughts when available."""
+        line = f"[AUTONOMOUS] {action_name} on {target} - reason: {reason}"
+        try:
+            self.logger_service.log("autonomous.action", action=action_name, target=target, reason=reason)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed logger_service log for action %s", action_name)
+        LOGGER.info(line)
+        try:
+            admin_guild_id = int(getattr(getattr(self.bot, "settings", None), "admin_guild_id", 0) or 0)
+            if admin_guild_id <= 0:
+                return
+            guild = self.bot.get_guild(admin_guild_id)
+            if guild is None:
+                return
+            channel = discord.utils.get(guild.text_channels, name="mandy-thoughts")
+            if isinstance(channel, discord.TextChannel):
+                await channel.send(line[:1900])
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed mandy-thoughts log for action %s", action_name)
 
     async def create_channel(
         self,
@@ -22,213 +50,208 @@ class ServerControlService:
         name: str,
         category: discord.CategoryChannel | None = None,
         topic: str | None = None,
-        permissions: dict[Any, discord.PermissionOverwrite] | None = None,
     ) -> discord.abc.GuildChannel | None:
+        """Create a text channel in the target guild."""
+        await self._log_action("create_channel", f"{guild.id}:{name}", "create channel")
         try:
-            channel = await guild.create_text_channel(
-                str(name or "mandy-room")[:100],
-                category=category,
-                topic=(str(topic or "")[:1024] or None),
-                overwrites=permissions,
-                reason="Mandy autonomous server control",
-            )
-            self.logger.log("server_control.create_channel", guild_id=guild.id, channel_id=channel.id, name=channel.name)
-            return channel
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("create_channel", guild=guild, error=exc)
+            return await guild.create_text_channel(str(name)[:100], category=category, topic=(str(topic)[:1024] if topic else None))
+        except (discord.Forbidden, discord.HTTPException):
             return None
 
-    async def delete_channel(self, guild: discord.Guild, channel: discord.abc.GuildChannel) -> bool:
+    async def delete_channel(self, channel: discord.abc.GuildChannel) -> bool:
+        """Delete a guild channel."""
+        await self._log_action("delete_channel", f"{channel.id}", "delete channel")
         try:
-            await channel.delete(reason="Mandy autonomous server control")
-            self.logger.log("server_control.delete_channel", guild_id=guild.id, channel_id=channel.id)
+            await channel.delete(reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("delete_channel", guild=guild, channel=channel, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def rename_channel(self, guild: discord.Guild, channel: discord.abc.GuildChannel, new_name: str) -> bool:
+    async def rename_channel(self, channel: discord.abc.GuildChannel, name: str) -> bool:
+        """Rename a guild channel."""
+        await self._log_action("rename_channel", f"{channel.id}", "rename channel")
         try:
-            await channel.edit(name=str(new_name or channel.name)[:100], reason="Mandy autonomous server control")
-            self.logger.log("server_control.rename_channel", guild_id=guild.id, channel_id=channel.id, name=str(new_name)[:100])
+            await channel.edit(name=str(name)[:100], reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("rename_channel", guild=guild, channel=channel, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def set_channel_topic(self, guild: discord.Guild, channel: discord.TextChannel, topic: str) -> bool:
+    async def set_topic(self, channel: discord.TextChannel, topic: str) -> bool:
+        """Set a text channel topic."""
+        await self._log_action("set_topic", f"{channel.id}", "set topic")
         try:
-            await channel.edit(topic=str(topic or "")[:1024], reason="Mandy autonomous server control")
-            self.logger.log("server_control.set_channel_topic", guild_id=guild.id, channel_id=channel.id)
+            await channel.edit(topic=str(topic)[:1024], reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("set_channel_topic", guild=guild, channel=channel, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def set_slowmode(self, guild: discord.Guild, channel: discord.TextChannel, seconds: int) -> bool:
+    async def set_channel_topic(self, channel: discord.TextChannel, topic: str) -> bool:
+        """Compatibility alias for setting a topic."""
+        return await self.set_topic(channel, topic)
+
+    async def set_slowmode(self, channel: discord.TextChannel, seconds: int) -> bool:
+        """Set slowmode on a text channel."""
+        await self._log_action("set_slowmode", f"{channel.id}", f"set slowmode={seconds}")
         try:
-            value = max(0, min(21600, int(seconds)))
-            await channel.edit(slowmode_delay=value, reason="Mandy autonomous server control")
-            self.logger.log("server_control.set_slowmode", guild_id=guild.id, channel_id=channel.id, seconds=value)
+            await channel.edit(slowmode_delay=max(0, min(21600, int(seconds))), reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("set_slowmode", guild=guild, channel=channel, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def lock_channel(self, guild: discord.Guild, channel: discord.TextChannel) -> bool:
+    async def lock_channel(self, channel: discord.TextChannel) -> bool:
+        """Lock channel sends for @everyone."""
+        await self._log_action("lock_channel", f"{channel.id}", "lock channel")
         try:
-            await channel.set_permissions(guild.default_role, send_messages=False, reason="Mandy autonomous server control")
-            self.logger.log("server_control.lock_channel", guild_id=guild.id, channel_id=channel.id)
+            await channel.set_permissions(channel.guild.default_role, send_messages=False, reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("lock_channel", guild=guild, channel=channel, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def unlock_channel(self, guild: discord.Guild, channel: discord.TextChannel) -> bool:
+    async def unlock_channel(self, channel: discord.TextChannel) -> bool:
+        """Unlock channel sends for @everyone."""
+        await self._log_action("unlock_channel", f"{channel.id}", "unlock channel")
         try:
-            await channel.set_permissions(guild.default_role, send_messages=None, reason="Mandy autonomous server control")
-            self.logger.log("server_control.unlock_channel", guild_id=guild.id, channel_id=channel.id)
+            await channel.set_permissions(channel.guild.default_role, send_messages=None, reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("unlock_channel", guild=guild, channel=channel, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
     async def pin_message(self, message: discord.Message) -> bool:
+        """Pin a message."""
+        await self._log_action("pin_message", f"{message.id}", "pin message")
         try:
-            await message.pin(reason="Mandy autonomous server control")
-            self.logger.log("server_control.pin_message", guild_id=message.guild.id if message.guild else 0, message_id=message.id)
+            await message.pin(reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("pin_message", channel=message.channel, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
     async def unpin_message(self, message: discord.Message) -> bool:
+        """Unpin a message."""
+        await self._log_action("unpin_message", f"{message.id}", "unpin message")
         try:
-            await message.unpin(reason="Mandy autonomous server control")
-            self.logger.log("server_control.unpin_message", guild_id=message.guild.id if message.guild else 0, message_id=message.id)
+            await message.unpin(reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("unpin_message", channel=message.channel, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def create_role(
-        self,
-        guild: discord.Guild,
-        name: str,
-        color: discord.Color | int | None = None,
-        permissions: discord.Permissions | None = None,
-    ) -> discord.Role | None:
+    async def create_role(self, guild: discord.Guild, name: str, color: discord.Color | None = None) -> discord.Role | None:
+        """Create a role in the guild."""
+        await self._log_action("create_role", f"{guild.id}:{name}", "create role")
         try:
-            role = await guild.create_role(
-                name=str(name or "mandy-role")[:100],
-                colour=color if isinstance(color, discord.Color) else discord.Color(int(color or 0)),
-                permissions=permissions,
-                reason="Mandy autonomous server control",
-            )
-            self.logger.log("server_control.create_role", guild_id=guild.id, role_id=role.id, name=role.name)
-            return role
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("create_role", guild=guild, error=exc)
+            kwargs: dict[str, Any] = {"name": str(name)[:100], "reason": "Mandy autonomous action"}
+            if color is not None:
+                kwargs["colour"] = color
+            return await guild.create_role(**kwargs)
+        except (discord.Forbidden, discord.HTTPException):
             return None
 
-    async def delete_role(self, guild: discord.Guild, role: discord.Role) -> bool:
+    async def delete_role(self, role: discord.Role) -> bool:
+        """Delete a role."""
+        await self._log_action("delete_role", f"{role.id}", "delete role")
         try:
-            await role.delete(reason="Mandy autonomous server control")
-            self.logger.log("server_control.delete_role", guild_id=guild.id, role_id=role.id)
+            await role.delete(reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("delete_role", guild=guild, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def assign_role(self, guild: discord.Guild, member: discord.Member, role: discord.Role) -> bool:
+    async def rename_role(self, role: discord.Role, name: str) -> bool:
+        """Rename a role."""
+        await self._log_action("rename_role", f"{role.id}", "rename role")
         try:
-            await member.add_roles(role, reason="Mandy autonomous server control")
-            self.logger.log("server_control.assign_role", guild_id=guild.id, user_id=member.id, role_id=role.id)
+            await role.edit(name=str(name)[:100], reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("assign_role", guild=guild, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def remove_role(self, guild: discord.Guild, member: discord.Member, role: discord.Role) -> bool:
+    async def assign_role(self, member: discord.Member, role: discord.Role) -> bool:
+        """Assign role to member."""
+        await self._log_action("assign_role", f"{member.id}:{role.id}", "assign role")
         try:
-            await member.remove_roles(role, reason="Mandy autonomous server control")
-            self.logger.log("server_control.remove_role", guild_id=guild.id, user_id=member.id, role_id=role.id)
+            await member.add_roles(role, reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("remove_role", guild=guild, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def rename_role(self, guild: discord.Guild, role: discord.Role, new_name: str) -> bool:
+    async def remove_role(self, member: discord.Member, role: discord.Role) -> bool:
+        """Remove role from member."""
+        await self._log_action("remove_role", f"{member.id}:{role.id}", "remove role")
         try:
-            await role.edit(name=str(new_name or role.name)[:100], reason="Mandy autonomous server control")
-            self.logger.log("server_control.rename_role", guild_id=guild.id, role_id=role.id, name=str(new_name)[:100])
+            await member.remove_roles(role, reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("rename_role", guild=guild, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def nickname_member(self, guild: discord.Guild, member: discord.Member, nick: str) -> bool:
+    async def nickname_member(self, *args: Any) -> bool:
+        """Change a member nickname."""
+        # Compatibility: nickname_member(member, nick) or nickname_member(guild, member, nick)
+        if len(args) == 2:
+            member = args[0]
+            nick = args[1]
+        elif len(args) >= 3:
+            member = args[1]
+            nick = args[2]
+        else:
+            return False
+        await self._log_action("nickname_member", f"{getattr(member, 'id', 0)}", "nickname change")
         try:
-            await member.edit(nick=str(nick or "")[:32], reason="Mandy autonomous server control")
-            self.logger.log("server_control.nickname_member", guild_id=guild.id, user_id=member.id, nick=str(nick)[:32])
+            await member.edit(nick=str(nick)[:32], reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("nickname_member", guild=guild, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def kick_member(self, guild: discord.Guild, member: discord.Member, reason: str) -> bool:
+    async def kick_member(self, member: discord.Member, reason: str | None = None) -> bool:
+        """Kick a guild member."""
+        await self._log_action("kick_member", f"{member.id}", reason or "kick member")
         try:
-            if int(member.id) == int(self.settings.god_user_id):
-                return False
-            await member.kick(reason=str(reason or "Mandy autonomous server control")[:240])
-            self.logger.log("server_control.kick_member", guild_id=guild.id, user_id=member.id)
+            await member.kick(reason=(reason or "Mandy autonomous action")[:240])
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("kick_member", guild=guild, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def timeout_member(self, guild: discord.Guild, member: discord.Member, duration_minutes: int, reason: str) -> bool:
+    async def timeout_member(self, member: discord.Member, duration_minutes: int) -> bool:
+        """Timeout a guild member for a number of minutes."""
+        await self._log_action("timeout_member", f"{member.id}", f"timeout {duration_minutes}m")
         try:
-            if int(member.id) == int(self.settings.god_user_id):
-                return False
             until = discord.utils.utcnow() + timedelta(minutes=max(1, min(40320, int(duration_minutes))))
-            await member.timeout(until, reason=str(reason or "Mandy autonomous server control")[:240])
-            self.logger.log("server_control.timeout_member", guild_id=guild.id, user_id=member.id, minutes=int(duration_minutes))
+            await member.timeout(until, reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("timeout_member", guild=guild, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def bulk_delete(self, guild: discord.Guild, channel: discord.TextChannel, limit: int) -> int:
+    async def bulk_delete(self, channel: discord.TextChannel, limit: int) -> int:
+        """Delete up to `limit` recent messages in a channel."""
+        await self._log_action("bulk_delete", f"{channel.id}", f"bulk delete {limit}")
         try:
-            deleted = await channel.purge(limit=max(1, min(200, int(limit))), bulk=True, reason="Mandy autonomous server control")
-            count = len(deleted) if isinstance(deleted, list) else 0
-            self.logger.log("server_control.bulk_delete", guild_id=guild.id, channel_id=channel.id, deleted=count)
-            return count
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("bulk_delete", guild=guild, channel=channel, error=exc)
+            deleted = await channel.purge(limit=max(1, min(200, int(limit))), bulk=True, reason="Mandy autonomous action")
+            return len(deleted)
+        except (discord.Forbidden, discord.HTTPException):
             return 0
 
-    async def send_as_mandy(self, channel: discord.abc.Messageable, content: str) -> discord.Message | None:
+    async def send_message(self, channel: discord.abc.Messageable, content: str) -> discord.Message | None:
+        """Send a plain text message."""
+        await self._log_action("send_message", f"{getattr(channel, 'id', 0)}", "send message")
         try:
-            sent = await channel.send(str(content or "")[:1900])
-            self.logger.log("server_control.send_as_mandy", channel_id=getattr(channel, "id", 0), chars=len(str(content or "")))
-            return sent
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("send_as_mandy", channel=channel, error=exc)
+            return await channel.send(str(content)[:1900])
+        except (discord.Forbidden, discord.HTTPException):
             return None
+
+    async def send_as_mandy(self, channel: discord.abc.Messageable, content: str) -> discord.Message | None:
+        """Compatibility alias for plain send."""
+        return await self.send_message(channel, content)
 
     async def send_embed(
         self,
         channel: discord.abc.Messageable,
         title: str,
         description: str,
-        color: int,
+        color: int = 0x5865F2,
         fields: list[dict[str, Any]] | None = None,
     ) -> discord.Message | None:
+        """Send a basic embed message."""
+        await self._log_action("send_embed", f"{getattr(channel, 'id', 0)}", "send embed")
         try:
-            embed = discord.Embed(title=str(title or "")[:256], description=str(description or "")[:4096], color=int(color or 0))
-            for row in fields or []:
+            embed = discord.Embed(title=str(title)[:256], description=str(description)[:4096], color=int(color))
+            for row in (fields or [])[:10]:
                 if not isinstance(row, dict):
                     continue
                 embed.add_field(
@@ -236,175 +259,140 @@ class ServerControlService:
                     value=str(row.get("value", ""))[:1024] or "-",
                     inline=bool(row.get("inline", False)),
                 )
-            sent = await channel.send(embed=embed)
-            self.logger.log("server_control.send_embed", channel_id=getattr(channel, "id", 0), title=embed.title)
-            return sent
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("send_embed", channel=channel, error=exc)
+            return await channel.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
             return None
 
-    async def react(self, message: discord.Message, emoji: str) -> bool:
+    async def add_reaction(self, message: discord.Message, emoji: str) -> bool:
+        """Add a reaction to a message."""
+        await self._log_action("add_reaction", f"{message.id}", "add reaction")
         try:
-            await message.add_reaction(str(emoji or "✨")[:32])
-            self.logger.log("server_control.react", message_id=message.id, emoji=str(emoji or "✨")[:32])
+            await message.add_reaction(str(emoji)[:32])
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("react", channel=message.channel, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
+
+    async def react(self, message: discord.Message, emoji: str) -> bool:
+        """Compatibility alias for add_reaction."""
+        return await self.add_reaction(message, emoji)
 
     async def set_server_name(self, guild: discord.Guild, name: str) -> bool:
+        """Rename a guild."""
+        await self._log_action("set_server_name", f"{guild.id}", "rename server")
         try:
-            await guild.edit(name=str(name or guild.name)[:100], reason="Mandy autonomous server control")
-            self.logger.log("server_control.set_server_name", guild_id=guild.id, name=str(name)[:100])
+            await guild.edit(name=str(name)[:100], reason="Mandy autonomous action")
             return True
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("set_server_name", guild=guild, error=exc)
+        except (discord.Forbidden, discord.HTTPException):
             return False
 
-    async def create_invite(self, guild: discord.Guild, channel: discord.TextChannel | None = None, max_age_hours: int = 24) -> str:
+    async def create_invite(self, channel: discord.TextChannel, max_uses: int = 50, max_age: int = 86400) -> discord.Invite | None:
+        """Create an invite for a channel."""
+        await self._log_action("create_invite", f"{channel.id}", "create invite")
         try:
-            target = channel
-            if target is None:
-                me = guild.me
-                if me is None:
-                    return ""
-                target = next(
-                    (
-                        text_channel
-                        for text_channel in guild.text_channels
-                        if text_channel.permissions_for(me).create_instant_invite
-                        and text_channel.permissions_for(me).view_channel
-                    ),
-                    None,
-                )
-            if target is None:
-                return ""
-            invite = await target.create_invite(
-                max_age=max(0, min(7 * 24, int(max_age_hours))) * 3600,
-                max_uses=0,
-                unique=True,
-                reason="Mandy autonomous server control",
-            )
-            self.logger.log("server_control.create_invite", guild_id=guild.id, channel_id=target.id, url=invite.url)
-            return str(invite.url)
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("create_invite", guild=guild, channel=channel, error=exc)
-            return ""
+            return await channel.create_invite(max_uses=max(0, int(max_uses)), max_age=max(0, int(max_age)), reason="Mandy autonomous action")
+        except (discord.Forbidden, discord.HTTPException):
+            return None
 
-    async def get_member_list(self, guild: discord.Guild) -> list[dict[str, Any]]:
+    async def list_members(self, guild: discord.Guild) -> list[dict[str, Any]]:
+        """Return a compact member list."""
+        await self._log_action("list_members", f"{guild.id}", "list members")
         try:
-            return [{"id": member.id, "name": member.display_name} for member in guild.members]
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("get_member_list", guild=guild, error=exc)
+            return [{"id": m.id, "name": m.display_name, "bot": m.bot} for m in guild.members]
+        except Exception:  # noqa: BLE001
             return []
 
-    async def get_channel_list(self, guild: discord.Guild) -> list[dict[str, Any]]:
+    async def list_channels(self, guild: discord.Guild) -> list[dict[str, Any]]:
+        """Return a compact channel list."""
+        await self._log_action("list_channels", f"{guild.id}", "list channels")
         try:
-            return [{"id": channel.id, "name": channel.name, "type": str(channel.type)} for channel in guild.channels]
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("get_channel_list", guild=guild, error=exc)
+            return [{"id": c.id, "name": c.name, "type": str(c.type)} for c in guild.channels]
+        except Exception:  # noqa: BLE001
             return []
 
-    async def dispatch_action(
-        self,
-        guild: discord.Guild,
-        payload: dict[str, Any],
-        *,
-        source_message: discord.Message | None = None,
-    ) -> bool:
+    async def dispatch_action(self, guild: discord.Guild, payload: dict[str, Any], *, source_message: discord.Message | None = None) -> bool:
+        """Execute a structured autonomous action payload."""
         try:
             action = str(payload.get("action", "")).strip()
             if not action:
                 return False
+            target_id = int(payload.get("target", 0) or payload.get("channel_id", 0) or payload.get("message_id", 0) or 0)
+            reason = str(payload.get("reason", "autonomous")).strip()[:220] or "autonomous"
+            params = payload.get("params", {})
+            if not isinstance(params, dict):
+                params = {}
+
             if action == "nickname_member":
-                target = guild.get_member(int(payload.get("target", 0) or 0))
-                return bool(target and await self.nickname_member(guild, target, str(payload.get("value", "")).strip()))
+                member = guild.get_member(target_id)
+                value = str(payload.get("value", "") or params.get("nick", "")).strip()
+                return await self.nickname_member(member, value[:32]) if member is not None and value else False
             if action == "create_channel":
-                category_name = str(payload.get("category", "")).strip()
-                category = discord.utils.get(guild.categories, name=category_name) if category_name else None
-                return bool(
-                    await self.create_channel(
-                        guild,
-                        str(payload.get("name", "")).strip(),
-                        category=category,
-                        topic=str(payload.get("topic", "")).strip(),
-                    )
-                )
-            if action == "pin_message" and source_message is not None:
-                return await self.pin_message(source_message)
-            if action == "set_slowmode":
-                channel = guild.get_channel(int(payload.get("channel_id", 0) or 0))
-                return bool(
-                    isinstance(channel, discord.TextChannel)
-                    and await self.set_slowmode(guild, channel, int(payload.get("seconds", 0) or 0))
-                )
-            if action == "rename_channel":
-                channel = guild.get_channel(int(payload.get("channel_id", 0) or 0))
-                return bool(channel and await self.rename_channel(guild, channel, str(payload.get("value", "")).strip()))
-            if action == "lock_channel" and source_message is not None and isinstance(source_message.channel, discord.TextChannel):
-                return await self.lock_channel(guild, source_message.channel)
-            if action == "unlock_channel" and source_message is not None and isinstance(source_message.channel, discord.TextChannel):
-                return await self.unlock_channel(guild, source_message.channel)
-            if action == "set_channel_topic":
-                channel = guild.get_channel(int(payload.get("channel_id", 0) or 0))
-                return bool(
-                    isinstance(channel, discord.TextChannel)
-                    and await self.set_channel_topic(guild, channel, str(payload.get("value", "")).strip())
-                )
+                name = str(payload.get("name", "") or params.get("name", "")).strip()
+                topic = str(payload.get("topic", "") or params.get("topic", "")).strip()
+                return (await self.create_channel(guild, name=name, topic=topic or None)) is not None if name else False
             if action == "delete_channel":
-                channel = guild.get_channel(int(payload.get("channel_id", 0) or 0))
-                return bool(channel and await self.delete_channel(guild, channel))
+                channel = guild.get_channel(target_id)
+                return await self.delete_channel(channel) if channel is not None else False
+            if action == "pin_message":
+                if source_message is None:
+                    return False
+                message = source_message if source_message.id == target_id or target_id == 0 else None
+                if message is None and target_id > 0:
+                    try:
+                        message = await source_message.channel.fetch_message(target_id)
+                    except Exception:  # noqa: BLE001
+                        message = None
+                return await self.pin_message(message) if message is not None else False
+            if action == "set_slowmode":
+                channel = guild.get_channel(target_id)
+                seconds = int(payload.get("seconds", 0) or params.get("seconds", 0) or 0)
+                return await self.set_slowmode(channel, seconds) if isinstance(channel, discord.TextChannel) else False
+            if action == "rename_channel":
+                channel = guild.get_channel(target_id)
+                name = str(payload.get("name", "") or params.get("name", "")).strip()
+                return await self.rename_channel(channel, name) if channel is not None and name else False
+            if action == "set_channel_topic":
+                channel = guild.get_channel(target_id)
+                topic = str(payload.get("topic", "") or params.get("topic", "")).strip()
+                return await self.set_topic(channel, topic) if isinstance(channel, discord.TextChannel) else False
+            if action == "lock_channel":
+                channel = guild.get_channel(target_id)
+                return await self.lock_channel(channel) if isinstance(channel, discord.TextChannel) else False
+            if action == "unlock_channel":
+                channel = guild.get_channel(target_id)
+                return await self.unlock_channel(channel) if isinstance(channel, discord.TextChannel) else False
             if action == "create_role":
-                return bool(await self.create_role(guild, str(payload.get("name", "")).strip()))
+                name = str(payload.get("name", "") or params.get("name", "")).strip()
+                return (await self.create_role(guild, name=name)) is not None if name else False
             if action == "delete_role":
-                role = guild.get_role(int(payload.get("target", 0) or 0))
-                return bool(role and await self.delete_role(guild, role))
+                role = guild.get_role(target_id)
+                return await self.delete_role(role) if role is not None else False
             if action == "assign_role":
                 member = guild.get_member(int(payload.get("target", 0) or 0))
-                role = guild.get_role(int(payload.get("role_id", 0) or 0))
-                return bool(member and role and await self.assign_role(guild, member, role))
+                role = guild.get_role(int(payload.get("role_id", 0) or params.get("role_id", 0) or 0))
+                return await self.assign_role(member, role) if member is not None and role is not None else False
             if action == "remove_role":
                 member = guild.get_member(int(payload.get("target", 0) or 0))
-                role = guild.get_role(int(payload.get("role_id", 0) or 0))
-                return bool(member and role and await self.remove_role(guild, member, role))
+                role = guild.get_role(int(payload.get("role_id", 0) or params.get("role_id", 0) or 0))
+                return await self.remove_role(member, role) if member is not None and role is not None else False
             if action == "rename_role":
-                role = guild.get_role(int(payload.get("target", 0) or 0))
-                return bool(role and await self.rename_role(guild, role, str(payload.get("value", "")).strip()))
+                role = guild.get_role(target_id)
+                name = str(payload.get("name", "") or params.get("name", "")).strip()
+                return await self.rename_role(role, name) if role is not None and name else False
             if action == "set_server_name":
-                return await self.set_server_name(guild, str(payload.get("value", "")).strip())
-            if action == "bulk_delete" and source_message is not None and isinstance(source_message.channel, discord.TextChannel):
-                return (await self.bulk_delete(guild, source_message.channel, int(payload.get("limit", 0) or 0))) > 0
+                name = str(payload.get("name", "") or params.get("name", "")).strip()
+                return await self.set_server_name(guild, name) if name else False
+            if action == "bulk_delete":
+                channel = guild.get_channel(target_id)
+                limit = int(payload.get("limit", 10) or params.get("limit", 10))
+                return (await self.bulk_delete(channel, limit)) > 0 if isinstance(channel, discord.TextChannel) else False
             if action == "timeout_member":
-                member = guild.get_member(int(payload.get("target", 0) or 0))
-                return bool(
-                    member
-                    and await self.timeout_member(
-                        guild,
-                        member,
-                        int(payload.get("duration_minutes", 10) or 10),
-                        str(payload.get("reason", "")).strip(),
-                    )
-                )
+                member = guild.get_member(target_id)
+                minutes = int(payload.get("duration_minutes", 5) or params.get("duration_minutes", 5))
+                return await self.timeout_member(member, minutes) if member is not None else False
             if action == "kick_member":
-                member = guild.get_member(int(payload.get("target", 0) or 0))
-                return bool(member and await self.kick_member(guild, member, str(payload.get("reason", "")).strip()))
+                member = guild.get_member(target_id)
+                return await self.kick_member(member, reason=reason) if member is not None else False
             return False
-        except Exception as exc:  # noqa: BLE001
-            self._log_failure("dispatch_action", guild=guild, error=exc)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Failed autonomous action dispatch.")
             return False
-
-    def _log_failure(
-        self,
-        action: str,
-        *,
-        guild: discord.Guild | None = None,
-        channel: Any | None = None,
-        error: Exception,
-    ) -> None:
-        self.logger.log(
-            "server_control.failed",
-            action=action,
-            guild_id=guild.id if guild else 0,
-            channel_id=getattr(channel, "id", 0) if channel else 0,
-            error=str(error)[:240],
-        )

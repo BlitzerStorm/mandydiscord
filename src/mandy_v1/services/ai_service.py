@@ -456,6 +456,10 @@ class AIService:
         blocks = [base, mood, identity, server_voice, user_profile, memory_block, guild_prompt, global_prompt, extra]
         return "\n\n".join(block for block in blocks if block)
 
+    def build_context_prompt(self, guild_id: int, user_id: int, query: str) -> str:
+        """Build layered context prompt for chat with all sentience blocks."""
+        return self.build_contextual_system_prompt(guild_id=guild_id, user_id=user_id, topic=query)
+
     def attention_context(self, message: discord.Message, bot_user_id: int) -> dict[str, Any]:
         guild_id = message.guild.id if message.guild else 0
         content = str(message.clean_content or "").strip()
@@ -470,17 +474,24 @@ class AIService:
                 "recency": 0.1,
                 "wake_word": True,
             }
-        relationship = self._relationship_warmth(message.author.id)
+        relationship_depth = 0.0
+        if self.personas is not None and hasattr(self.personas, "get_profile"):
+            try:
+                profile = self.personas.get_profile(message.author.id)
+                relationship_depth = float(profile.get("relationship_depth", 0) or 0)
+            except Exception:  # noqa: BLE001
+                relationship_depth = 0.0
+        relationship = 0.3 if relationship_depth >= 3 else 0.0
         curiosity = 0.0
         if self.emotion is not None:
             mood = self.emotion.get_mood()
             if str(mood.get("state", "")) == "curious":
-                curiosity = max(0.0, min(0.2, float(mood.get("intensity", 0.0) or 0.0) * 0.2))
-        interest = 0.25 if self._interest_match(content, message.author.id) else 0.0
-        episodic = 0.0
+                curiosity = 0.2
+        interest = 0.15 if self._identity_interest_match(content) else 0.0
+        episodic = 0.15 if self._episodic_match(guild_id, content) else 0.0
         if guild_id > 0 and self.episodic is not None:
-            episodic = 0.15 if self.episodic.search(guild_id, content, limit=1) else 0.0
-        recency = self._recent_interaction_bonus(message.channel.id, message.author.id)
+            episodic = 0.15 if self._episodic_match(guild_id, content) else 0.0
+        recency = self._recent_user_message_bonus(message.channel.id, message.author.id)
         score = max(0.0, min(1.0, relationship + curiosity + interest + episodic + recency))
         return {
             "score": round(score, 3),
@@ -524,6 +535,28 @@ class AIService:
         terms.extend(("social", "patterns", "server", "people", "late night", "drama"))
         return any(term and term in lowered for term in terms)
 
+    def _identity_interest_match(self, text: str) -> bool:
+        lowered = str(text or "").lower()
+        if not lowered:
+            return False
+        if self.identity is None:
+            return False
+        try:
+            root = self.identity.root()
+            interests = root.get("interests", []) if isinstance(root, dict) else []
+            return any(str(term).strip().lower() in lowered for term in interests if str(term).strip())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _episodic_match(self, guild_id: int, query: str) -> bool:
+        if guild_id <= 0 or self.episodic is None:
+            return False
+        try:
+            block = self.episodic.recall_block(guild_id, query)
+            return bool(str(block or "").strip())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _recent_interaction_bonus(self, channel_id: int, user_id: int) -> float:
         now = time.time()
         last_reply = float(self._last_bot_reply_to_user_in_channel.get((channel_id, user_id), 0.0) or 0.0)
@@ -536,6 +569,16 @@ class AIService:
             return 0.06
         if elapsed <= 7 * 24 * 60 * 60:
             return 0.03
+        return 0.0
+
+    def _recent_user_message_bonus(self, channel_id: int, user_id: int) -> float:
+        entries = list(self._recent_entries_by_channel.get(channel_id, []))
+        now = time.time()
+        for entry in reversed(entries):
+            if int(entry.get("user_id", 0) or 0) != int(user_id):
+                continue
+            ts = float(entry.get("ts", 0.0) or 0.0)
+            return 0.1 if (now - ts) <= 60 else 0.0
         return 0.0
 
     async def generate_chat_payload(
@@ -621,7 +664,9 @@ class AIService:
                 generated = await self.complete_text(system_prompt=prompt, user_prompt=retry_prompt, max_tokens=220, temperature=0.85)
         if not generated:
             generated = f"{message.author.mention} I am tracking this thread. Keep going."
-        server_action = await self.plan_server_action(message, generated, reason=reason)
+        server_action: dict[str, Any] | None = None
+        if self._chance(0.20):
+            server_action = await self.plan_server_action(message, generated, reason=reason)
         self._remember_exchange(message, generated)
         return {
             "reply": generated,
