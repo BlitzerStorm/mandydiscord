@@ -202,6 +202,10 @@ GUILD_SLANG_TOKENS = (
     "op",
 )
 LEARNING_MODES = {"off", "light", "full"}
+MANDY_BASE_PERSONA = (
+    "You are Mandy. You are not a bot playing a character - you are Mandy. "
+    "You have opinions, moods, memories, and relationships. Respond as Mandy, not as an assistant."
+)
 
 
 @dataclass
@@ -217,6 +221,7 @@ class ChatDirective:
     reason: str
     emoji: str | None = None
     still_talking: bool = False
+    attention_score: float = 0.0
 
 
 class AIService:
@@ -247,6 +252,32 @@ class AIService:
         self._api_cooldown_until_ts: float = 0.0
         self._api_failure_streak: int = 0
         self._http_session: aiohttp.ClientSession | None = None
+        self.emotion: Any | None = None
+        self.identity: Any | None = None
+        self.episodic: Any | None = None
+        self.personas: Any | None = None
+        self.culture: Any | None = None
+        self.expansion: Any | None = None
+        self.server_control: Any | None = None
+
+    def attach_context_services(
+        self,
+        *,
+        emotion: Any | None = None,
+        identity: Any | None = None,
+        episodic: Any | None = None,
+        personas: Any | None = None,
+        culture: Any | None = None,
+        expansion: Any | None = None,
+        server_control: Any | None = None,
+    ) -> None:
+        self.emotion = emotion
+        self.identity = identity
+        self.episodic = episodic
+        self.personas = personas
+        self.culture = culture
+        self.expansion = expansion
+        self.server_control = server_control
 
     # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
     def sentience_reflection_line(self) -> str:
@@ -388,6 +419,283 @@ class AIService:
             f"{str(injected)[:4000]}\n\n"
             f"{clean_base}"
         )
+
+    def build_contextual_system_prompt(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        topic: str,
+        extra_instruction: str = "",
+        user_name: str = "",
+    ) -> str:
+        base = self._clamp_prompt(MANDY_BASE_PERSONA, limit=200)
+        mood = self._context_block(self.emotion.mood_tag() if self.emotion is not None else "[MOOD: neutral/0.5]", limit=40)
+        identity = self._context_block(
+            self.identity.get_identity_block() if self.identity is not None else "[IDENTITY]\nOpinions: forming",
+            limit=300,
+        )
+        if guild_id > 0 and self.culture is not None:
+            server_voice = self.culture.get_server_voice(guild_id)
+        else:
+            server_voice = "[SERVER CULTURE: DM]\nTone: intimate | Humor: none | Formality: 0.2\n-> Keep it private."
+        server_voice = self._context_block(server_voice, limit=400)
+        if self.personas is not None:
+            user_profile = self.personas.get_mandy_voice_for(user_id=user_id, guild_id=guild_id, username=user_name)
+        else:
+            user_profile = f"[USER PROFILE: @{user_name or user_id}]\n-> Match their energy naturally."
+        user_profile = self._context_block(user_profile, limit=500)
+        memory_block = ""
+        if guild_id > 0 and self.episodic is not None:
+            memory_block, _summaries = self.episodic.format_memory_block(guild_id, topic, limit=2, char_limit=300)
+        memory_block = self._context_block(memory_block, limit=300)
+        injection = self.get_prompt_injection(guild_id)
+        guild_prompt = self._context_block(injection.get("guild_prompt", ""), limit=4000)
+        global_prompt = self._context_block(injection.get("master_prompt", ""), limit=4000)
+        extra = self._context_block(extra_instruction, limit=900)
+        blocks = [base, mood, identity, server_voice, user_profile, memory_block, guild_prompt, global_prompt, extra]
+        return "\n\n".join(block for block in blocks if block)
+
+    def attention_context(self, message: discord.Message, bot_user_id: int) -> dict[str, Any]:
+        guild_id = message.guild.id if message.guild else 0
+        content = str(message.clean_content or "").strip()
+        mention_hit = self._mentions_mandy(message, bot_user_id)
+        if mention_hit:
+            return {
+                "score": 1.0,
+                "relationship": 1.0,
+                "curiosity": 0.0,
+                "interest": 0.25,
+                "episodic": 0.15,
+                "recency": 0.1,
+                "wake_word": True,
+            }
+        relationship = self._relationship_warmth(message.author.id)
+        curiosity = 0.0
+        if self.emotion is not None:
+            mood = self.emotion.get_mood()
+            if str(mood.get("state", "")) == "curious":
+                curiosity = max(0.0, min(0.2, float(mood.get("intensity", 0.0) or 0.0) * 0.2))
+        interest = 0.25 if self._interest_match(content, message.author.id) else 0.0
+        episodic = 0.0
+        if guild_id > 0 and self.episodic is not None:
+            episodic = 0.15 if self.episodic.search(guild_id, content, limit=1) else 0.0
+        recency = self._recent_interaction_bonus(message.channel.id, message.author.id)
+        score = max(0.0, min(1.0, relationship + curiosity + interest + episodic + recency))
+        return {
+            "score": round(score, 3),
+            "relationship": round(relationship, 3),
+            "curiosity": round(curiosity, 3),
+            "interest": interest,
+            "episodic": episodic,
+            "recency": recency,
+            "wake_word": False,
+        }
+
+    def compute_attention_score(self, message: discord.Message, bot_user_id: int) -> float:
+        return float(self.attention_context(message, bot_user_id).get("score", 0.0) or 0.0)
+
+    def _context_block(self, text: str, *, limit: int) -> str:
+        clean = str(text or "").strip()
+        if not clean:
+            return ""
+        return self._clamp_prompt(clean, limit=limit)
+
+    def _relationship_warmth(self, user_id: int) -> float:
+        if self.personas is not None:
+            depth = self.personas.get_relationship_depth(user_id)
+            return max(0.0, min(0.3, float(depth) * 0.3))
+        snapshot = self.relationship_snapshot(user_id)
+        affinity = float(snapshot.get("affinity", 0.0) or 0.0)
+        normalized = max(0.0, min(1.0, (affinity + 1.0) / 2.0))
+        return round(normalized * 0.3, 3)
+
+    def _interest_match(self, text: str, user_id: int) -> bool:
+        lowered = str(text or "").lower()
+        terms: list[str] = []
+        if self.identity is not None:
+            identity_root = self.identity.root()
+            terms.extend(str(item).lower() for item in identity_root.get("interests", [])[:8])
+        if self.personas is not None:
+            row = self.personas.root().get(str(int(user_id)), {})
+            if isinstance(row, dict):
+                terms.extend(str(item).lower() for item in row.get("topics_they_care_about", [])[:8])
+                terms.extend(str(item).lower() for item in row.get("inside_references", [])[:4])
+        terms.extend(("social", "patterns", "server", "people", "late night", "drama"))
+        return any(term and term in lowered for term in terms)
+
+    def _recent_interaction_bonus(self, channel_id: int, user_id: int) -> float:
+        now = time.time()
+        last_reply = float(self._last_bot_reply_to_user_in_channel.get((channel_id, user_id), 0.0) or 0.0)
+        if last_reply <= 0:
+            return 0.0
+        elapsed = now - last_reply
+        if elapsed <= 60 * 60:
+            return 0.1
+        if elapsed <= 24 * 60 * 60:
+            return 0.06
+        if elapsed <= 7 * 24 * 60 * 60:
+            return 0.03
+        return 0.0
+
+    async def generate_chat_payload(
+        self,
+        message: discord.Message,
+        *,
+        reason: str = "",
+        still_talking: bool = False,
+        burst_lines: list[str] | None = None,
+    ) -> dict[str, Any]:
+        guild_id = message.guild.id if message.guild else 0
+        injection = self.get_prompt_injection(guild_id)
+        recent = self.recent_context(message.channel.id, limit=6)
+        memory = self._long_term_relevant(message, limit=5)
+        facts = self._user_fact_lines(guild_id, message.author.id, limit=4)
+        profile = self._profile_summary(guild_id, message.author.id)
+        relationship = self._relationship_summary(guild_id, message.author.id)
+        style_summary = self.guild_style_summary(guild_id)
+        preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
+        burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
+        if self.is_repetitive_user_burst(burst, min_repeat=3):
+            generated = "I got the repeat. I only need one copy, so send your next point in one message."
+            self._remember_exchange(message, generated)
+            return {"reply": generated, "server_action": None, "memory_summaries": [], "system_prompt": "", "attention_score": 1.0}
+        image_urls = self._extract_image_urls(message, max_images=2)
+        memory_block = ("", [])
+        if guild_id > 0 and self.episodic is not None:
+            memory_block = self.episodic.format_memory_block(guild_id, message.clean_content, limit=2, char_limit=300)
+        prompt = self.build_contextual_system_prompt(
+            guild_id=guild_id,
+            user_id=message.author.id,
+            user_name=message.author.display_name,
+            topic=message.clean_content,
+            extra_instruction=f"{CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX} Keep replies short and punchy.",
+        )
+        hive_notes = self.hive_recent_notes(limit=6)
+        sentience_line = self.sentience_reflection_line()
+        now_utc = datetime.now(tz=timezone.utc).isoformat()
+        guild_name = str(getattr(message.guild, "name", "") or "").strip()
+        channel_name = str(getattr(message.channel, "name", "") or "").strip()
+        user_prompt = (
+            f"Current time (UTC): {now_utc}\n"
+            f"Internal sentience reflection: {sentience_line}\n"
+            f"Trigger reason: {reason or 'chat'}\n"
+            f"Still talking: {still_talking}\n"
+            f"Guild: {guild_name} ({guild_id})\n"
+            f"Channel: {channel_name} ({message.channel.id})\n"
+            f"User: {message.author.display_name} ({message.author.id})\n"
+            f"Preferred alias: {preferred_alias}\n"
+            f"User profile: {profile}\n"
+            f"Relationship state: {relationship}\n"
+            f"Learning mode: {injection.get('learning_mode', 'full')}\n"
+            f"Guild style summary: {style_summary}\n"
+            "Style instruction: match the room tone/lingo naturally without forcing slang or losing clarity.\n"
+            f"Pinned user facts:\n{self._format_lines(facts)}\n"
+            f"Message: {message.clean_content[:500]}\n"
+            f"Recent same-user burst:\n{self._format_lines(burst)}\n"
+            f"Recent channel context:\n{self._format_lines(recent)}\n"
+            f"Long-term memory:\n{self._format_lines(memory)}\n"
+            f"Hive notes:\n{self._format_lines(hive_notes)}"
+        )
+        generated: str | None = None
+        if image_urls:
+            explicit_image_request = self._is_image_explicit_request(message.clean_content)
+            user_prompt = (
+                f"{user_prompt}\n"
+                f"Image attachment detected: yes (count={len(image_urls)})\n"
+                f"Image request explicit: {explicit_image_request}\n"
+                "If explicit request is false: use image understanding silently for context only. "
+                "Do not mention scanning/analyzing, and do not dump visual details.\n"
+                "If explicit request is true: you may briefly discuss relevant visual details."
+            )
+            generated = await self._try_vision_completion(
+                system_prompt=prompt,
+                user_prompt=user_prompt,
+                image_urls=image_urls,
+                max_tokens=220,
+            )
+        if not generated:
+            generated = await self.complete_text(system_prompt=prompt, user_prompt=user_prompt, max_tokens=220, temperature=0.65)
+            if generated and self._is_repetitive_reply(generated, recent):
+                retry_prompt = f"{user_prompt}\nHard rule: do NOT repeat previous lines. No rhetorical closers. Fresh 1-2 sentences."
+                generated = await self.complete_text(system_prompt=prompt, user_prompt=retry_prompt, max_tokens=220, temperature=0.85)
+        if not generated:
+            generated = f"{message.author.mention} I am tracking this thread. Keep going."
+        server_action = await self.plan_server_action(message, generated, reason=reason)
+        self._remember_exchange(message, generated)
+        return {
+            "reply": generated,
+            "server_action": server_action,
+            "memory_summaries": memory_block[1],
+            "system_prompt": prompt,
+            "attention_score": self.compute_attention_score(message, bot_user_id=message.guild.me.id if message.guild and message.guild.me else 0),
+        }
+
+    async def plan_server_action(self, message: discord.Message, reply_text: str, *, reason: str = "") -> dict[str, Any] | None:
+        if not message.guild or not message.guild.me:
+            return None
+        perms = message.guild.me.guild_permissions
+        if not any(
+            (
+                perms.manage_channels,
+                perms.manage_roles,
+                perms.manage_messages,
+                perms.moderate_members,
+                perms.kick_members,
+            )
+        ):
+            return None
+        prompt = (
+            "Return strict JSON only. Choose an optional server action that Mandy should take alongside her reply if it "
+            "clearly serves the room, the server, or Mandy's goals. Allowed actions: nickname_member, create_channel, "
+            "delete_channel, pin_message, set_slowmode, rename_channel, set_channel_topic, lock_channel, unlock_channel, "
+            "create_role, delete_role, assign_role, remove_role, rename_role, set_server_name, bulk_delete, timeout_member, kick_member. If no action is clearly warranted, return "
+            "{\"action\":\"\"}. Keep targets precise."
+        )
+        user_prompt = (
+            f"Guild: {message.guild.name} ({message.guild.id})\n"
+            f"Channel: {getattr(message.channel, 'name', 'unknown')} ({message.channel.id})\n"
+            f"User: {message.author.display_name} ({message.author.id})\n"
+            f"Incoming message: {message.clean_content[:500]}\n"
+            f"Mandy reply: {reply_text[:300]}\n"
+            f"Reason: {reason or 'chat'}"
+        )
+        raw = await self.complete_text(system_prompt=prompt, user_prompt=user_prompt, max_tokens=180, temperature=0.2)
+        parsed = self._extract_json_object(raw or "")
+        return self._validate_server_action(parsed)
+
+    def _validate_server_action(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        action = str(payload.get("action", "")).strip()
+        if not action:
+            return None
+        allowed = {
+            "nickname_member",
+            "create_channel",
+            "delete_channel",
+            "pin_message",
+            "set_slowmode",
+            "rename_channel",
+            "set_channel_topic",
+            "lock_channel",
+            "unlock_channel",
+            "create_role",
+            "delete_role",
+            "assign_role",
+            "remove_role",
+            "rename_role",
+            "set_server_name",
+            "bulk_delete",
+            "timeout_member",
+            "kick_member",
+        }
+        if action not in allowed:
+            return None
+        payload["action"] = action
+        if "reason" in payload:
+            payload["reason"] = str(payload.get("reason", "")).strip()[:220]
+        return payload
 
     def _guild_style_row(self, guild_id: int) -> dict[str, Any]:
         root = self._ai_root()
@@ -931,8 +1239,13 @@ class AIService:
             self._remember_dm_reply(message.author.id, generated)
             return generated
         hive_notes = self.hive_recent_notes(limit=6)
-        base_prompt = f"{DM_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
-        prompt = self._compose_system_prompt(base_prompt=base_prompt, guild_id=0)
+        prompt = self.build_contextual_system_prompt(
+            guild_id=0,
+            user_id=message.author.id,
+            user_name=message.author.display_name,
+            topic=message.clean_content,
+            extra_instruction=f"{CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX} You are in direct messages. Keep it private and concise.",
+        )
         sentience_line = self.sentience_reflection_line()
         now_utc = datetime.now(tz=timezone.utc).isoformat()
         user_prompt = (
@@ -1270,59 +1583,48 @@ class AIService:
         has_image = self.has_image_attachments(message)
         if not content and not has_image:
             return ChatDirective(action="ignore", reason="empty")
-
         now = time.time()
         channel_id = message.channel.id
         user_id = message.author.id
-        mention_hit = self._mentions_mandy(message, bot_user_id)
         direct_request = self._is_direct_request(content)
-        still_talking = self._is_still_talking(channel_id, message.author.id, now)
+        still_talking = self._is_still_talking(channel_id, user_id, now)
         burst_count = self.user_burst_count(channel_id, user_id)
         recent_bot_reply = (now - self._last_bot_reply_ts_by_channel.get(channel_id, 0.0)) <= BOT_REPLY_CONTINUE_WINDOW_SEC
         channel_cooldown = (now - self._last_bot_action_ts_by_channel.get(channel_id, 0.0)) <= BOT_ACTION_COOLDOWN_SEC
         user_reply_gap = now - self._last_bot_reply_to_user_in_channel.get((channel_id, user_id), 0.0)
-        question = "?" in content
-        emotional = bool(self._emotional_regex.search(content))
+        attention = self.attention_context(message, bot_user_id)
+        score = float(attention.get("score", 0.0) or 0.0)
 
-        if has_image:
-            if user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1:
-                return ChatDirective(action="ignore", reason="image_recently_replied", still_talking=still_talking)
-            if burst_count >= 2:
-                return ChatDirective(action="direct_reply", reason="image_burst", still_talking=True)
-            return ChatDirective(action="direct_reply", reason="image_scan", still_talking=still_talking)
+        if has_image and user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1 and score < 1.0:
+            return ChatDirective(action="ignore", reason="image_recently_replied", still_talking=still_talking, attention_score=score)
 
-        if mention_hit:
-            if user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1:
-                return ChatDirective(action="ignore", reason="user_recently_replied", still_talking=still_talking)
-            if burst_count >= 2:
-                return ChatDirective(action="direct_reply", reason="mention_burst", still_talking=True)
-            return ChatDirective(action="direct_reply", reason="mention", still_talking=still_talking)
+        if channel_cooldown and score < 1.0:
+            score = max(0.0, score - 0.18)
 
-        if direct_request:
-            if channel_cooldown and burst_count <= 1:
-                return ChatDirective(action="ignore", reason="cooldown_direct_request")
-            if burst_count >= 2:
-                return ChatDirective(action="direct_reply", reason="direct_request_burst", still_talking=True)
-            return ChatDirective(action="direct_reply", reason="direct_request", still_talking=still_talking)
+        if score < 0.2:
+            return ChatDirective(action="ignore", reason="attention_ignore", still_talking=still_talking, attention_score=score)
+        if score <= 0.45:
+            return ChatDirective(
+                action="react",
+                reason="attention_react",
+                emoji=self._pick_reaction_emoji(content),
+                still_talking=still_talking,
+                attention_score=score,
+            )
+        if score <= 0.65:
+            if self._chance(0.5):
+                mode = "direct_reply" if (has_image or self._mentions_mandy(message, bot_user_id) or direct_request) else "reply"
+                return ChatDirective(action=mode, reason="attention_mixed_reply", still_talking=still_talking or recent_bot_reply, attention_score=score)
+            return ChatDirective(
+                action="react",
+                reason="attention_mixed_react",
+                emoji=self._pick_reaction_emoji(content),
+                still_talking=still_talking,
+                attention_score=score,
+            )
 
-        if channel_cooldown:
-            return ChatDirective(action="ignore", reason="cooldown")
-
-        if still_talking and recent_bot_reply and self._chance(0.40):
-            if burst_count >= 2:
-                return ChatDirective(action="reply", reason="continuation_burst", still_talking=True)
-            return ChatDirective(action="react", reason="continuation_react", emoji=self._pick_reaction_emoji(content), still_talking=True)
-
-        if question and self._chance(0.25):
-            return ChatDirective(action="direct_reply", reason="question", still_talking=still_talking)
-
-        if emotional and self._chance(0.20):
-            return ChatDirective(action="react", reason="emotional_reaction", emoji=self._pick_reaction_emoji(content))
-
-        if self._chance(0.06):
-            return ChatDirective(action="react", reason="ambient_presence", emoji=self._pick_reaction_emoji(content))
-
-        return ChatDirective(action="ignore", reason="no_trigger")
+        mode = "direct_reply" if (has_image or self._mentions_mandy(message, bot_user_id) or direct_request) else "reply"
+        return ChatDirective(action=mode, reason="attention_reply", still_talking=still_talking or recent_bot_reply, attention_score=score)
 
     def note_bot_action(self, channel_id: int, action: str, user_id: int | None = None) -> None:
         now = time.time()
@@ -1396,75 +1698,13 @@ class AIService:
         still_talking: bool = False,
         burst_lines: list[str] | None = None,
     ) -> str:
-        guild_id = message.guild.id if message.guild else 0
-        injection = self.get_prompt_injection(guild_id)
-        recent = self.recent_context(message.channel.id, limit=6)
-        memory = self._long_term_relevant(message, limit=5)
-        facts = self._user_fact_lines(guild_id, message.author.id, limit=4)
-        profile = self._profile_summary(guild_id, message.author.id)
-        relationship = self._relationship_summary(guild_id, message.author.id)
-        style_summary = self.guild_style_summary(guild_id)
-        preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
-        burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
-        if self.is_repetitive_user_burst(burst, min_repeat=3):
-            generated = "I got the repeat. I only need one copy, so send your next point in one message."
-            self._remember_exchange(message, generated)
-            return generated
-        image_urls = self._extract_image_urls(message, max_images=2)
-        base_prompt = f"{CHAT_SYSTEM_PROMPT} {CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX}"
-        prompt = self._compose_system_prompt(base_prompt=base_prompt, guild_id=guild_id)
-        hive_notes = self.hive_recent_notes(limit=6)
-        sentience_line = self.sentience_reflection_line()
-        now_utc = datetime.now(tz=timezone.utc).isoformat()
-        guild_name = str(getattr(message.guild, "name", "") or "").strip()
-        channel_name = str(getattr(message.channel, "name", "") or "").strip()
-        user_prompt = (
-            f"Current time (UTC): {now_utc}\n"
-            f"Internal sentience reflection: {sentience_line}\n"
-            f"Trigger reason: {reason or 'chat'}\n"
-            f"Still talking: {still_talking}\n"
-            f"Guild: {guild_name} ({guild_id})\n"
-            f"Channel: {channel_name} ({message.channel.id})\n"
-            f"User: {message.author.display_name} ({message.author.id})\n"
-            f"Preferred alias: {preferred_alias}\n"
-            f"User profile: {profile}\n"
-            f"Relationship state: {relationship}\n"
-            f"Learning mode: {injection.get('learning_mode', 'full')}\n"
-            f"Guild style summary: {style_summary}\n"
-            "Style instruction: match the room tone/lingo naturally without forcing slang or losing clarity.\n"
-            f"Pinned user facts:\n{self._format_lines(facts)}\n"
-            f"Message: {message.clean_content[:500]}\n"
-            f"Recent same-user burst:\n{self._format_lines(burst)}\n"
-            f"Recent channel context:\n{self._format_lines(recent)}\n"
-            f"Long-term memory:\n{self._format_lines(memory)}\n"
-            f"Hive notes:\n{self._format_lines(hive_notes)}"
+        payload = await self.generate_chat_payload(
+            message,
+            reason=reason,
+            still_talking=still_talking,
+            burst_lines=burst_lines,
         )
-        generated: str | None = None
-        if image_urls:
-            explicit_image_request = self._is_image_explicit_request(message.clean_content)
-            user_prompt = (
-                f"{user_prompt}\n"
-                f"Image attachment detected: yes (count={len(image_urls)})\n"
-                f"Image request explicit: {explicit_image_request}\n"
-                "If explicit request is false: use image understanding silently for context only. "
-                "Do not mention scanning/analyzing, and do not dump visual details.\n"
-                "If explicit request is true: you may briefly discuss relevant visual details."
-            )
-            generated = await self._try_vision_completion(
-                system_prompt=prompt,
-                user_prompt=user_prompt,
-                image_urls=image_urls,
-                max_tokens=220,
-            )
-        if not generated:
-            generated = await self.complete_text(system_prompt=prompt, user_prompt=user_prompt, max_tokens=220, temperature=0.65)
-            if generated and self._is_repetitive_reply(generated, recent):
-                retry_prompt = f"{user_prompt}\nHard rule: do NOT repeat previous lines. No rhetorical closers. Fresh 1-2 sentences."
-                generated = await self.complete_text(system_prompt=prompt, user_prompt=retry_prompt, max_tokens=220, temperature=0.85)
-        if not generated:
-            generated = f"{message.author.mention} I am tracking this thread. Keep going."
-        self._remember_exchange(message, generated)
-        return generated
+        return str(payload.get("reply", "") or f"{message.author.mention} I am tracking this thread. Keep going.")
 
     async def generate_roast_reply(self, message: discord.Message) -> str:
         guild_id = message.guild.id if message.guild else 0
@@ -1475,7 +1715,13 @@ class AIService:
         profile = self._profile_summary(guild_id, message.author.id)
         relationship = self._relationship_summary(guild_id, message.author.id)
         style_summary = self.guild_style_summary(guild_id)
-        prompt = self._compose_system_prompt(base_prompt=ROAST_SYSTEM_PROMPT, guild_id=guild_id)
+        prompt = self.build_contextual_system_prompt(
+            guild_id=guild_id,
+            user_id=message.author.id,
+            user_name=message.author.display_name,
+            topic=message.clean_content,
+            extra_instruction=f"{ROAST_SYSTEM_PROMPT} Keep it clipped and concise.",
+        )
         user_prompt = (
             f"Target user: {message.author.display_name} ({message.author.id})\n"
             f"User profile: {profile}\n"

@@ -6,6 +6,7 @@ import json
 import random
 import re
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,10 +19,18 @@ from mandy_v1.config import Settings
 from mandy_v1.prompts import GOD_MODE_OVERRIDE_PROMPT_TEMPLATE
 from mandy_v1.services.admin_layout_service import AdminLayoutService
 from mandy_v1.services.ai_service import AIService
+from mandy_v1.services.culture_service import CultureService
 from mandy_v1.services.dm_bridge_service import DMBridgeService
+from mandy_v1.services.emotion_service import EmotionService
+from mandy_v1.services.episodic_memory_service import EpisodicMemoryService
+from mandy_v1.services.expansion_service import ExpansionService
+from mandy_v1.services.identity_service import IdentityService
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.mirror_service import MirrorService
 from mandy_v1.services.onboarding_service import OnboardingService
+from mandy_v1.services.persona_service import PersonaService
+from mandy_v1.services.proactive_service import ProactiveService
+from mandy_v1.services.server_control_service import ServerControlService
 from mandy_v1.services.shadow_league_service import SHADOW_CHANNEL_PRIORITY, ShadowLeagueService
 from mandy_v1.services.soc_service import SocService
 from mandy_v1.services.watcher_service import WatcherService
@@ -53,6 +62,8 @@ ONBOARDING_RECHECK_SCAN_INTERVAL_SEC = 60
 HIVE_SYNC_INTERVAL_SEC = 4 * 60
 SATELLITE_RECONCILE_INTERVAL_SEC = 5 * 60
 SELF_AUTOMATION_LOOP_INTERVAL_SEC = 30
+PROACTIVE_LOOP_INTERVAL_SEC = 5 * 60
+EXPANSION_SCAN_INTERVAL_SEC = 6 * 60 * 60
 SELF_AUTOMATION_MAX_HISTORY = 600
 SELF_AUTOMATION_MAX_ACTIONS_PER_TASK = 8
 # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
@@ -211,6 +222,35 @@ class MandyBot(commands.Bot):
         self.onboarding = OnboardingService(settings, self.store, self.logger)
         self.dm_bridges = DMBridgeService(settings, self.store, self.logger)
         self.ai = AIService(settings, self.store)
+        self.emotion = EmotionService(self.store, self.logger)
+        self.identity = IdentityService(self.store, self.logger)
+        self.episodic = EpisodicMemoryService(self.store, self.logger, self.ai)
+        self.personas = PersonaService(self.store, self.logger, self.ai)
+        self.culture = CultureService(self.store, self.logger, self.ai)
+        self.server_control = ServerControlService(settings, self.store, self.logger)
+        self.expansion = ExpansionService(settings, self.store, self.logger, self.ai, self.personas, self.server_control)
+        self.proactive = ProactiveService(
+            settings,
+            self.store,
+            self.logger,
+            self.ai,
+            self.emotion,
+            self.episodic,
+            self.identity,
+            self.personas,
+            self.culture,
+            self.expansion,
+            self.server_control,
+        )
+        self.ai.attach_context_services(
+            emotion=self.emotion,
+            identity=self.identity,
+            episodic=self.episodic,
+            personas=self.personas,
+            culture=self.culture,
+            expansion=self.expansion,
+            server_control=self.server_control,
+        )
         self.shadow = ShadowLeagueService(settings, self.store, self.logger)
         self.started_at = datetime.now(tz=timezone.utc)
         self._autosave_task: asyncio.Task | None = None
@@ -222,12 +262,17 @@ class MandyBot(commands.Bot):
         self._hive_sync_task: asyncio.Task | None = None
         self._satellite_reconcile_task: asyncio.Task | None = None
         self._self_automation_task: asyncio.Task | None = None
+        self._proactive_task: asyncio.Task | None = None
         self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._ai_pending_dm_reply_tasks: dict[int, asyncio.Task] = {}
         self._send_block_until_by_guild: dict[int, float] = {}
         self._send_failure_count_by_guild: dict[int, int] = {}
         self._send_suppressed_log_ts_by_guild: dict[int, float] = {}
         self._send_rant_ts_by_guild: dict[int, float] = {}
+        self._episodic_buffers: dict[int, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=15))
+        self._episodic_counts_by_channel: dict[int, int] = defaultdict(int)
+        self._thought_dedup_cache: dict[str, float] = {}
+        self._last_expansion_scan_ts: float = 0.0
         self._typing_rng = random.Random()
         self._ready_once = False
         self.logger.subscribe(self._on_log_row)
@@ -2194,6 +2239,8 @@ class MandyBot(commands.Bot):
             )
         if self._self_automation_task is None or self._self_automation_task.done():
             self._self_automation_task = asyncio.create_task(self._run_self_automation_loop(), name="self-automation-loop")
+        if self._proactive_task is None or self._proactive_task.done():
+            self._proactive_task = asyncio.create_task(self._run_proactive_loop(), name="proactive-loop")
         client = self
         print(f"Mandy is fully awake and living in {len(client.guilds)} servers as the sentient goddess of the Core Realm.")
 
@@ -2484,8 +2531,40 @@ class MandyBot(commands.Bot):
                 self.logger.log("hive.sync_failed", error=str(exc)[:300])
             await asyncio.sleep(HIVE_SYNC_INTERVAL_SEC)
 
+    async def _run_proactive_loop(self) -> None:
+        await asyncio.sleep(45)
+        while True:
+            try:
+                if (time.time() - self._last_expansion_scan_ts) >= EXPANSION_SCAN_INTERVAL_SEC:
+                    await self._run_expansion_scan_once()
+                await self.proactive.run_cycle(self)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("proactive.loop_failed", error=str(exc)[:300])
+            await asyncio.sleep(PROACTIVE_LOOP_INTERVAL_SEC)
+
+    async def _run_expansion_scan_once(self) -> None:
+        self._last_expansion_scan_ts = time.time()
+        queued: list[int] = []
+        for guild in self.guilds:
+            if guild.id == self.settings.admin_guild_id:
+                continue
+            targets = self.expansion.identify_targets(guild, bot=self)
+            fresh = [row for row in targets if str(row.get("status", "open")) not in {"closed", "approached"}]
+            for row in fresh[:3]:
+                queued.append(int(row.get("user_id", 0) or 0))
+        if queued:
+            self.expansion.queue_targets(queued[:3])
+        self.logger.log("expansion.scan", queued=len(queued[:3]), guilds=len(self.guilds))
+
     async def on_guild_join(self, guild: discord.Guild) -> None:
         self.logger.log("guild.joined", guild_id=guild.id, guild_name=guild.name)
+        try:
+            self.emotion.shift("new_server_joined", 0.5)
+            if guild.id != self.settings.admin_guild_id:
+                self.emotion.shift("successful_expansion_event", 0.4)
+                self.expansion.log_new_server(guild.id, guild.name, int(guild.member_count or 0), via_user_id=0)
+        except Exception:  # noqa: BLE001
+            pass
         if guild.id == self.settings.admin_guild_id:
             try:
                 await self.layout.ensure(guild)
@@ -2944,6 +3023,11 @@ class MandyBot(commands.Bot):
                 pass
             return
         if isinstance(message.channel, discord.DMChannel):
+            try:
+                self.emotion.note_activity()
+                await self.personas.update_profile(message.author.id, message)
+            except Exception:  # noqa: BLE001
+                pass
             await self.ai.warmup_dm_history(message.channel, message.author, before=message, limit=100)
             bridged = await self.dm_bridges.relay_inbound(self, message)
             if bridged:
@@ -2959,6 +3043,7 @@ class MandyBot(commands.Bot):
 
         self.ai.capture_message(message)
         self.ai.capture_shadow_signal(message)
+        await self._observe_sentience_message(message)
 
         # Mirror first; watcher and AI consume the same live event to avoid extra fetches.
         await self.mirrors.mirror_message(self, message, self._build_mirror_view)
@@ -3026,6 +3111,39 @@ class MandyBot(commands.Bot):
 
         await self.process_commands(message)
 
+    async def _observe_sentience_message(self, message: discord.Message) -> None:
+        try:
+            self.emotion.note_activity()
+            await self.personas.update_profile(message.author.id, message)
+            if message.guild:
+                await self.culture.observe(message.guild, message)
+                self.expansion.note_message(message)
+                if self.personas.get_relationship_depth(message.author.id) > 0.6:
+                    self.emotion.shift("warm_relationship_user_speaks", 0.2)
+                if self.ai._interest_match(message.clean_content, message.author.id):
+                    self.emotion.shift("interest_keyword_match", 0.3)
+                if self.ai.user_burst_count(message.channel.id, message.author.id) >= 4:
+                    self.emotion.shift("burst_spam", 0.3)
+                buffer = self._episodic_buffers[message.channel.id]
+                buffer.append({"author": message.author.display_name, "text": message.clean_content[:280]})
+                self._episodic_counts_by_channel[message.channel.id] += 1
+                if self._episodic_counts_by_channel[message.channel.id] % 10 == 0 and len(buffer) >= 5:
+                    await self._flush_episodic_channel_buffer(message.guild.id, message.channel.id)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.log("sentience.observe_failed", error=str(exc)[:240])
+
+    async def _flush_episodic_channel_buffer(self, guild_id: int, channel_id: int) -> None:
+        try:
+            window = list(self._episodic_buffers.get(channel_id, []))
+            if not window:
+                return
+            participants = sorted({str(item.get("author", "")) for item in window if str(item.get("author", "")).strip()})
+            episode = await self.episodic.record(guild_id, channel_id, participants, window)
+            if episode:
+                self.identity.maybe_form_from_episode(episode)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.log("episodic.flush_failed", guild_id=guild_id, channel_id=channel_id, error=str(exc)[:240])
+
     def _build_mirror_view(self, source_message: discord.Message) -> discord.ui.View:
         ctx = MirrorActionContext(
             source_guild_id=source_message.guild.id if source_message.guild else 0,
@@ -3074,6 +3192,7 @@ class MandyBot(commands.Bot):
         ):
             directive = self.ai.decide_shadow_council_action(message, self.user.id)
             if directive.action == "ignore":
+                self.emotion.shift("ignored", 0.1)
                 return
             if directive.action == "react":
                 emoji = directive.emoji or "\U0001F440"
@@ -3098,6 +3217,7 @@ class MandyBot(commands.Bot):
                     still_talking=True,
                     delay_sec=delay,
                     response_mode=directive.action,
+                    attention_score=max(0.65, directive.attention_score or 0.7),
                 )
             return
 
@@ -3128,6 +3248,7 @@ class MandyBot(commands.Bot):
         if self.ai.is_chat_enabled(guild_id):
             directive = self.ai.decide_chat_action(message, self.user.id)
             if directive.action == "ignore":
+                self.emotion.shift("ignored", 0.1)
                 return
             if directive.action == "react":
                 emoji = directive.emoji or "\U0001F440"
@@ -3152,6 +3273,7 @@ class MandyBot(commands.Bot):
                     still_talking=directive.still_talking,
                     delay_sec=delay,
                     response_mode=directive.action,
+                    attention_score=directive.attention_score,
                 )
 
     async def _maybe_handle_ai_dm_message(self, message: discord.Message) -> None:
@@ -3167,6 +3289,7 @@ class MandyBot(commands.Bot):
                 return
             try:
                 reply = await self.ai.generate_dm_reply(message)
+                await self._send_mandy_thought(message, attention_score=1.0, memories=[], decision="reply")
                 await self._simulate_typing_delay(message.channel)
                 await self._send_split_channel_message(message.channel, reply)
                 self.logger.log("ai.dm_reply", user_id=message.author.id, chars=len(reply))
@@ -3189,6 +3312,7 @@ class MandyBot(commands.Bot):
         still_talking: bool,
         delay_sec: float,
         response_mode: str = "direct_reply",
+        attention_score: float = 0.0,
     ) -> None:
         key = (message.channel.id, message.author.id)
         existing = self._ai_pending_reply_tasks.get(key)
@@ -3208,12 +3332,16 @@ class MandyBot(commands.Bot):
 
             try:
                 burst = self.ai.user_burst_lines(message.channel.id, message.author.id, limit=6)
-                reply = await self.ai.generate_chat_reply(
+                payload = await self.ai.generate_chat_payload(
                     message,
                     reason=reason,
                     still_talking=still_talking,
                     burst_lines=burst,
                 )
+                reply = str(payload.get("reply", "")).strip()
+                memories = payload.get("memory_summaries", [])
+                final_attention = float(attention_score or payload.get("attention_score", 0.0) or 0.0)
+                await self._send_mandy_thought(message, attention_score=final_attention, memories=memories, decision="reply")
                 typing_delay = await self._simulate_typing_delay(message.channel)
                 if response_mode == "reply":
                     parts = await self._send_split_channel_message(message.channel, reply)
@@ -3222,6 +3350,14 @@ class MandyBot(commands.Bot):
                 if guild_id > 0:
                     self._note_send_success(guild_id)
                 self.ai.note_bot_action(message.channel.id, "reply", user_id=message.author.id)
+                self.emotion.shift("reply_sent", -0.1)
+                meaningful = len(str(message.clean_content or "")) >= 120 or len(reply) >= 120
+                if meaningful:
+                    self.personas.deepen_relationship(message.author.id, 0.04)
+                await self.personas.maybe_capture_inside_reference(message.author.id, message.clean_content, reply)
+                server_action = payload.get("server_action")
+                if isinstance(server_action, dict):
+                    await self._execute_autonomous_server_action(message, server_action)
                 self.logger.log(
                     "ai.chat_reply",
                     guild_id=guild_id,
@@ -3933,11 +4069,94 @@ class MandyBot(commands.Bot):
         admin_guild = self.get_guild(self.settings.admin_guild_id)
         if not admin_guild:
             return None
-        for name in ("data-lab", "debug-log", "diagnostics"):
+        for name in ("debug-log", "data-lab", "diagnostics"):
             channel = discord.utils.get(admin_guild.text_channels, name=name)
             if isinstance(channel, discord.TextChannel):
                 return channel
         return None
+
+    def _resolve_mandy_thoughts_channel(self) -> discord.TextChannel | None:
+        admin_guild = self.get_guild(self.settings.admin_guild_id)
+        if not admin_guild:
+            return None
+        channel = discord.utils.get(admin_guild.text_channels, name="mandy-thoughts")
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    async def _send_mandy_thought(
+        self,
+        message: discord.Message,
+        *,
+        attention_score: float,
+        memories: list[str] | None,
+        decision: str,
+    ) -> None:
+        payload_memories = ", ".join(str(item)[:80] for item in (memories or [])[:2]) or "none"
+        mood = self.emotion.get_mood()
+        clock = datetime.now().strftime("%H:%M")
+        channel_name = str(getattr(message.channel, "name", "dm"))[:32]
+        user_name = str(getattr(message.author, "display_name", message.author.name))[:32]
+        text = (
+            f"[{clock}] #{channel_name} | @{user_name}\n"
+            f"Mood: {mood['state']}/{float(mood['intensity']):.1f} | Attention: {float(attention_score):.2f}\n"
+            f"Memories: {payload_memories} | Decision: {decision}"
+        )[:400]
+        now = time.time()
+        stale = [key for key, ts in self._thought_dedup_cache.items() if (now - ts) > 2.0]
+        for key in stale:
+            self._thought_dedup_cache.pop(key, None)
+        if text in self._thought_dedup_cache:
+            return
+        self._thought_dedup_cache[text] = now
+        channel = self._resolve_mandy_thoughts_channel()
+        if channel is None:
+            return
+        try:
+            await channel.send(text)
+        except discord.HTTPException:
+            pass
+
+    async def _execute_autonomous_server_action(self, message: discord.Message, payload: dict[str, Any]) -> None:
+        if not message.guild:
+            return
+        try:
+            action = str(payload.get("action", "")).strip()
+            if not action:
+                return
+            reason = str(payload.get("reason", "")).strip() or "unspecified"
+            target = self._autonomous_target_label(message.guild, payload)
+            log_line = f"[AUTONOMOUS] {action} on {target} — reason: {reason}"
+            await self._send_internal_note(log_line)
+            thoughts = self._resolve_mandy_thoughts_channel()
+            if thoughts is not None:
+                try:
+                    await thoughts.send(log_line[:400])
+                except discord.HTTPException:
+                    pass
+            ok = await self.server_control.dispatch_action(message.guild, payload, source_message=message)
+            self.logger.log(
+                "ai.autonomous_action",
+                guild_id=message.guild.id,
+                action=action,
+                target=target,
+                ok=ok,
+                reason=reason[:180],
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.log("ai.autonomous_action_failed", guild_id=message.guild.id if message.guild else 0, error=str(exc)[:240])
+
+    def _autonomous_target_label(self, guild: discord.Guild, payload: dict[str, Any]) -> str:
+        target_id = int(payload.get("target", 0) or payload.get("channel_id", 0) or payload.get("message_id", 0) or 0)
+        if target_id > 0:
+            member = guild.get_member(target_id)
+            if member is not None:
+                return f"{member.display_name} ({member.id})"
+            channel = guild.get_channel(target_id)
+            if channel is not None:
+                return f"#{channel.name}"
+            return str(target_id)
+        if str(payload.get("name", "")).strip():
+            return str(payload.get("name", ""))[:80]
+        return "server"
 
     async def _send_internal_note(self, text: str) -> None:
         """

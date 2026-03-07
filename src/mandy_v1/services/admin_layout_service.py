@@ -14,7 +14,7 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     "SHADOW LEAGUE": ["shadow-council", "shadow-ops", "shadow-lounge"],
     "SATELLITES": [],
     "GUEST ACCESS": ["guest-chat", "guest-feedback", "quarantine"],
-    "ENGINEERING": ["system-log", "audit-log", "debug-log", "mirror-log", "data-lab", "dm-bridges"],
+    "ENGINEERING": ["system-log", "audit-log", "debug-log", "mirror-log", "data-lab", "dm-bridges", "mandy-thoughts"],
     "GOD CORE": ["admin-chat", "server-management", "layout-control", "blueprint-export", "incident-room"],
 }
 
@@ -40,6 +40,7 @@ DEFAULT_TOPICS: dict[str, str] = {
     "mirror-log": "Mirror sync and delivery logs.",
     "data-lab": "Data review and analysis workspace.",
     "dm-bridges": "DM bridge home and staff relay operations.",
+    "mandy-thoughts": "Private Mandy internal monologue feed.",
     "admin-chat": "Admin-only control room chat.",
     "server-management": "Cross-server management operations.",
     "layout-control": "Layout and provisioning control surface.",
@@ -83,6 +84,7 @@ class AdminLayoutService:
                 if ch_created:
                     created_channels += 1
                 ensured_channels[channel_name] = channel
+                await self._apply_channel_permissions(channel, channel_name, roles, guild)
 
         for channel_name, pin_text in pins.items():
             channel = ensured_channels.get(channel_name) or discord.utils.get(guild.text_channels, name=channel_name)
@@ -187,6 +189,21 @@ class AdminLayoutService:
                 return
         msg = await channel.send(content)
         await msg.pin(reason="Mandy v1 pinned panel sync")
+
+    async def _apply_channel_permissions(
+        self,
+        channel: discord.TextChannel,
+        channel_name: str,
+        roles: dict[str, discord.Role],
+        guild: discord.Guild,
+    ) -> None:
+        if channel_name != "mandy-thoughts":
+            return
+        everyone = guild.default_role
+        await channel.set_permissions(everyone, view_channel=False)
+        await channel.set_permissions(roles["ACCESS:Engineer"], view_channel=False)
+        await channel.set_permissions(roles["ACCESS:Admin"], view_channel=False)
+        await channel.set_permissions(roles["ACCESS:SOC"], view_channel=True, send_messages=True, read_message_history=True)
 
     def _layout_map(self) -> dict[str, list[str]]:
         config = self.store.data.setdefault("layout", {})

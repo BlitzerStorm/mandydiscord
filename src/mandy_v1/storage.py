@@ -34,6 +34,38 @@ DEFAULT_STORE: dict[str, Any] = {
         "verified_user_ids": [],
     },
     "dm_bridges": {},
+    "emotion": {
+        "state": "neutral",
+        "intensity": 0.5,
+        "last_updated": 0,
+        "event_log": [],
+    },
+    "episodic": {
+        "episodes": {},
+    },
+    "identity": {
+        "seeded": False,
+        "opinions": {},
+        "interests": [],
+        "dislikes": [],
+    },
+    "personas": {},
+    "culture": {},
+    "expansion": {
+        "target_users": {},
+        "known_servers": {},
+        "approach_log": [],
+        "invite_links": {},
+        "cooldowns": {},
+        "queue": [],
+        "last_scan_ts": 0,
+    },
+    "proactive": {
+        "guild_cooldowns": {},
+        "user_cooldowns": {},
+        "nicknames": {},
+        "last_loop_ts": 0,
+    },
     "feature_requests": {
         "next_id": 1,
         "requests": {},
