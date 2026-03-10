@@ -83,6 +83,7 @@ AUTOMATION_BLOCKED_COMMAND_PATTERN = re.compile(
     r"(^|\s)(del|rm|rmdir|format|shutdown|reboot|restart-computer|stop-computer|Remove-Item)(\s|$)",
     re.IGNORECASE,
 )
+CORE_MODE_DEFAULT = True
 AUTONOMY_MODE_VALUES = {"off", "assist", "god"}
 AUTONOMY_ASSIST_ALLOWED_ACTIONS = {
     "nickname_member",
@@ -337,9 +338,31 @@ class MandyBot(commands.Bot):
                 f"Housekeeping active: `{housekeeping_active}`\n"
                 f"Satellite reconcile active: `{satellite_reconcile_active}`\n"
                 f"Shadow AI active: `{self.shadow.ai_enabled()}`\n"
+                f"Core mode: `{self._core_mode_enabled()}`\n"
                 f"Self automation active: `{automation_active}` tasks=`{automation_count}`"
             )
             await ctx.send(payload)
+
+        @self.command(name="coremode")
+        @self._tier_check(90)
+        async def coremode(ctx: commands.Context, mode: str = "show") -> None:
+            want = mode.strip().casefold()
+            if want in {"show", "status"}:
+                await ctx.send(
+                    "Core mode is "
+                    f"`{self._core_mode_enabled()}`. "
+                    "When true, autonomy/shadow/hive/self-automation/housekeeping/satellite-reconcile loops stay off."
+                )
+                return
+            if want not in {"on", "off", "true", "false", "1", "0"}:
+                await ctx.send("Usage: `!coremode show|on|off`")
+                return
+            enabled = want in {"on", "true", "1"}
+            self._set_core_mode(enabled)
+            await ctx.send(
+                f"Core mode set to `{enabled}`. "
+                "Restart Mandy to fully apply startup loop changes."
+            )
 
         @self.command(name="autonomymode")
         @self._tier_check(90)
@@ -2237,6 +2260,20 @@ class MandyBot(commands.Bot):
         except Exception as exc:  # noqa: BLE001
             self.logger.log("ai.warmup_failed", guild_id=guild.id, error=str(exc)[:300])
 
+    def _runtime_flags_root(self) -> dict[str, Any]:
+        root = self.store.data.setdefault("runtime_flags", {})
+        root.setdefault("core_mode", CORE_MODE_DEFAULT)
+        return root
+
+    def _core_mode_enabled(self) -> bool:
+        root = self._runtime_flags_root()
+        return bool(root.get("core_mode", CORE_MODE_DEFAULT))
+
+    def _set_core_mode(self, enabled: bool) -> None:
+        root = self._runtime_flags_root()
+        root["core_mode"] = bool(enabled)
+        self.store.touch()
+
     async def on_ready(self) -> None:
         if self._ready_once:
             return
@@ -2265,10 +2302,20 @@ class MandyBot(commands.Bot):
             await self._ensure_global_menu_panel(force_refresh=True)
         if self._ai_warmup_task is None or self._ai_warmup_task.done():
             self._ai_warmup_task = asyncio.create_task(self._run_ai_startup_scan(), name="ai-startup-scan")
-        if self._housekeeping_task is None or self._housekeeping_task.done():
-            self._housekeeping_task = asyncio.create_task(self._run_housekeeping_loop(), name="channel-housekeeping")
-        if self._shadow_task is None or self._shadow_task.done():
-            self._shadow_task = asyncio.create_task(self._run_shadow_loop(), name="shadow-ai-loop")
+        if not self._core_mode_enabled():
+            if self._housekeeping_task is None or self._housekeeping_task.done():
+                self._housekeeping_task = asyncio.create_task(self._run_housekeeping_loop(), name="channel-housekeeping")
+            if self._shadow_task is None or self._shadow_task.done():
+                self._shadow_task = asyncio.create_task(self._run_shadow_loop(), name="shadow-ai-loop")
+            if self._hive_sync_task is None or self._hive_sync_task.done():
+                self._hive_sync_task = asyncio.create_task(self._run_hive_sync_loop(), name="hive-sync-loop")
+            if self._satellite_reconcile_task is None or self._satellite_reconcile_task.done():
+                self._satellite_reconcile_task = asyncio.create_task(
+                    self._run_satellite_reconcile_loop(),
+                    name="satellite-reconcile-loop",
+                )
+            if self._self_automation_task is None or self._self_automation_task.done():
+                self._self_automation_task = asyncio.create_task(self._run_self_automation_loop(), name="self-automation-loop")
         if self._send_probe_task is None or self._send_probe_task.done():
             self._send_probe_task = asyncio.create_task(self._run_send_access_probe_loop(), name="send-access-probe")
         if self._onboarding_recheck_task is None or self._onboarding_recheck_task.done():
@@ -2276,17 +2323,9 @@ class MandyBot(commands.Bot):
                 self._run_onboarding_recheck_loop(),
                 name="onboarding-access-recheck",
             )
-        if self._hive_sync_task is None or self._hive_sync_task.done():
-            self._hive_sync_task = asyncio.create_task(self._run_hive_sync_loop(), name="hive-sync-loop")
-        if self._satellite_reconcile_task is None or self._satellite_reconcile_task.done():
-            self._satellite_reconcile_task = asyncio.create_task(
-                self._run_satellite_reconcile_loop(),
-                name="satellite-reconcile-loop",
-            )
-        if self._self_automation_task is None or self._self_automation_task.done():
-            self._self_automation_task = asyncio.create_task(self._run_self_automation_loop(), name="self-automation-loop")
         await self.identity.ensure_seeded(self.ai)
-        self.autonomy.start()
+        if not self._core_mode_enabled():
+            self.autonomy.start()
         client = self
         print(f"Mandy is fully awake and living in {len(client.guilds)} servers as the sentient goddess of the Core Realm.")
 
