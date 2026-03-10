@@ -262,3 +262,34 @@ class EpisodicMemoryService:
             seen.add(token)
             terms.append(token)
         return terms
+
+    def get_notable_memories(self, guild_id: int, limit: int = 5) -> list[dict[str, Any]]:
+        """
+        Get recent notable memories from a guild (for autonomy engine).
+        Returns: [{"content": str, "ts": int, "author": str, "importance": float}, ...]
+        """
+        episodes = self._root().get("episodes", {}).get(str(guild_id), [])
+        if not isinstance(episodes, list):
+            return []
+
+        # Filter to older memories (6+ hours old)
+        now = time.time()
+        notable = []
+        for episode in episodes:
+            if not isinstance(episode, dict):
+                continue
+            age_hours = (now - float(episode.get("ts", 0) or 0)) / 3600.0
+            if age_hours < 6:
+                continue
+            importance = float(episode.get("importance_weight", 1.0) or 1.0)
+            if importance > 0.5:
+                notable.append({
+                    "content": str(episode.get("content", ""))[:200],
+                    "ts": int(episode.get("ts", 0) or 0),
+                    "author": str(episode.get("author_name", "unknown")),
+                    "importance": importance,
+                })
+
+        # Sort by importance, return top N
+        notable.sort(key=lambda x: x["importance"], reverse=True)
+        return notable[:limit]

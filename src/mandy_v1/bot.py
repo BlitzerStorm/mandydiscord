@@ -29,7 +29,7 @@ from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.mirror_service import MirrorService
 from mandy_v1.services.onboarding_service import OnboardingService
 from mandy_v1.services.persona_service import PersonaService
-from mandy_v1.services.proactive_service import ProactiveService
+from mandy_v1.services.autonomy_engine import AutonomyEngine
 from mandy_v1.services.server_control_service import ServerControlService
 from mandy_v1.services.shadow_league_service import SHADOW_CHANNEL_PRIORITY, ShadowLeagueService
 from mandy_v1.services.soc_service import SocService
@@ -229,15 +229,15 @@ class MandyBot(commands.Bot):
         self.culture = CultureService(self.store, self.ai)
         self.server_control = ServerControlService(self, self.logger)
         self.expansion = ExpansionService(self.store, self.ai)
-        self.proactive = ProactiveService(
-            self,
-            self.store,
-            self.ai,
-            self.emotion,
-            self.episodic,
-            self.personas,
-            self.culture,
-            self.expansion,
+        self.autonomy = AutonomyEngine(
+            bot=self,
+            storage=self.store,
+            ai_service=self.ai,
+            emotion_service=self.emotion,
+            episodic_memory_service=self.episodic,
+            persona_service=self.personas,
+            culture_service=self.culture,
+            expansion_service=self.expansion,
         )
         self.ai.attach_context_services(
             emotion=self.emotion,
@@ -2237,7 +2237,7 @@ class MandyBot(commands.Bot):
         if self._self_automation_task is None or self._self_automation_task.done():
             self._self_automation_task = asyncio.create_task(self._run_self_automation_loop(), name="self-automation-loop")
         await self.identity.ensure_seeded(self.ai)
-        self.proactive.start()
+        self.autonomy.start()
         client = self
         print(f"Mandy is fully awake and living in {len(client.guilds)} servers as the sentient goddess of the Core Realm.")
 

@@ -1,6 +1,8 @@
 __all__ = [
     "ai_service",
     "admin_layout_service",
+    "autonomy_engine",
+    "behavior_library",
     "culture_service",
     "dm_bridge_service",
     "emotion_service",
@@ -11,7 +13,6 @@ __all__ = [
     "mirror_service",
     "onboarding_service",
     "persona_service",
-    "proactive_service",
     "server_control_service",
     "shadow_league_service",
     "soc_service",

@@ -331,3 +331,23 @@ class PersonaService:
             row["arc"] = "warming"
         else:
             row["arc"] = "new"
+
+    def get_relationships_summary(self) -> dict[str, Any]:
+        """
+        Get a summary of all relationships for autonomy decision-making.
+        Returns: {user_id: {"depth": 0-5, "arc": str, "last_seen_ts": int}}
+        """
+        summary = {}
+        for uid, profile in self._root().items():
+            if not isinstance(profile, dict):
+                continue
+            try:
+                user_id = int(uid)
+                summary[str(user_id)] = {
+                    "depth": int(profile.get("relationship_depth", 0) or 0),
+                    "arc": str(profile.get("arc", "new")),
+                    "last_seen_ts": int(profile.get("last_updated", 0) or 0),
+                }
+            except (ValueError, TypeError):
+                continue
+        return summary

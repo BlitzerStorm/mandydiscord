@@ -332,3 +332,16 @@ class CultureService:
     def root(self) -> dict[str, Any]:
         """Compatibility alias returning guild culture map."""
         return self._root()
+
+    def get_server_readiness(self, guild_id: int) -> dict[str, Any]:
+        """
+        Get calibration/readiness of a server for autonomous actions.
+        Returns: {"calibrated": bool, "tone": str, "active": bool}
+        """
+        culture = self.get_culture(guild_id)
+        return {
+            "calibrated": bool(culture.get("calibrated")),
+            "tone": str(culture.get("tone", "unknown")),
+            "active": bool(culture.get("total_observations", 0) >= 10),
+            "observation_count": int(culture.get("total_observations", 0) or 0),
+        }

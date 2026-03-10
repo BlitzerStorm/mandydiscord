@@ -3,3 +3,8 @@ __pycache__/
 .env
 passwords.txt
 data/
+tmpclaude-*.cwd
+tmpclaude-*-cwd
+nul
+src/mandy_v1/services/proactive_service.py
+workspace.code-workspace

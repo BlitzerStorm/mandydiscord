@@ -209,3 +209,23 @@ class EmotionService:
         """Return compact textual mood summary."""
         mood = self.get_mood()
         return f"{mood['state']} ({float(mood['intensity']):.2f})"
+
+    def get_action_probability(self, action_type: str = "default") -> float:
+        """
+        Get probability (0-1) of whether Mandy wants to take action right now.
+        Higher mood intensity = higher probability of acting.
+        """
+        mood = self.get_mood()
+        intensity = float(mood.get("intensity", 0.5) or 0.5)
+        state = str(mood.get("state", "neutral"))
+
+        # Mood-specific modifiers
+        if state in ("excited", "energetic", "playful"):
+            intensity *= 1.5
+        elif state in ("reflective", "melancholy", "irritated"):
+            intensity *= 0.5
+        elif state == "bored":
+            intensity *= 2.0
+
+        # Clamp to 0-1
+        return max(0.0, min(1.0, intensity))
