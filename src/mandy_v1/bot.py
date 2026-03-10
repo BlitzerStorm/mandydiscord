@@ -3310,6 +3310,40 @@ class MandyBot(commands.Bot):
                         user_id=message.author.id,
                         error=str(exc)[:300],
                     )
+                return
+
+            # Roast mode fallback: still respond to direct Mandy mentions/threads
+            # using normal chat behavior, otherwise Mandy looks "dead".
+            directive = self.ai.decide_chat_action(message, self.user.id)
+            if directive.action == "ignore":
+                self.emotion.shift("ignored", 0.1)
+                return
+            if directive.action == "react":
+                emoji = directive.emoji or "\U0001F440"
+                try:
+                    await message.add_reaction(emoji)
+                    self.ai.note_bot_action(message.channel.id, "react")
+                    self.logger.log(
+                        "ai.chat_react",
+                        guild_id=guild_id,
+                        user_id=message.author.id,
+                        emoji=emoji,
+                        reason=directive.reason,
+                    )
+                except discord.HTTPException:
+                    self.logger.log("ai.chat_react_failed", guild_id=guild_id, user_id=message.author.id, emoji=emoji)
+                return
+            if directive.action in {"reply", "direct_reply"}:
+                delay = self.ai.reply_delay_seconds(message, reason=directive.reason, still_talking=directive.still_talking)
+                self._schedule_ai_reply(
+                    message,
+                    reason=directive.reason,
+                    still_talking=directive.still_talking,
+                    delay_sec=delay,
+                    response_mode=directive.action,
+                    attention_score=directive.attention_score,
+                )
+                return
             return
         if self.ai.is_chat_enabled(guild_id):
             directive = self.ai.decide_chat_action(message, self.user.id)
