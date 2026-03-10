@@ -1694,6 +1694,16 @@ class AIService:
         recent_bot_reply = (now - self._last_bot_reply_ts_by_channel.get(channel_id, 0.0)) <= BOT_REPLY_CONTINUE_WINDOW_SEC
         channel_cooldown = (now - self._last_bot_action_ts_by_channel.get(channel_id, 0.0)) <= BOT_ACTION_COOLDOWN_SEC
         user_reply_gap = now - self._last_bot_reply_to_user_in_channel.get((channel_id, user_id), 0.0)
+        addressed = self._is_addressed_to_mandy(
+            message,
+            bot_user_id=bot_user_id,
+            direct_request=direct_request,
+            still_talking=still_talking,
+            recent_bot_reply=recent_bot_reply,
+            now=now,
+        )
+        if not addressed:
+            return ChatDirective(action="ignore", reason="not_addressed", still_talking=still_talking, attention_score=0.0)
         attention = self.attention_context(message, bot_user_id)
         score = float(attention.get("score", 0.0) or 0.0)
 
@@ -1932,6 +1942,30 @@ class AIService:
             if message.reference.resolved.author.id == bot_user_id:
                 return True
         return bool(self._alias_regex.search(message.content))
+
+    def _is_addressed_to_mandy(
+        self,
+        message: discord.Message,
+        *,
+        bot_user_id: int,
+        direct_request: bool,
+        still_talking: bool,
+        recent_bot_reply: bool,
+        now: float,
+    ) -> bool:
+        if self._mentions_mandy(message, bot_user_id):
+            return True
+        channel_id = int(message.channel.id)
+        user_id = int(message.author.id)
+        last_reply = float(self._last_bot_reply_to_user_in_channel.get((channel_id, user_id), 0.0) or 0.0)
+        continuing_with_user = last_reply > 0 and (now - last_reply) <= BOT_REPLY_CONTINUE_WINDOW_SEC and (still_talking or recent_bot_reply)
+        if continuing_with_user:
+            return True
+        if direct_request:
+            lowered = str(message.clean_content or "").casefold()
+            # Avoid hijacking third-party conversations like "can you ..." not aimed at Mandy.
+            return any(token in lowered for token in ("mandy", "mandi", "mndy", "mdy", "mandee", "bot", "ai"))
+        return False
 
     async def _try_completion(self, system_prompt: str, user_prompt: str, max_tokens: int) -> str | None:
         return await self.complete_text(
