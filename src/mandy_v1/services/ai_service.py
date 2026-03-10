@@ -87,6 +87,7 @@ BOT_ACTION_COOLDOWN_SEC = 9
 BOT_REPLY_CONTINUE_WINDOW_SEC = 90
 USER_BURST_WINDOW_SEC = 35
 USER_REPLY_MIN_GAP_SEC = 12
+SERVER_ACTION_PLAN_MIN_GAP_SEC = 120
 LONG_TERM_MEMORY_MAX_ROWS = 220
 LONG_TERM_RECENT_FLOOR = 50
 LONG_TERM_DECAY_PER_DAY = 0.03
@@ -201,6 +202,36 @@ GUILD_SLANG_TOKENS = (
     "rizz",
     "op",
 )
+SERVER_ACTION_REASON_HINTS = {
+    "help",
+    "moderation",
+    "incident",
+    "safety",
+    "spam",
+    "request",
+    "direct_request",
+}
+SERVER_ACTION_TEXT_HINTS = (
+    "help",
+    "moderator",
+    "mod",
+    "spam",
+    "raid",
+    "scam",
+    "fake",
+    "abuse",
+    "harass",
+    "kick",
+    "timeout",
+    "lock channel",
+    "unlock channel",
+    "slowmode",
+    "cleanup",
+    "clean up",
+    "delete messages",
+    "create channel",
+    "role",
+)
 LEARNING_MODES = {"off", "light", "full"}
 MANDY_BASE_PERSONA = (
     "You are Mandy. You are not a bot playing a character - you are Mandy. "
@@ -234,6 +265,7 @@ class AIService:
         self._last_bot_action_ts_by_channel: dict[int, float] = {}
         self._last_bot_reply_ts_by_channel: dict[int, float] = {}
         self._last_bot_reply_to_user_in_channel: dict[tuple[int, int], float] = {}
+        self._last_server_action_plan_ts_by_guild: dict[int, float] = {}
         self._alias_regex = re.compile(r"\b(?:mandy|mandi|mndy|mdy|mandee)\b", re.IGNORECASE)
         self._negative_regex = re.compile("|".join(re.escape(term) for term in NEGATIVE_TERMS), re.IGNORECASE)
         self._positive_regex = re.compile("|".join(re.escape(term) for term in POSITIVE_TERMS), re.IGNORECASE)
@@ -665,8 +697,10 @@ class AIService:
         if not generated:
             generated = f"{message.author.mention} I am tracking this thread. Keep going."
         server_action: dict[str, Any] | None = None
-        if self._chance(0.20):
+        if self._should_attempt_server_action(message, reason=reason):
             server_action = await self.plan_server_action(message, generated, reason=reason)
+            if server_action:
+                self._last_server_action_plan_ts_by_guild[int(guild_id)] = time.time()
         self._remember_exchange(message, generated)
         return {
             "reply": generated,
@@ -675,6 +709,29 @@ class AIService:
             "system_prompt": prompt,
             "attention_score": self.compute_attention_score(message, bot_user_id=message.guild.me.id if message.guild and message.guild.me else 0),
         }
+
+    def _should_attempt_server_action(self, message: discord.Message, *, reason: str = "") -> bool:
+        if not message.guild:
+            return False
+        guild_id = int(message.guild.id)
+        now = time.time()
+        last_ts = float(self._last_server_action_plan_ts_by_guild.get(guild_id, 0.0) or 0.0)
+        if (now - last_ts) < SERVER_ACTION_PLAN_MIN_GAP_SEC:
+            return False
+
+        reason_norm = str(reason or "").strip().casefold()
+        if reason_norm in SERVER_ACTION_REASON_HINTS:
+            return True
+
+        text = str(message.clean_content or "").casefold()
+        if any(hint in text for hint in SERVER_ACTION_TEXT_HINTS):
+            return True
+
+        # Explicit asks to Mandy sometimes need operational actions.
+        if self._mentions_mandy(message, bot_user_id=message.guild.me.id if message.guild and message.guild.me else 0):
+            if self._is_direct_request(text) and self._chance(0.35):
+                return True
+        return False
 
     async def plan_server_action(self, message: discord.Message, reply_text: str, *, reason: str = "") -> dict[str, Any] | None:
         if not message.guild or not message.guild.me:

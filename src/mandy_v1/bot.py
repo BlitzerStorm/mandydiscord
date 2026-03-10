@@ -83,6 +83,35 @@ AUTOMATION_BLOCKED_COMMAND_PATTERN = re.compile(
     r"(^|\s)(del|rm|rmdir|format|shutdown|reboot|restart-computer|stop-computer|Remove-Item)(\s|$)",
     re.IGNORECASE,
 )
+AUTONOMY_MODE_VALUES = {"off", "assist", "god"}
+AUTONOMY_ASSIST_ALLOWED_ACTIONS = {
+    "nickname_member",
+    "pin_message",
+    "set_slowmode",
+    "rename_channel",
+    "set_channel_topic",
+    "lock_channel",
+    "unlock_channel",
+    "assign_role",
+    "remove_role",
+    "timeout_member",
+}
+AUTONOMY_GOD_ALLOWED_ACTIONS = AUTONOMY_ASSIST_ALLOWED_ACTIONS.union(
+    {
+        "create_channel",
+        "delete_channel",
+        "create_role",
+        "delete_role",
+        "rename_role",
+        "bulk_delete",
+        "kick_member",
+        "set_server_name",
+    }
+)
+AUTONOMY_DESTRUCTIVE_ACTIONS = {"delete_channel", "delete_role", "bulk_delete", "kick_member", "set_server_name"}
+AUTONOMY_ACTION_MIN_GAP_SEC = 10 * 60
+AUTONOMY_ACTION_WINDOW_SEC = 60 * 60
+AUTONOMY_ACTION_MAX_PER_WINDOW = 2
 
 
 @dataclass(frozen=True)
@@ -311,6 +340,26 @@ class MandyBot(commands.Bot):
                 f"Self automation active: `{automation_active}` tasks=`{automation_count}`"
             )
             await ctx.send(payload)
+
+        @self.command(name="autonomymode")
+        @self._tier_check(90)
+        async def autonomymode(ctx: commands.Context, mode: str = "show") -> None:
+            want = mode.strip().casefold()
+            if want in {"show", "status"}:
+                current = self._autonomy_mode()
+                await ctx.send(
+                    f"Autonomy mode: `{current}` "
+                    f"allowed_actions=`{len(self._autonomy_allowed_actions(current))}` "
+                    f"window_max=`{AUTONOMY_ACTION_MAX_PER_WINDOW}`/{AUTONOMY_ACTION_WINDOW_SEC // 60}m"
+                )
+                return
+            if want not in AUTONOMY_MODE_VALUES:
+                await ctx.send("Mode must be one of: `off`, `assist`, `god`.")
+                return
+            root = self._autonomy_policy_root()
+            root["mode"] = want
+            self.store.touch()
+            await ctx.send(f"Autonomy mode set to `{want}`.")
 
         @self.command(name="selfcheck")
         @self._tier_check(70)
@@ -4132,6 +4181,85 @@ class MandyBot(commands.Bot):
         except discord.HTTPException:
             pass
 
+    def _autonomy_policy_root(self) -> dict[str, Any]:
+        root = self.store.data.setdefault("autonomy_policy", {})
+        root.setdefault("mode", "assist")
+        root.setdefault("allowed_actions", [])
+        root.setdefault("action_log", [])
+        return root
+
+    def _autonomy_mode(self) -> str:
+        mode = str(self._autonomy_policy_root().get("mode", "assist")).strip().casefold()
+        return mode if mode in AUTONOMY_MODE_VALUES else "assist"
+
+    def _autonomy_allowed_actions(self, mode: str | None = None) -> set[str]:
+        active_mode = (mode or self._autonomy_mode()).strip().casefold()
+        if active_mode == "off":
+            return set()
+        if active_mode == "god":
+            return set(AUTONOMY_GOD_ALLOWED_ACTIONS)
+        allowed = set(AUTONOMY_ASSIST_ALLOWED_ACTIONS)
+        extra = self._autonomy_policy_root().get("allowed_actions", [])
+        if isinstance(extra, list):
+            allowed.update(str(item).strip() for item in extra if str(item).strip())
+        return allowed
+
+    def _autonomy_action_rate_limited(self, guild_id: int) -> bool:
+        now = time.time()
+        root = self._autonomy_policy_root()
+        log_rows = root.setdefault("action_log", [])
+        if not isinstance(log_rows, list):
+            return False
+        last_ts = 0.0
+        recent_count = 0
+        for row in log_rows[-500:]:
+            if not isinstance(row, dict):
+                continue
+            if int(row.get("guild_id", 0) or 0) != int(guild_id):
+                continue
+            ts = float(row.get("ts", 0.0) or 0.0)
+            if ts > last_ts:
+                last_ts = ts
+            if (now - ts) <= AUTONOMY_ACTION_WINDOW_SEC:
+                recent_count += 1
+        if last_ts > 0 and (now - last_ts) < AUTONOMY_ACTION_MIN_GAP_SEC:
+            return True
+        return recent_count >= AUTONOMY_ACTION_MAX_PER_WINDOW
+
+    def _record_autonomy_action(self, guild_id: int, action: str, ok: bool, reason: str) -> None:
+        root = self._autonomy_policy_root()
+        log_rows = root.setdefault("action_log", [])
+        if not isinstance(log_rows, list):
+            return
+        log_rows.append(
+            {
+                "ts": time.time(),
+                "guild_id": int(guild_id),
+                "action": str(action)[:80],
+                "ok": bool(ok),
+                "reason": str(reason)[:200],
+            }
+        )
+        if len(log_rows) > 800:
+            del log_rows[: len(log_rows) - 800]
+        self.store.touch()
+
+    def _is_autonomous_action_allowed(self, guild_id: int, payload: dict[str, Any]) -> tuple[bool, str]:
+        action = str(payload.get("action", "")).strip()
+        if not action:
+            return (False, "missing_action")
+        mode = self._autonomy_mode()
+        if mode == "off":
+            return (False, "mode_off")
+        allowed = self._autonomy_allowed_actions(mode)
+        if action not in allowed:
+            return (False, f"action_not_allowed_in_{mode}")
+        if self._autonomy_action_rate_limited(guild_id):
+            return (False, "rate_limited")
+        if action in AUTONOMY_DESTRUCTIVE_ACTIONS and mode != "god":
+            return (False, "destructive_requires_god_mode")
+        return (True, "ok")
+
     async def _execute_autonomous_server_action(self, message: discord.Message, payload: dict[str, Any]) -> None:
         if not message.guild:
             return
@@ -4140,6 +4268,17 @@ class MandyBot(commands.Bot):
             if not action:
                 return
             reason = str(payload.get("reason", "")).strip() or "unspecified"
+            allowed, why = self._is_autonomous_action_allowed(message.guild.id, payload)
+            if not allowed:
+                self.logger.log(
+                    "ai.autonomous_action_blocked",
+                    guild_id=message.guild.id,
+                    action=action,
+                    reason=reason[:180],
+                    block_reason=why,
+                    mode=self._autonomy_mode(),
+                )
+                return
             target = self._autonomous_target_label(message.guild, payload)
             log_line = f"[AUTONOMOUS] {action} on {target} — reason: {reason}"
             await self._send_internal_note(log_line)
@@ -4150,6 +4289,7 @@ class MandyBot(commands.Bot):
                 except discord.HTTPException:
                     pass
             ok = await self.server_control.dispatch_action(message.guild, payload, source_message=message)
+            self._record_autonomy_action(message.guild.id, action, ok, reason)
             self.logger.log(
                 "ai.autonomous_action",
                 guild_id=message.guild.id,
