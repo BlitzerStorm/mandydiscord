@@ -33,6 +33,13 @@ BEHAVIOR_MIN_INTERVALS = {
     "expansion_queue_processing": 15 * 60,  # 15 minutes
 }
 
+PUBLIC_ACTION_TYPES = {
+    "absent_user_callout",
+    "episodic_callback",
+    "curiosity_burst",
+    "lore_callback",
+}
+
 # Mood-to-action-frequency mapping
 MOOD_INTENSITY_MULTIPLIERS = {
     "excited": 1.8,
@@ -132,6 +139,7 @@ class AutonomyEngine:
         node.setdefault("discovered_behaviors", [])
         node.setdefault("last_decision_ts", 0.0)
         node.setdefault("decision_count", 0)
+        node.setdefault("last_public_action_by_guild", {})
         return node
 
     def _mark_dirty(self) -> None:
@@ -220,9 +228,14 @@ class AutonomyEngine:
             if not scored_actions:
                 return None
 
-            # Pick action weighted by score
-            weights = [max(0.01, action.priority) for action in scored_actions]
-            chosen = self._rng.choices(scored_actions, weights=weights, k=1)[0]
+            # Mostly exploit the best option, but keep light exploration.
+            ranked = sorted(scored_actions, key=lambda a: a.priority, reverse=True)
+            if self._rng.random() < 0.85:
+                chosen = ranked[0]
+            else:
+                pool = ranked[: min(3, len(ranked))]
+                weights = [max(0.01, action.priority) for action in pool]
+                chosen = self._rng.choices(pool, weights=weights, k=1)[0]
 
             return chosen
 
@@ -248,7 +261,7 @@ class AutonomyEngine:
 
         for action in behavior_actions:
             # Check if behavior is off cooldown
-            if self._is_behavior_available(action.type):
+            if self._is_behavior_available(action.type, action.guild_id):
                 available.append(action)
 
         return available
@@ -257,7 +270,10 @@ class AutonomyEngine:
         """Check if a behavior can run (hasn't hit cooldown)."""
         last_runs = self._root().get("behavior_last_run", {})
         last_run_key = f"{behavior_type}:{guild_id}" if guild_id else behavior_type
-        last_run = last_runs.get(last_run_key, 0.0)
+        # Prefer guild-specific cooldowns. Fallback to legacy global key.
+        last_run = float(last_runs.get(last_run_key, 0.0) or 0.0)
+        if last_run == 0.0:
+            last_run = float(last_runs.get(behavior_type, 0.0) or 0.0)
 
         if last_run == 0:
             return True  # Never run
@@ -288,6 +304,18 @@ class AutonomyEngine:
             # Success history
             success_rate = self._get_behavior_success_rate(action.type)
             score *= max(0.5, success_rate)  # Don't penalize too harshly
+
+            # Learned behavior weights
+            behavior_weight = float(self._root().get("behavior_weights", {}).get(action.type, 1.0) or 1.0)
+            score *= max(0.3, min(2.0, behavior_weight))
+
+            # Repetition penalty for recently used behavior type
+            if self._was_recent_behavior(action.type, window=6):
+                score *= 0.45
+
+            # Anti-spam gate for public channel messages
+            if not self._can_send_public_action(action):
+                score *= 0.01
 
             # Set priority
             action.priority = score
@@ -333,6 +361,26 @@ class AutonomyEngine:
         successful = sum(1 for o in recent if o.get("success"))
         return successful / len(recent)
 
+    def _was_recent_behavior(self, behavior_type: str, *, window: int = 6) -> bool:
+        history = self._root().get("action_history", [])
+        if not isinstance(history, list) or not history:
+            return False
+        for row in history[-window:]:
+            if isinstance(row, dict) and row.get("action_type") == behavior_type:
+                return True
+        return False
+
+    def _can_send_public_action(self, action: Action) -> bool:
+        if action.type not in PUBLIC_ACTION_TYPES or action.guild_id is None:
+            return True
+        root = self._root()
+        last_by_guild = root.get("last_public_action_by_guild", {})
+        if not isinstance(last_by_guild, dict):
+            return True
+        last = float(last_by_guild.get(str(action.guild_id), 0.0) or 0.0)
+        # Hard minimum gap between autonomous public posts in the same guild.
+        return (time.time() - last) >= (6 * 60)
+
     async def _execute_action(self, action: Action) -> ActionOutcome | None:
         """Execute an action and capture its outcome."""
         try:
@@ -357,6 +405,13 @@ class AutonomyEngine:
             last_runs = self._root().get("behavior_last_run", {})
             key = f"{action.type}:{action.guild_id}" if action.guild_id else action.type
             last_runs[key] = time.time()
+            # Keep legacy global key so existing cooldown data remains usable.
+            last_runs[action.type] = time.time()
+
+            if outcome.success and action.type in PUBLIC_ACTION_TYPES and action.guild_id is not None:
+                last_by_guild = self._root().setdefault("last_public_action_by_guild", {})
+                if isinstance(last_by_guild, dict):
+                    last_by_guild[str(action.guild_id)] = time.time()
 
             return outcome
 
