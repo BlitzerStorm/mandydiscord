@@ -39,6 +39,10 @@ PUBLIC_ACTION_TYPES = {
     "curiosity_burst",
     "lore_callback",
 }
+PUBLIC_MIN_GUILD_GAP_SEC = 15 * 60
+PUBLIC_ACTION_WINDOW_SEC = 60 * 60
+PUBLIC_MAX_PER_WINDOW = 2
+PUBLIC_RECENT_ACTIVITY_SEC = 30 * 60
 
 # Mood-to-action-frequency mapping
 MOOD_INTENSITY_MULTIPLIERS = {
@@ -140,6 +144,7 @@ class AutonomyEngine:
         node.setdefault("last_decision_ts", 0.0)
         node.setdefault("decision_count", 0)
         node.setdefault("last_public_action_by_guild", {})
+        node.setdefault("public_action_log", [])
         return node
 
     def _mark_dirty(self) -> None:
@@ -216,6 +221,14 @@ class AutonomyEngine:
                 # Too low energy to do anything
                 return None
 
+            # Probabilistic action gate to prevent over-eager loops.
+            action_probability = 0.5
+            if hasattr(self.emotion, "get_action_probability"):
+                action_probability = float(self.emotion.get_action_probability("autonomy") or 0.5)
+            action_probability = max(0.05, min(0.95, action_probability))
+            if self._rng.random() > action_probability:
+                return None
+
             # Get available behaviors
             available_actions = await self._get_available_actions(mood)
 
@@ -237,6 +250,10 @@ class AutonomyEngine:
                 weights = [max(0.01, action.priority) for action in pool]
                 chosen = self._rng.choices(pool, weights=weights, k=1)[0]
 
+            root = self._root()
+            root["last_decision_ts"] = time.time()
+            root["decision_count"] = int(root.get("decision_count", 0) or 0) + 1
+            self._mark_dirty()
             return chosen
 
         except Exception:  # noqa: BLE001
@@ -293,6 +310,7 @@ class AutonomyEngine:
         - Contextual relevance (active guild → higher score)
         """
         scored = []
+        relationships = self.personas.get_relationships_summary() if hasattr(self.personas, "get_relationships_summary") else {}
 
         for action in actions:
             score = 1.0
@@ -316,6 +334,29 @@ class AutonomyEngine:
             # Anti-spam gate for public channel messages
             if not self._can_send_public_action(action):
                 score *= 0.01
+
+            # Context-awareness: prefer actions where server/readiness context is strong.
+            if action.guild_id and hasattr(self.culture, "get_server_readiness"):
+                readiness = self.culture.get_server_readiness(action.guild_id)
+                if isinstance(readiness, dict):
+                    if not bool(readiness.get("active", False)):
+                        score *= 0.15
+                    elif bool(readiness.get("calibrated", False)):
+                        score *= 1.1
+
+            if action.type == "episodic_callback" and action.guild_id and hasattr(self.episodic, "get_notable_memories"):
+                notable = self.episodic.get_notable_memories(action.guild_id, limit=3)
+                if not notable:
+                    score *= 0.25
+
+            if action.type == "confidant_maintenance" and isinstance(relationships, dict):
+                deep_count = sum(
+                    1
+                    for row in relationships.values()
+                    if isinstance(row, dict) and int(row.get("depth", 0) or 0) >= 4
+                )
+                if deep_count <= 0:
+                    score *= 0.1
 
             # Set priority
             action.priority = score
@@ -373,13 +414,43 @@ class AutonomyEngine:
     def _can_send_public_action(self, action: Action) -> bool:
         if action.type not in PUBLIC_ACTION_TYPES or action.guild_id is None:
             return True
+
+        now = time.time()
         root = self._root()
         last_by_guild = root.get("last_public_action_by_guild", {})
         if not isinstance(last_by_guild, dict):
             return True
         last = float(last_by_guild.get(str(action.guild_id), 0.0) or 0.0)
         # Hard minimum gap between autonomous public posts in the same guild.
-        return (time.time() - last) >= (6 * 60)
+        if (now - last) < PUBLIC_MIN_GUILD_GAP_SEC:
+            return False
+
+        # Rolling per-guild cap for public autonomous sends.
+        action_log = root.get("public_action_log", [])
+        if isinstance(action_log, list):
+            recent_count = 0
+            for row in action_log[-200:]:
+                if not isinstance(row, dict):
+                    continue
+                if int(row.get("guild_id", 0) or 0) != int(action.guild_id):
+                    continue
+                row_ts = float(row.get("ts", 0.0) or 0.0)
+                if (now - row_ts) <= PUBLIC_ACTION_WINDOW_SEC:
+                    recent_count += 1
+            if recent_count >= PUBLIC_MAX_PER_WINDOW:
+                return False
+
+        # Only post autonomously if guild has recent human activity.
+        if hasattr(self.culture, "_profile"):
+            profile = self.culture._profile(action.guild_id)  # noqa: SLF001
+            if isinstance(profile, dict):
+                observed = int(profile.get("observed_count", 0) or 0)
+                last_human_msg_ts = float(profile.get("last_updated", 0.0) or 0.0)
+                if observed < 10:
+                    return False
+                if last_human_msg_ts <= 0 or (now - last_human_msg_ts) > PUBLIC_RECENT_ACTIVITY_SEC:
+                    return False
+        return True
 
     async def _execute_action(self, action: Action) -> ActionOutcome | None:
         """Execute an action and capture its outcome."""
@@ -409,9 +480,19 @@ class AutonomyEngine:
             last_runs[action.type] = time.time()
 
             if outcome.success and action.type in PUBLIC_ACTION_TYPES and action.guild_id is not None:
-                last_by_guild = self._root().setdefault("last_public_action_by_guild", {})
+                root = self._root()
+                last_by_guild = root.setdefault("last_public_action_by_guild", {})
                 if isinstance(last_by_guild, dict):
                     last_by_guild[str(action.guild_id)] = time.time()
+                action_log = root.setdefault("public_action_log", [])
+                if isinstance(action_log, list):
+                    action_log.append({
+                        "ts": time.time(),
+                        "guild_id": int(action.guild_id),
+                        "action_type": action.type,
+                    })
+                    if len(action_log) > 500:
+                        del action_log[: len(action_log) - 500]
 
             return outcome
 

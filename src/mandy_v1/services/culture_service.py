@@ -338,10 +338,14 @@ class CultureService:
         Get calibration/readiness of a server for autonomous actions.
         Returns: {"calibrated": bool, "tone": str, "active": bool}
         """
-        culture = self.get_culture(guild_id)
+        culture = self._profile(guild_id)
+        observed = int(culture.get("observed_count", 0) or 0)
+        last_updated = float(culture.get("last_updated", 0.0) or 0.0)
+        recently_active = (time.time() - last_updated) <= (30 * 60) if last_updated > 0 else False
         return {
-            "calibrated": bool(culture.get("calibrated")),
-            "tone": str(culture.get("tone", "unknown")),
-            "active": bool(culture.get("total_observations", 0) >= 10),
-            "observation_count": int(culture.get("total_observations", 0) or 0),
+            "calibrated": bool(culture.get("calibration_complete", False)),
+            "tone": str(culture.get("detected_tone", "unknown")),
+            "active": bool(observed >= 10 and recently_active),
+            "observation_count": observed,
+            "last_updated": int(last_updated or 0),
         }
