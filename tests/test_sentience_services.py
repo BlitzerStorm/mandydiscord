@@ -15,6 +15,7 @@ from mandy_v1.services.identity_service import IdentityService
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.persona_service import PersonaService
 from mandy_v1.services.runtime_coordinator_service import RuntimeCoordinatorService
+from mandy_v1.services.self_model_service import SelfModelService
 from mandy_v1.services.server_control_service import ServerControlService
 from mandy_v1.storage import MessagePackStore
 
@@ -197,6 +198,14 @@ def test_runtime_coordinator_builds_workspace_and_autonomy_context(tmp_path: Pat
         persona_service=persona,
         culture_service=culture,
         autonomy_engine=DummyAutonomy(),
+        self_model_service=SelfModelService(
+            store,
+            emotion_service=emotion,
+            identity_service=identity,
+            episodic_memory_service=episodic,
+            persona_service=persona,
+            culture_service=culture,
+        ),
     )
     context = runtime.build_prompt_context(
         guild_id=0,
@@ -210,6 +219,45 @@ def test_runtime_coordinator_builds_workspace_and_autonomy_context(tmp_path: Pat
     assert "Workspace:" in context
     assert "Autonomy:" in context
     assert "Self-check" in context
+    assert "SelfModel:" in context
+
+
+def test_self_model_snapshot_and_quality_capture(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    logger = LoggerService(store)
+    emotion = EmotionService(store, logger)
+    identity = IdentityService(store, logger)
+    episodic = EpisodicMemoryService(store, logger)
+    persona = PersonaService(store, logger)
+    culture = CultureService(store, logger)
+    self_model = SelfModelService(
+        store,
+        emotion_service=emotion,
+        identity_service=identity,
+        episodic_memory_service=episodic,
+        persona_service=persona,
+        culture_service=culture,
+    )
+    persona.update_from_message(7, "peter", "my name is Peter and I love bots")
+    snapshot = self_model.snapshot(
+        guild_id=0,
+        channel_id=55,
+        user_id=7,
+        topic="mandy",
+        user_name="Peter",
+        recent_lines=["Peter: mandy"],
+        facts=["name: Peter"],
+    )
+    assert snapshot["user_name"] == "Peter"
+    quality = self_model.evaluate_reply(
+        "Hi Peter, what got you curious?",
+        snapshot=snapshot,
+        recent_lines=["Hi Peter, what got you curious?"],
+    )
+    assert "generic" in quality["issues"]
+    self_model.note_reply_outcome(guild_id=0, user_id=7, reply="real reply", quality=quality, reason="mention")
+    root = store.data["self_model"]["state"]
+    assert int(root["reply_count"]) >= 1
 
 
 class _DummyResponse:

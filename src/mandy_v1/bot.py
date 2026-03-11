@@ -30,6 +30,7 @@ from mandy_v1.services.mirror_service import MirrorService
 from mandy_v1.services.onboarding_service import OnboardingService
 from mandy_v1.services.persona_service import PersonaService
 from mandy_v1.services.runtime_coordinator_service import RuntimeCoordinatorService
+from mandy_v1.services.self_model_service import SelfModelService
 from mandy_v1.services.autonomy_engine import AutonomyEngine
 from mandy_v1.services.server_control_service import ServerControlService
 from mandy_v1.services.shadow_league_service import SHADOW_CHANNEL_PRIORITY, ShadowLeagueService
@@ -258,6 +259,14 @@ class MandyBot(commands.Bot):
         self.identity = IdentityService(self.store, self.ai)
         self.personas = PersonaService(self.store, self.ai)
         self.culture = CultureService(self.store, self.ai)
+        self.self_model = SelfModelService(
+            self.store,
+            emotion_service=self.emotion,
+            identity_service=self.identity,
+            episodic_memory_service=self.episodic,
+            persona_service=self.personas,
+            culture_service=self.culture,
+        )
         self.server_control = ServerControlService(self, self.logger)
         self.expansion = ExpansionService(self.store, self.ai)
         self.autonomy = AutonomyEngine(
@@ -279,6 +288,7 @@ class MandyBot(commands.Bot):
             culture_service=self.culture,
             expansion_service=self.expansion,
             autonomy_engine=self.autonomy,
+            self_model_service=self.self_model,
         )
         self.ai.attach_context_services(
             emotion=self.emotion,
@@ -289,6 +299,7 @@ class MandyBot(commands.Bot):
             expansion=self.expansion,
             server_control=self.server_control,
             runtime_coordinator=self.runtime,
+            self_model=self.self_model,
         )
         self.shadow = ShadowLeagueService(settings, self.store, self.logger)
         self.started_at = datetime.now(tz=timezone.utc)
@@ -3503,6 +3514,7 @@ class MandyBot(commands.Bot):
                 )
                 reply = str(payload.get("reply", "")).strip()
                 memories = payload.get("memory_summaries", [])
+                reply_quality = payload.get("reply_quality", {})
                 final_attention = float(attention_score or payload.get("attention_score", 0.0) or 0.0)
                 await self._send_mandy_thought(message, attention_score=final_attention, memories=memories, decision="reply")
                 typing_delay = await self._simulate_typing_delay(message.channel)
@@ -3517,6 +3529,13 @@ class MandyBot(commands.Bot):
                 meaningful = len(str(message.clean_content or "")) >= 120 or len(reply) >= 120
                 if meaningful:
                     self.personas.deepen_relationship(message.author.id, 0.04)
+                self.self_model.note_reply_outcome(
+                    guild_id=guild_id,
+                    user_id=message.author.id,
+                    reply=reply,
+                    quality=reply_quality if isinstance(reply_quality, dict) else {},
+                    reason=reason,
+                )
                 await self.personas.maybe_capture_inside_reference(message.author.id, message.clean_content, reply)
                 server_action = payload.get("server_action")
                 if isinstance(server_action, dict):
@@ -3532,6 +3551,8 @@ class MandyBot(commands.Bot):
                     response_mode=response_mode,
                     typing_delay_sec=typing_delay,
                     parts=parts,
+                    reply_quality=float(reply_quality.get("quality", 0.0) or 0.0) if isinstance(reply_quality, dict) else 0.0,
+                    reply_issues=",".join(str(x) for x in reply_quality.get("issues", [])[:4]) if isinstance(reply_quality, dict) else "",
                 )
             except asyncio.CancelledError:
                 return

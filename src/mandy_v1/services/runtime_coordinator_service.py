@@ -24,6 +24,7 @@ class RuntimeCoordinatorService:
         culture_service: Any | None = None,
         expansion_service: Any | None = None,
         autonomy_engine: Any | None = None,
+        self_model_service: Any | None = None,
     ) -> None:
         self.storage = storage
         self.emotion = emotion_service
@@ -33,6 +34,7 @@ class RuntimeCoordinatorService:
         self.culture = culture_service
         self.expansion = expansion_service
         self.autonomy = autonomy_engine
+        self.self_model = self_model_service
         self._workspace_cache: dict[str, Any] = {"root": "", "ts": 0.0, "snapshot": {}}
 
     def workspace_snapshot(self, workspace_root: Path) -> dict[str, Any]:
@@ -159,6 +161,26 @@ class RuntimeCoordinatorService:
                     "Autonomy: "
                     f"decisions={int(status.get('decision_count', 0) or 0)} "
                     f"success={float(status.get('recent_success_rate', 0.0) or 0.0):.2f}"
+                )
+
+        if self.self_model is not None and hasattr(self.self_model, "snapshot"):
+            try:
+                snapshot = self.self_model.snapshot(
+                    guild_id=guild_id,
+                    channel_id=0,
+                    user_id=user_id,
+                    topic=topic,
+                    user_name=user_name,
+                    recent_lines=[],
+                    facts=[],
+                )
+            except Exception:  # noqa: BLE001
+                snapshot = {}
+            if isinstance(snapshot, dict) and snapshot:
+                lines.append(
+                    "SelfModel: "
+                    f"focus={str(snapshot.get('current_focus', 'stay present'))[:40]} "
+                    f"goal={str(snapshot.get('social_goal', 'read the room'))[:40]}"
                 )
 
         if workspace_root is not None:

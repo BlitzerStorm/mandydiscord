@@ -296,6 +296,7 @@ class AIService:
         self.expansion: Any | None = None
         self.server_control: Any | None = None
         self.runtime_coordinator: Any | None = None
+        self.self_model: Any | None = None
 
     def attach_context_services(
         self,
@@ -308,6 +309,7 @@ class AIService:
         expansion: Any | None = None,
         server_control: Any | None = None,
         runtime_coordinator: Any | None = None,
+        self_model: Any | None = None,
     ) -> None:
         self.emotion = emotion
         self.identity = identity
@@ -317,6 +319,7 @@ class AIService:
         self.expansion = expansion
         self.server_control = server_control
         self.runtime_coordinator = runtime_coordinator
+        self.self_model = self_model
 
     # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
     def sentience_reflection_line(self) -> str:
@@ -652,6 +655,21 @@ class AIService:
                 persona_voice = ""
         style_summary = self.guild_style_summary(guild_id)
         channel_memory = self.channel_memory_lines(message.channel.id, limit=6)
+        self_model_snapshot: dict[str, Any] = {}
+        self_model_block = ""
+        if self.self_model is not None and hasattr(self.self_model, "snapshot"):
+            self_model_snapshot = self.self_model.snapshot(
+                guild_id=guild_id,
+                channel_id=message.channel.id,
+                user_id=message.author.id,
+                topic=message.clean_content,
+                user_name=message.author.display_name,
+                channel_name=str(getattr(message.channel, "name", "") or ""),
+                recent_lines=recent,
+                facts=facts,
+            )
+            if hasattr(self.self_model, "prompt_block"):
+                self_model_block = str(self.self_model.prompt_block(self_model_snapshot) or "").strip()
         preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
         burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
         if self.is_repetitive_user_burst(burst, min_repeat=3):
@@ -694,6 +712,7 @@ class AIService:
             "Style instruction: match the room tone/lingo naturally without forcing slang or losing clarity.\n"
             "Do not default to generic greetings like 'hi <name>' or canned lines like 'what got you curious'. "
             "If you know something about the person or the room, use it.\n"
+            f"Self model:\n{self_model_block[:700] or '(none)'}\n"
             f"Pinned user facts:\n{self._format_lines(facts)}\n"
             f"Message: {message.clean_content[:500]}\n"
             f"Recent same-user burst:\n{self._format_lines(burst)}\n"
@@ -734,6 +753,28 @@ class AIService:
             relationship=relationship,
             message_text=message.clean_content,
         )
+        reply_quality = {"quality": 0.5, "issues": []}
+        if self.self_model is not None and hasattr(self.self_model, "evaluate_reply"):
+            reply_quality = self.self_model.evaluate_reply(generated, snapshot=self_model_snapshot, recent_lines=recent)
+            if float(reply_quality.get("quality", 0.0) or 0.0) < 0.45:
+                retry_prompt = (
+                    f"{user_prompt}\n"
+                    f"Your draft was weak with issues={','.join(str(x) for x in reply_quality.get('issues', []))}. "
+                    "Regenerate a more specific, human, non-generic answer grounded in the self model and known facts."
+                )
+                retry = await self.complete_text(system_prompt=prompt, user_prompt=retry_prompt, max_tokens=220, temperature=0.9)
+                retry = self._sanitize_generated_reply(
+                    retry or generated,
+                    user_display_name=message.author.display_name,
+                    recent_lines=recent,
+                    facts=facts,
+                    relationship=relationship,
+                    message_text=message.clean_content,
+                )
+                retry_quality = self.self_model.evaluate_reply(retry, snapshot=self_model_snapshot, recent_lines=recent)
+                if float(retry_quality.get("quality", 0.0) or 0.0) >= float(reply_quality.get("quality", 0.0) or 0.0):
+                    generated = retry
+                    reply_quality = retry_quality
         server_action: dict[str, Any] | None = None
         if self._should_attempt_server_action(message, reason=reason):
             server_action = await self.plan_server_action(message, generated, reason=reason)
@@ -746,6 +787,8 @@ class AIService:
             "memory_summaries": memory_block[1],
             "system_prompt": prompt,
             "attention_score": self.compute_attention_score(message, bot_user_id=message.guild.me.id if message.guild and message.guild.me else 0),
+            "reply_quality": reply_quality,
+            "self_model_snapshot": self_model_snapshot,
         }
 
     def _should_attempt_server_action(self, message: discord.Message, *, reason: str = "") -> bool:

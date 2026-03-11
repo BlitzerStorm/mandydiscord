@@ -14,6 +14,7 @@ __all__ = [
     "onboarding_service",
     "persona_service",
     "server_control_service",
+    "self_model_service",
     "shadow_league_service",
     "soc_service",
     "watcher_service",
