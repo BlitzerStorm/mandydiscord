@@ -249,6 +249,7 @@ def test_self_model_snapshot_and_quality_capture(tmp_path: Path) -> None:
         facts=["name: Peter"],
     )
     assert snapshot["user_name"] == "Peter"
+    assert "trust_score" in snapshot
     quality = self_model.evaluate_reply(
         "Hi Peter, what got you curious?",
         snapshot=snapshot,
@@ -258,6 +259,18 @@ def test_self_model_snapshot_and_quality_capture(tmp_path: Path) -> None:
     self_model.note_reply_outcome(guild_id=0, user_id=7, reply="real reply", quality=quality, reason="mention")
     root = store.data["self_model"]["state"]
     assert int(root["reply_count"]) >= 1
+
+
+def test_relationship_signal_tracks_trust_and_conflict(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = AIService(settings, store)
+
+    ai._note_relationship_signal(user_id=7, user_name="Peter", text="thank you mandy, appreciate you", source="test")  # noqa: SLF001
+    ai._note_relationship_signal(user_id=7, user_name="Peter", text="you are annoying and I hate this", source="test")  # noqa: SLF001
+    rel = ai.relationship_snapshot(7)
+    assert float(rel["trust_score"]) > 0.0
+    assert float(rel["conflict_score"]) > 0.0
 
 
 class _DummyResponse:

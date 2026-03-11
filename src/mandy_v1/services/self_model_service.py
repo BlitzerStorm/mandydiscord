@@ -73,6 +73,15 @@ class SelfModelService:
         relationship_depth = float(user_profile.get("relationship_depth", 0.0) or 0.0) if isinstance(user_profile, dict) else 0.0
         relationship_arc = str(user_profile.get("arc", "new")) if isinstance(user_profile, dict) else "new"
         communication_style = str(user_profile.get("communication_style", "casual")) if isinstance(user_profile, dict) else "casual"
+        trust_score = 0.0
+        conflict_score = 0.0
+        ai_root = self.storage.data.get("ai", {})
+        relationships = ai_root.get("relationships", {}) if isinstance(ai_root, dict) else {}
+        if isinstance(relationships, dict):
+            rel_row = relationships.get(str(int(user_id)), {})
+            if isinstance(rel_row, dict):
+                trust_score = float(rel_row.get("trust_score", 0.0) or 0.0)
+                conflict_score = float(rel_row.get("conflict_score", 0.0) or 0.0)
 
         room_read = {"active": False, "calibrated": False, "tone": "unknown"}
         if guild_id > 0 and self.culture is not None and hasattr(self.culture, "get_server_readiness"):
@@ -105,6 +114,8 @@ class SelfModelService:
             "relationship_depth": round(relationship_depth, 2),
             "relationship_arc": relationship_arc,
             "communication_style": communication_style,
+            "trust_score": round(trust_score, 2),
+            "conflict_score": round(conflict_score, 2),
             "room_active": room_read["active"],
             "room_calibrated": room_read["calibrated"],
             "room_tone": str(room_read["tone"])[:60],
@@ -126,7 +137,9 @@ class SelfModelService:
                 f"name={snapshot.get('user_name', 'user')} "
                 f"depth={snapshot.get('relationship_depth', 0.0):.2f} "
                 f"arc={snapshot.get('relationship_arc', 'new')} "
-                f"style={snapshot.get('communication_style', 'casual')}"
+                f"style={snapshot.get('communication_style', 'casual')} "
+                f"trust={snapshot.get('trust_score', 0.0):.2f} "
+                f"conflict={snapshot.get('conflict_score', 0.0):.2f}"
             ),
             (
                 "Room model: "
@@ -164,6 +177,7 @@ class SelfModelService:
         personalized = any(str(item).split(":", 1)[-1].strip().casefold() in lowered for item in facts if ":" in str(item))
         grounded = bool(snapshot.get("memory_anchor")) or bool(snapshot.get("recent_context"))
         warm = "warm" in str(snapshot.get("mood", "")).casefold() or float(snapshot.get("relationship_depth", 0.0) or 0.0) >= 2.0
+        conflict = float(snapshot.get("conflict_score", 0.0) or 0.0)
         quality = 0.55
         if personalized:
             quality += 0.18
@@ -171,6 +185,8 @@ class SelfModelService:
             quality += 0.12
         if warm and len(text) >= 24:
             quality += 0.08
+        if conflict >= 1.0 and "straight" in lowered:
+            quality += 0.05
         if generic:
             quality -= 0.22
         if repeated:
@@ -191,6 +207,8 @@ class SelfModelService:
             "repeated": repeated,
             "personalized": personalized,
             "grounded": grounded,
+            "trust_score": round(float(snapshot.get("trust_score", 0.0) or 0.0), 2),
+            "conflict_score": round(conflict, 2),
             "issues": issues[:4],
         }
 

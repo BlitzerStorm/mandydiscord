@@ -655,6 +655,7 @@ class AIService:
                 persona_voice = ""
         style_summary = self.guild_style_summary(guild_id)
         channel_memory = self.channel_memory_lines(message.channel.id, limit=6)
+        thread_memory = self.thread_memory_lines(message.channel.id, limit=5)
         self_model_snapshot: dict[str, Any] = {}
         self_model_block = ""
         if self.self_model is not None and hasattr(self.self_model, "snapshot"):
@@ -718,6 +719,7 @@ class AIService:
             f"Recent same-user burst:\n{self._format_lines(burst)}\n"
             f"Recent channel context:\n{self._format_lines(recent)}\n"
             f"Channel-local memory:\n{self._format_lines(channel_memory)}\n"
+            f"Thread memory:\n{self._format_lines(thread_memory)}\n"
             f"Long-term memory:\n{self._format_lines(memory)}\n"
             f"Hive notes:\n{self._format_lines(hive_notes)}"
         )
@@ -789,6 +791,14 @@ class AIService:
             "attention_score": self.compute_attention_score(message, bot_user_id=message.guild.me.id if message.guild and message.guild.me else 0),
             "reply_quality": reply_quality,
             "self_model_snapshot": self_model_snapshot,
+            "decision_trace": {
+                "recent_context_n": len(recent),
+                "channel_memory_n": len(channel_memory),
+                "thread_memory_n": len(thread_memory),
+                "facts_n": len(facts),
+                "quality": float(reply_quality.get("quality", 0.0) or 0.0) if isinstance(reply_quality, dict) else 0.0,
+                "issues": [str(item)[:30] for item in reply_quality.get("issues", [])[:4]] if isinstance(reply_quality, dict) else [],
+            },
         }
 
     def _should_attempt_server_action(self, message: discord.Message, *, reason: str = "") -> bool:
@@ -983,6 +993,10 @@ class AIService:
             "affinity": float(row.get("affinity", 0.0) or 0.0),
             "positive_hits": int(row.get("positive_hits", 0) or 0),
             "negative_hits": int(row.get("negative_hits", 0) or 0),
+            "trust_score": float(row.get("trust_score", 0.0) or 0.0),
+            "conflict_score": float(row.get("conflict_score", 0.0) or 0.0),
+            "supportive_hits": int(row.get("supportive_hits", 0) or 0),
+            "hostile_hits": int(row.get("hostile_hits", 0) or 0),
             "risk_flags": [str(f)[:40] for f in flags[:8]],
             "last_seen_ts": float(row.get("last_seen_ts", 0.0) or 0.0),
             "last_invited_ts": float(row.get("last_invited_ts", 0.0) or 0.0),
@@ -1105,6 +1119,14 @@ class AIService:
                 "user_id": message.author.id,
                 "line": line,
                 "text": message.clean_content[:350],
+                "thread_id": int(getattr(message.channel, "id", 0) or 0),
+                "channel_name": str(getattr(message.channel, "name", "unknown"))[:80],
+                "reply_to_user_id": int(
+                    getattr(getattr(getattr(message, "reference", None), "resolved", None), "author", None).id
+                )
+                if getattr(getattr(message, "reference", None), "resolved", None) is not None
+                and getattr(getattr(getattr(message, "reference", None), "resolved", None), "author", None) is not None
+                else 0,
             }
         )
         if update_turn:
@@ -2019,6 +2041,23 @@ class AIService:
         memory.extend(snippets[: max(1, limit - 1)])
         return memory
 
+    def thread_memory_lines(self, channel_id: int, limit: int = 5) -> list[str]:
+        entries = list(self._recent_entries_by_channel.get(channel_id, []))
+        if not entries:
+            return []
+        out: list[str] = []
+        for entry in reversed(entries):
+            text = " ".join(str(entry.get("text", "")).split()).strip()
+            if not text:
+                continue
+            reply_to = int(entry.get("reply_to_user_id", 0) or 0)
+            prefix = f"reply_to={reply_to} " if reply_to > 0 else ""
+            out.append(f"{prefix}{text[:120]}")
+            if len(out) >= max(1, limit):
+                break
+        out.reverse()
+        return out
+
     def _is_repetitive_reply(self, text: str, recent_lines: list[str]) -> bool:
         body = " ".join(str(text or "").split()).strip().casefold()
         if len(body) < 10:
@@ -2419,6 +2458,10 @@ class AIService:
                 "positive_hits": 0,
                 "negative_hits": 0,
                 "risk_flags": [],
+                "trust_score": 0.0,
+                "conflict_score": 0.0,
+                "supportive_hits": 0,
+                "hostile_hits": 0,
                 "notes": [],
                 "last_seen_ts": 0.0,
                 "last_seen_iso": "",
@@ -2452,8 +2495,12 @@ class AIService:
 
         # Small, bounded updates only. This is a gate/ledger, not a transcript.
         affinity = float(row.get("affinity", 0.0) or 0.0)
+        trust = float(row.get("trust_score", 0.0) or 0.0)
+        conflict = float(row.get("conflict_score", 0.0) or 0.0)
         positives = int(row.get("positive_hits", 0) or 0)
         negatives = int(row.get("negative_hits", 0) or 0)
+        supportive_hits = int(row.get("supportive_hits", 0) or 0)
+        hostile_hits = int(row.get("hostile_hits", 0) or 0)
         flags = row.get("risk_flags", [])
         if not isinstance(flags, list):
             flags = []
@@ -2462,15 +2509,25 @@ class AIService:
         if raw and self._positive_regex.search(raw):
             positives += 1
             affinity = min(5.0, affinity + 0.10)
+            trust = min(5.0, trust + 0.14)
+            supportive_hits += 1
         if raw and self._negative_regex.search(raw):
             negatives += 1
             affinity = max(-5.0, affinity - 0.15)
+            conflict = min(5.0, conflict + 0.18)
+            hostile_hits += 1
             if "hostile_language" not in flags:
                 flags.append("hostile_language")
+        if "thank" in raw.casefold() or "appreciate" in raw.casefold():
+            trust = min(5.0, trust + 0.08)
+        if any(term in raw.casefold() for term in ("shut up", "hate you", "annoying")):
+            conflict = min(5.0, conflict + 0.12)
 
         # Mild decay so old negatives don't permanently poison someone.
         if prev_seen > 0 and (now - prev_seen) > 30 * 86400:
             affinity *= 0.98
+            trust *= 0.995
+            conflict *= 0.992
 
         # If recent behavior trends positive, clear the generic hostility flag.
         if affinity >= 0.25 and negatives <= max(2, positives):
@@ -2478,8 +2535,12 @@ class AIService:
                 flags.remove("hostile_language")
 
         row["affinity"] = round(affinity, 3)
+        row["trust_score"] = round(max(0.0, min(5.0, trust)), 3)
+        row["conflict_score"] = round(max(0.0, min(5.0, conflict)), 3)
         row["positive_hits"] = positives
         row["negative_hits"] = negatives
+        row["supportive_hits"] = supportive_hits
+        row["hostile_hits"] = hostile_hits
         row["last_source"] = str(source)[:60]
         self.store.touch()
 

@@ -121,6 +121,21 @@ def test_channel_memory_lines_include_participants_and_recent_text(tmp_path: Pat
     assert any("nicknames earlier" in line for line in lines[1:])
 
 
+def test_thread_memory_lines_include_reply_links(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = AIService(settings, store)
+
+    base = _stub_message(guild_id=77, user_id=2001, content="first message")
+    replied = _stub_message(guild_id=77, user_id=2002, content="second message")
+    replied.reference = SimpleNamespace(resolved=SimpleNamespace(author=SimpleNamespace(id=2001)))
+    ai.capture_message(base, touch=False)
+    ai.capture_message(replied, touch=False)
+
+    lines = ai.thread_memory_lines(55, limit=4)
+    assert any("reply_to=2001" in line for line in lines)
+
+
 def test_sanitize_generated_reply_breaks_generic_curious_loop(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path)
     store = _make_store(tmp_path)

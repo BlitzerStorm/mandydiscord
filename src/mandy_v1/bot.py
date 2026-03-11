@@ -3515,8 +3515,15 @@ class MandyBot(commands.Bot):
                 reply = str(payload.get("reply", "")).strip()
                 memories = payload.get("memory_summaries", [])
                 reply_quality = payload.get("reply_quality", {})
+                decision_trace = payload.get("decision_trace", {})
                 final_attention = float(attention_score or payload.get("attention_score", 0.0) or 0.0)
-                await self._send_mandy_thought(message, attention_score=final_attention, memories=memories, decision="reply")
+                await self._send_mandy_thought(
+                    message,
+                    attention_score=final_attention,
+                    memories=memories,
+                    decision="reply",
+                    diagnostics=decision_trace if isinstance(decision_trace, dict) else reply_quality if isinstance(reply_quality, dict) else None,
+                )
                 typing_delay = await self._simulate_typing_delay(message.channel)
                 if response_mode == "reply":
                     parts = await self._send_split_channel_message(message.channel, reply)
@@ -3553,6 +3560,8 @@ class MandyBot(commands.Bot):
                     parts=parts,
                     reply_quality=float(reply_quality.get("quality", 0.0) or 0.0) if isinstance(reply_quality, dict) else 0.0,
                     reply_issues=",".join(str(x) for x in reply_quality.get("issues", [])[:4]) if isinstance(reply_quality, dict) else "",
+                    thread_memory_n=int(decision_trace.get("thread_memory_n", 0) or 0) if isinstance(decision_trace, dict) else 0,
+                    facts_n=int(decision_trace.get("facts_n", 0) or 0) if isinstance(decision_trace, dict) else 0,
                 )
             except asyncio.CancelledError:
                 return
@@ -4273,16 +4282,22 @@ class MandyBot(commands.Bot):
         attention_score: float,
         memories: list[str] | None,
         decision: str,
+        diagnostics: dict[str, Any] | None = None,
     ) -> None:
         payload_memories = ", ".join(str(item)[:80] for item in (memories or [])[:2]) or "none"
         mood = self.emotion.get_mood()
         clock = datetime.now().strftime("%H:%M")
         channel_name = str(getattr(message.channel, "name", "dm"))[:32]
         user_name = str(getattr(message.author, "display_name", message.author.name))[:32]
+        trace = ""
+        if isinstance(diagnostics, dict) and diagnostics:
+            quality = float(diagnostics.get("quality", 0.0) or 0.0)
+            issues = ",".join(str(item)[:16] for item in diagnostics.get("issues", [])[:3]) or "none"
+            trace = f"\nTrace: q={quality:.2f} issues={issues}"
         text = (
             f"[{clock}] #{channel_name} | @{user_name}\n"
             f"Mood: {mood['state']}/{float(mood['intensity']):.1f} | Attention: {float(attention_score):.2f}\n"
-            f"Memories: {payload_memories} | Decision: {decision}"
+            f"Memories: {payload_memories} | Decision: {decision}{trace}"
         )[:400]
         now = time.time()
         stale = [key for key, ts in self._thought_dedup_cache.items() if (now - ts) > 30.0]
