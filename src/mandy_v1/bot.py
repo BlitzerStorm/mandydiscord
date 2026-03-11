@@ -3398,7 +3398,7 @@ class MandyBot(commands.Bot):
                 )
                 return
             return
-        if self.ai.is_chat_enabled(guild_id):
+        if self._should_run_chat_pipeline(message):
             directive = self.ai.decide_chat_action(message, self.user.id)
             if directive.action == "ignore":
                 self.emotion.shift("ignored", 0.1)
@@ -3428,6 +3428,16 @@ class MandyBot(commands.Bot):
                     response_mode=directive.action,
                     attention_score=directive.attention_score,
                 )
+
+    def _should_run_chat_pipeline(self, message: discord.Message) -> bool:
+        if not message.guild or not self.user:
+            return False
+        guild_id = int(message.guild.id)
+        if self.ai.is_chat_enabled(guild_id):
+            return True
+        if guild_id == int(self.settings.admin_guild_id):
+            return self.ai._mentions_mandy(message, self.user.id)  # noqa: SLF001
+        return False
 
     async def _maybe_handle_ai_dm_message(self, message: discord.Message) -> None:
         key = int(message.author.id)

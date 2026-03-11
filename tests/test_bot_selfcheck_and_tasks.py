@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 from mandy_v1.bot import MandyBot
 from mandy_v1.config import Settings
@@ -57,3 +58,33 @@ def test_automation_command_allowlist(tmp_path: Path) -> None:
     assert bot._is_allowed_automation_command("python --version") is True
     assert bot._is_allowed_automation_command("rm -rf .") is False
     assert bot._is_allowed_automation_command("Remove-Item -Recurse .") is False
+
+
+def test_admin_hub_direct_mentions_run_chat_pipeline_even_when_chat_disabled(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+    bot._connection.user = SimpleNamespace(id=9999)
+    message = SimpleNamespace(
+        guild=SimpleNamespace(id=123),
+        author=SimpleNamespace(id=42, bot=False),
+        content="mandy are you there",
+        clean_content="mandy are you there",
+        mentions=[],
+        reference=None,
+    )
+    assert bot.ai.is_chat_enabled(123) is False
+    assert bot._should_run_chat_pipeline(message) is True
+
+
+def test_non_admin_guild_still_requires_chat_enabled(tmp_path: Path) -> None:
+    bot = _make_bot(tmp_path)
+    bot._connection.user = SimpleNamespace(id=9999)
+    message = SimpleNamespace(
+        guild=SimpleNamespace(id=456),
+        author=SimpleNamespace(id=42, bot=False),
+        content="mandy are you there",
+        clean_content="mandy are you there",
+        mentions=[],
+        reference=None,
+    )
+    assert bot.ai.is_chat_enabled(456) is False
+    assert bot._should_run_chat_pipeline(message) is False
