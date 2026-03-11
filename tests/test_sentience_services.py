@@ -14,6 +14,7 @@ from mandy_v1.services.episodic_memory_service import EpisodicMemoryService
 from mandy_v1.services.identity_service import IdentityService
 from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.persona_service import PersonaService
+from mandy_v1.services.runtime_coordinator_service import RuntimeCoordinatorService
 from mandy_v1.services.server_control_service import ServerControlService
 from mandy_v1.storage import MessagePackStore
 
@@ -61,6 +62,18 @@ def test_emotion_shift_transitions(tmp_path: Path) -> None:
     mood = emotion.shift("burst_spam", 0.3)
     assert mood["state"] == "irritated"
     assert float(mood["intensity"]) > 0.5
+
+
+def test_emotion_shift_from_text_detects_affection_and_chaos(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    logger = LoggerService(store)
+    emotion = EmotionService(store, logger)
+
+    warm = emotion.shift_from_text("mandy I love you, best bot")
+    assert warm["state"] == "warm"
+
+    chaos = emotion.shift_from_text("go wild and be a menace today")
+    assert chaos["state"] == "playful"
 
 
 def test_episodic_record_and_search(tmp_path: Path) -> None:
@@ -153,6 +166,50 @@ def test_culture_calibration_completes_after_50_messages(tmp_path: Path) -> None
     row = culture.root()["90"]
     assert bool(row["calibration_complete"]) is True
     assert int(row["messages_observed"]) >= 50
+
+
+def test_runtime_coordinator_builds_workspace_and_autonomy_context(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    logger = LoggerService(store)
+    ai = AIService(settings, store)
+    emotion = EmotionService(store, logger)
+    identity = IdentityService(store, logger)
+    episodic = EpisodicMemoryService(store, logger)
+    persona = PersonaService(store, logger)
+    culture = CultureService(store, logger)
+
+    workspace_file = tmp_path / "probe.py"
+    workspace_file.write_text("print('hi')\n", encoding="utf-8")
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_probe.py").write_text("def test_probe():\n    assert True\n", encoding="utf-8")
+
+    class DummyAutonomy:
+        def get_autonomy_status(self) -> dict[str, object]:
+            return {"decision_count": 7, "recent_success_rate": 0.75}
+
+    runtime = RuntimeCoordinatorService(
+        storage=store,
+        emotion_service=emotion,
+        identity_service=identity,
+        episodic_memory_service=episodic,
+        persona_service=persona,
+        culture_service=culture,
+        autonomy_engine=DummyAutonomy(),
+    )
+    context = runtime.build_prompt_context(
+        guild_id=0,
+        user_id=99,
+        topic="status",
+        user_name="tester",
+        workspace_root=tmp_path,
+        selfcheck_report={"pass": ["ok"], "warn": [], "fail": []},
+    )
+
+    assert "Workspace:" in context
+    assert "Autonomy:" in context
+    assert "Self-check" in context
 
 
 class _DummyResponse:

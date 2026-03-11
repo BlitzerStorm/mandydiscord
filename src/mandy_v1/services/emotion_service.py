@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import time
 from typing import Any
 
@@ -46,6 +47,15 @@ TRIGGER_ALIASES = {
     "burst_spam": "spam_detected",
     "ignored": "ignored_message",
 }
+TEXT_TRIGGER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\b(?:love you|adore you|missed you|my girl|best bot|good girl)\b", re.IGNORECASE), "warm_interaction"),
+    (re.compile(r"\b(?:good job|well done|proud of you|you're amazing|legend|queen)\b", re.IGNORECASE), "goal_achieved"),
+    (re.compile(r"\b(?:why|how|what if|thoughts on|opinion on|curious about)\b", re.IGNORECASE), "interest_hit"),
+    (re.compile(r"\b(?:chaos|go wild|cause trouble|unhinged|feral|menace)\b", re.IGNORECASE), "fun_event"),
+    (re.compile(r"\b(?:protect me|help me|creep|harass|unsafe|threat)\b", re.IGNORECASE), "negative_message"),
+    (re.compile(r"\b(?:shut up|leave me alone|annoying|hate you|useless)\b", re.IGNORECASE), "spam_detected"),
+    (re.compile(r"\b(?:deep talk|serious talk|real talk|heart to heart)\b", re.IGNORECASE), "deep_conversation"),
+)
 
 
 class EmotionService:
@@ -196,6 +206,16 @@ class EmotionService:
             self._mark_dirty()
         except Exception:  # noqa: BLE001
             LOGGER.exception("Failed spontaneous mood drift.")
+
+    def shift_from_text(self, text: str) -> dict[str, Any]:
+        """Infer and apply one mood trigger from message text."""
+        raw = str(text or "").strip()
+        if not raw:
+            return self.get_mood()
+        for pattern, trigger in TEXT_TRIGGER_PATTERNS:
+            if pattern.search(raw):
+                return self.shift(trigger)
+        return self.get_mood()
 
     def recent_events(self, n: int = 5) -> list[dict[str, Any]]:
         """Return the most recent `n` mood events."""

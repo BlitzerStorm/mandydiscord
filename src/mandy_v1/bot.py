@@ -29,6 +29,7 @@ from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.mirror_service import MirrorService
 from mandy_v1.services.onboarding_service import OnboardingService
 from mandy_v1.services.persona_service import PersonaService
+from mandy_v1.services.runtime_coordinator_service import RuntimeCoordinatorService
 from mandy_v1.services.autonomy_engine import AutonomyEngine
 from mandy_v1.services.server_control_service import ServerControlService
 from mandy_v1.services.shadow_league_service import SHADOW_CHANNEL_PRIORITY, ShadowLeagueService
@@ -269,6 +270,16 @@ class MandyBot(commands.Bot):
             culture_service=self.culture,
             expansion_service=self.expansion,
         )
+        self.runtime = RuntimeCoordinatorService(
+            storage=self.store,
+            emotion_service=self.emotion,
+            identity_service=self.identity,
+            episodic_memory_service=self.episodic,
+            persona_service=self.personas,
+            culture_service=self.culture,
+            expansion_service=self.expansion,
+            autonomy_engine=self.autonomy,
+        )
         self.ai.attach_context_services(
             emotion=self.emotion,
             identity=self.identity,
@@ -277,6 +288,7 @@ class MandyBot(commands.Bot):
             culture=self.culture,
             expansion=self.expansion,
             server_control=self.server_control,
+            runtime_coordinator=self.runtime,
         )
         self.shadow = ShadowLeagueService(settings, self.store, self.logger)
         self.started_at = datetime.now(tz=timezone.utc)
@@ -2481,7 +2493,8 @@ class MandyBot(commands.Bot):
             f"Task name: {str(task_row.get('name', ''))}\n"
             f"Task prompt: {prompt}\n"
             f"Admin guild id: {self.settings.admin_guild_id}\n"
-            f"Creator user id: {SUPER_USER_ID}"
+            f"Creator user id: {SUPER_USER_ID}\n"
+            f"{self.runtime.build_prompt_context(guild_id=0, user_id=SUPER_USER_ID, topic=prompt, workspace_root=self._workspace_root(), selfcheck_report=self._run_internal_selfcheck())}"
         )
         raw = await self.ai.complete_text(
             system_prompt=system_prompt,
@@ -3214,6 +3227,7 @@ class MandyBot(commands.Bot):
                 if int(self.culture._profile(message.guild.id).get("observed_count", 0) or 0) >= 50:  # noqa: SLF001
                     await self.culture.calibrate(message.guild.id, self.ai)
                 self.expansion.note_message(message)
+                self.emotion.shift_from_text(message.clean_content)
                 if self.personas.get_relationship_depth(message.author.id) > 0.6:
                     self.emotion.shift("warm_interaction")
                 if self.ai._interest_match(message.clean_content, message.author.id):

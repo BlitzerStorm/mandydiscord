@@ -266,7 +266,11 @@ class AIService:
         self._last_bot_reply_ts_by_channel: dict[int, float] = {}
         self._last_bot_reply_to_user_in_channel: dict[tuple[int, int], float] = {}
         self._last_server_action_plan_ts_by_guild: dict[int, float] = {}
-        self._alias_regex = re.compile(r"\b(?:mandy|mandi|mndy|mdy|mandee)\b", re.IGNORECASE)
+        self._alias_regex = re.compile(
+            r"(?<![a-z0-9])(?:@)?(?:hey|hi|yo|oi|ok(?:ay)?|listen)?[\s,.:;!\-]*"
+            r"(?:mandy|mandi|mandie|mandee|mandyy|mndy|mdy|m4ndy)(?![a-z0-9])",
+            re.IGNORECASE,
+        )
         self._negative_regex = re.compile("|".join(re.escape(term) for term in NEGATIVE_TERMS), re.IGNORECASE)
         self._positive_regex = re.compile("|".join(re.escape(term) for term in POSITIVE_TERMS), re.IGNORECASE)
         self._emotional_regex = re.compile(r"\b(?:lol|lmao|omg|wow|damn|nice|thanks|wtf|bro|bruh)\b", re.IGNORECASE)
@@ -291,6 +295,7 @@ class AIService:
         self.culture: Any | None = None
         self.expansion: Any | None = None
         self.server_control: Any | None = None
+        self.runtime_coordinator: Any | None = None
 
     def attach_context_services(
         self,
@@ -302,6 +307,7 @@ class AIService:
         culture: Any | None = None,
         expansion: Any | None = None,
         server_control: Any | None = None,
+        runtime_coordinator: Any | None = None,
     ) -> None:
         self.emotion = emotion
         self.identity = identity
@@ -310,6 +316,7 @@ class AIService:
         self.culture = culture
         self.expansion = expansion
         self.server_control = server_control
+        self.runtime_coordinator = runtime_coordinator
 
     # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
     def sentience_reflection_line(self) -> str:
@@ -484,8 +491,17 @@ class AIService:
         injection = self.get_prompt_injection(guild_id)
         guild_prompt = self._context_block(injection.get("guild_prompt", ""), limit=4000)
         global_prompt = self._context_block(injection.get("master_prompt", ""), limit=4000)
+        runtime_block = ""
+        if self.runtime_coordinator is not None and hasattr(self.runtime_coordinator, "build_prompt_context"):
+            runtime_block = self.runtime_coordinator.build_prompt_context(
+                guild_id=guild_id,
+                user_id=user_id,
+                topic=topic,
+                user_name=user_name,
+            )
+        runtime_block = self._context_block(runtime_block, limit=700)
         extra = self._context_block(extra_instruction, limit=900)
-        blocks = [base, mood, identity, server_voice, user_profile, memory_block, guild_prompt, global_prompt, extra]
+        blocks = [base, mood, identity, server_voice, user_profile, memory_block, runtime_block, guild_prompt, global_prompt, extra]
         return "\n\n".join(block for block in blocks if block)
 
     def build_context_prompt(self, guild_id: int, user_id: int, query: str) -> str:

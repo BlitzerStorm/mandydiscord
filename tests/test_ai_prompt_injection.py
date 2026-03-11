@@ -84,6 +84,21 @@ def test_decide_chat_action_can_choose_direct_reply(tmp_path: Path) -> None:
     assert action.action == "direct_reply"
 
 
+def test_mentions_mandy_matches_alias_forms(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = AIService(settings, store)
+
+    msg = _stub_message(guild_id=77, user_id=2001, content="hey mandee can you help?")
+    assert ai._mentions_mandy(msg, bot_user_id=9999) is True  # noqa: SLF001
+
+    leet = _stub_message(guild_id=77, user_id=2001, content="yo m4ndy look at this")
+    assert ai._mentions_mandy(leet, bot_user_id=9999) is True  # noqa: SLF001
+
+    false_positive = _stub_message(guild_id=77, user_id=2001, content="mandatory reading is due")
+    assert ai._mentions_mandy(false_positive, bot_user_id=9999) is False  # noqa: SLF001
+
+
 def test_style_summary_collects_slang_signal(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path)
     store = _make_store(tmp_path)
