@@ -95,8 +95,47 @@ def test_mentions_mandy_matches_alias_forms(tmp_path: Path) -> None:
     leet = _stub_message(guild_id=77, user_id=2001, content="yo m4ndy look at this")
     assert ai._mentions_mandy(leet, bot_user_id=9999) is True  # noqa: SLF001
 
+    stretched = _stub_message(guild_id=77, user_id=2001, content="maaandyy you awake?")
+    assert ai._mentions_mandy(stretched, bot_user_id=9999) is True  # noqa: SLF001
+
+    shortish = _stub_message(guild_id=77, user_id=2001, content="man mandi answer me")
+    assert ai._mentions_mandy(shortish, bot_user_id=9999) is True  # noqa: SLF001
+
     false_positive = _stub_message(guild_id=77, user_id=2001, content="mandatory reading is due")
     assert ai._mentions_mandy(false_positive, bot_user_id=9999) is False  # noqa: SLF001
+
+
+def test_channel_memory_lines_include_participants_and_recent_text(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = AIService(settings, store)
+
+    first = _stub_message(guild_id=77, user_id=2001, content="we were talking about nicknames earlier")
+    second = _stub_message(guild_id=77, user_id=2002, content="and Mandy got weirdly protective about it")
+    ai.capture_message(first, touch=False)
+    ai.capture_message(second, touch=False)
+
+    lines = ai.channel_memory_lines(55, limit=4)
+    assert lines
+    assert "active participants:" in lines[0]
+    assert any("nicknames earlier" in line for line in lines[1:])
+
+
+def test_sanitize_generated_reply_breaks_generic_curious_loop(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = AIService(settings, store)
+
+    sanitized = ai._sanitize_generated_reply(  # noqa: SLF001
+        "Hi Peter, what got you curious?",
+        user_display_name="Peter",
+        recent_lines=["Mandy: Hi Peter, what got you curious?"],
+        facts=["name: Peter"],
+        relationship="familiarity=known tone=warm curiosity=medium rapport=0.80 pos=3 neg=0 facts=1",
+        message_text="mandy",
+    )
+    assert sanitized != "Hi Peter, what got you curious?"
+    assert "curious" not in sanitized.casefold() or "what got you curious" not in sanitized.casefold()
 
 
 def test_style_summary_collects_slang_signal(tmp_path: Path) -> None:

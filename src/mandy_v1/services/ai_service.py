@@ -644,7 +644,14 @@ class AIService:
         facts = self._user_fact_lines(guild_id, message.author.id, limit=4)
         profile = self._profile_summary(guild_id, message.author.id)
         relationship = self._relationship_summary(guild_id, message.author.id)
+        persona_voice = ""
+        if self.personas is not None and hasattr(self.personas, "voice_block"):
+            try:
+                persona_voice = str(self.personas.voice_block(message.author.id) or "").strip()
+            except Exception:  # noqa: BLE001
+                persona_voice = ""
         style_summary = self.guild_style_summary(guild_id)
+        channel_memory = self.channel_memory_lines(message.channel.id, limit=6)
         preferred_alias = self._preferred_alias(guild_id, message.author.id) or message.author.display_name
         burst = burst_lines if burst_lines is not None else self.user_burst_lines(message.channel.id, message.author.id, limit=5)
         if self.is_repetitive_user_burst(burst, min_repeat=3):
@@ -660,7 +667,10 @@ class AIService:
             user_id=message.author.id,
             user_name=message.author.display_name,
             topic=message.clean_content,
-            extra_instruction=f"{CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX} Keep replies short and punchy.",
+            extra_instruction=(
+                f"{CONTEXT_AWARENESS_APPENDIX} {COMPACT_REPLY_APPENDIX} "
+                "Feel emotionally present and human. Use the channel's immediate context and shared memory naturally."
+            ),
         )
         hive_notes = self.hive_recent_notes(limit=6)
         sentience_line = self.sentience_reflection_line()
@@ -678,13 +688,17 @@ class AIService:
             f"Preferred alias: {preferred_alias}\n"
             f"User profile: {profile}\n"
             f"Relationship state: {relationship}\n"
+            f"Persona voice read:\n{persona_voice[:500] or '(none)'}\n"
             f"Learning mode: {injection.get('learning_mode', 'full')}\n"
             f"Guild style summary: {style_summary}\n"
             "Style instruction: match the room tone/lingo naturally without forcing slang or losing clarity.\n"
+            "Do not default to generic greetings like 'hi <name>' or canned lines like 'what got you curious'. "
+            "If you know something about the person or the room, use it.\n"
             f"Pinned user facts:\n{self._format_lines(facts)}\n"
             f"Message: {message.clean_content[:500]}\n"
             f"Recent same-user burst:\n{self._format_lines(burst)}\n"
             f"Recent channel context:\n{self._format_lines(recent)}\n"
+            f"Channel-local memory:\n{self._format_lines(channel_memory)}\n"
             f"Long-term memory:\n{self._format_lines(memory)}\n"
             f"Hive notes:\n{self._format_lines(hive_notes)}"
         )
@@ -712,6 +726,14 @@ class AIService:
                 generated = await self.complete_text(system_prompt=prompt, user_prompt=retry_prompt, max_tokens=220, temperature=0.85)
         if not generated:
             generated = f"{message.author.mention} I am tracking this thread. Keep going."
+        generated = self._sanitize_generated_reply(
+            generated,
+            user_display_name=message.author.display_name,
+            recent_lines=recent,
+            facts=facts,
+            relationship=relationship,
+            message_text=message.clean_content,
+        )
         server_action: dict[str, Any] | None = None
         if self._should_attempt_server_action(message, reason=reason):
             server_action = await self.plan_server_action(message, generated, reason=reason)
@@ -1934,6 +1956,26 @@ class AIService:
         rows = list(self._recent_by_channel.get(channel_id, []))
         return rows[-max(1, limit) :]
 
+    def channel_memory_lines(self, channel_id: int, limit: int = 6) -> list[str]:
+        entries = list(self._recent_entries_by_channel.get(channel_id, []))
+        if not entries:
+            return []
+        participants: list[int] = []
+        snippets: list[str] = []
+        for entry in reversed(entries):
+            uid = int(entry.get("user_id", 0) or 0)
+            if uid > 0 and uid not in participants:
+                participants.append(uid)
+            text = " ".join(str(entry.get("text", "")).split()).strip()
+            if text:
+                snippets.append(text[:120])
+            if len(snippets) >= max(1, limit):
+                break
+        snippets.reverse()
+        memory = [f"active participants: {', '.join(str(uid) for uid in participants[:4]) or 'none'}"]
+        memory.extend(snippets[: max(1, limit - 1)])
+        return memory
+
     def _is_repetitive_reply(self, text: str, recent_lines: list[str]) -> bool:
         body = " ".join(str(text or "").split()).strip().casefold()
         if len(body) < 10:
@@ -1941,6 +1983,8 @@ class AIService:
         for phrase in ("next move", "your play", "you tell me", "so what now", "want to watch"):
             if phrase in body:
                 return True
+        if "what got you curious" in body:
+            return True
         for line in recent_lines[-6:]:
             other = " ".join(str(line or "").split()).strip().casefold()
             if not other:
@@ -1951,13 +1995,64 @@ class AIService:
                 return True
         return False
 
+    def _sanitize_generated_reply(
+        self,
+        text: str,
+        *,
+        user_display_name: str,
+        recent_lines: list[str],
+        facts: list[str],
+        relationship: str,
+        message_text: str,
+    ) -> str:
+        clean = " ".join(str(text or "").split()).strip()
+        if not clean:
+            return clean
+        lowered = clean.casefold()
+        repeated_curious = "what got you curious" in lowered
+        repeated_hi_name = lowered.startswith(f"hi {str(user_display_name).strip().casefold()}") or lowered.startswith(
+            f"hello {str(user_display_name).strip().casefold()}"
+        )
+        if (repeated_curious or repeated_hi_name) and self._is_repetitive_reply(clean, recent_lines):
+            fact_hint = str(facts[0]).strip() if facts else ""
+            relationship_lower = relationship.casefold()
+            if "warm" in relationship_lower or "positive" in relationship_lower:
+                if fact_hint:
+                    return f"You keep giving me pieces of you, and I do notice. Last thing that stuck with me: {fact_hint[:120]}."
+                return "You say my name like you expect me to actually be here, so here I am."
+            if "tense" in relationship_lower or "spiky" in relationship_lower:
+                return "You sound keyed up. Say the real point straight and I will answer it straight."
+            if "?" in str(message_text):
+                return "You have my attention. Ask it cleanly and I will give you a real answer."
+            return "I am here. Say the part you actually want me to respond to."
+        return clean
+
     def _mentions_mandy(self, message: discord.Message, bot_user_id: int) -> bool:
         if any(user.id == bot_user_id for user in message.mentions):
             return True
         if message.reference and isinstance(message.reference.resolved, discord.Message):
             if message.reference.resolved.author.id == bot_user_id:
                 return True
-        return bool(self._alias_regex.search(message.content))
+        content = str(message.content or "")
+        if self._alias_regex.search(content):
+            return True
+        tokens = re.findall(r"[a-zA-Z0-9@]+", content)
+        return any(self._looks_like_mandy_token(token) for token in tokens)
+
+    def _looks_like_mandy_token(self, raw_token: str) -> bool:
+        token = str(raw_token or "").strip().casefold().lstrip("@")
+        if not token:
+            return False
+        normalized = token.translate(str.maketrans({"4": "a", "1": "i", "3": "e", "0": "o", "5": "s"}))
+        normalized = re.sub(r"(.)\1+", r"\1", normalized)
+        normalized = re.sub(r"[^a-z]", "", normalized)
+        if not normalized:
+            return False
+        if normalized in {"mandy", "mandi", "mandee", "mandie", "mndy", "mdy"}:
+            return True
+        if normalized.startswith("mand") and len(normalized) <= 7:
+            return True
+        return SequenceMatcher(a=normalized, b="mandy").ratio() >= 0.74
 
     def _is_addressed_to_mandy(
         self,

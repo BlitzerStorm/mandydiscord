@@ -48,9 +48,9 @@ DM_SYSTEM_PROMPT = (
 # Appended in code (so the base prompts above remain unchanged).
 COMPACT_REPLY_APPENDIX = (
     "Style constraints: "
-    "Keep replies very short (usually 1-2 sentences). "
+    "Keep replies short (usually 1-3 sentences). "
     "No rhetorical closers like 'Next move?', 'Your play?', 'You tell me.', 'Want to watch?', or 'So what now?'. "
-    "No narration or stage directions. No emojis."
+    "No narration or stage directions. Emotive punctuation is fine. Emojis are allowed but should be sparse and natural."
 )
 
 
