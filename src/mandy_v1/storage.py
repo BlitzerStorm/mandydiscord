@@ -125,6 +125,8 @@ DEFAULT_STORE: dict[str, Any] = {
         "telemetry": {
             "calls": 0,
             "cache_hits": 0,
+            "inflight_joins": 0,
+            "budget_throttles": 0,
             "successes": 0,
             "failures": 0,
             "fallbacks": 0,
@@ -133,6 +135,7 @@ DEFAULT_STORE: dict[str, Any] = {
             "estimated_cost_usd": 0.0,
             "last_call_ts": 0.0,
         },
+        "completion_cache": {},
         "prompt_injection": {
             "master_prompt": "",
             "master_learning_mode": "full",

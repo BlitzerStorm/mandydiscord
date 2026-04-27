@@ -62,8 +62,10 @@ class IntelligenceControlsCog(commands.Cog):
         model_line = ", ".join(f"{name}={count}" for name, count in list(models.items())[:6]) if isinstance(models, dict) else ""
         await ctx.send(
             (
-                f"AI telemetry calls=`{row['calls']}` cache_hits=`{row['cache_hits']}` successes=`{row['successes']}` "
-                f"failures=`{row['failures']}` fallbacks=`{row['fallbacks']}`\n"
+                f"AI telemetry calls=`{row['calls']}` cache_hits=`{row['cache_hits']}` "
+                f"inflight_joins=`{row.get('inflight_joins', 0)}` budget_throttles=`{row.get('budget_throttles', 0)}`\n"
+                f"successes=`{row['successes']}` failures=`{row['failures']}` fallbacks=`{row['fallbacks']}` "
+                f"persistent_cache_rows=`{row.get('persistent_cache_rows', 0)}`\n"
                 f"tokens~`{row['estimated_tokens']}` cost~`${row['estimated_cost_usd']}` "
                 f"cooldown=`{row['cooldown_remaining_sec']}s` failure_streak=`{row['failure_streak']}`\n"
                 f"models: {model_line or '(none)'}"

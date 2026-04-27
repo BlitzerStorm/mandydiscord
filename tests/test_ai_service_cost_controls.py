@@ -32,6 +32,20 @@ class StubAIService(AIService):
         return f"ok-{self.calls}"
 
 
+class SlowStubAIService(StubAIService):
+    async def _chat_completion(
+        self,
+        messages,
+        max_tokens: int = 180,
+        temperature: float = 0.7,
+        *,
+        api_key: str,
+        model: str,
+    ) -> str:
+        await asyncio.sleep(0.05)
+        return await super()._chat_completion(messages, max_tokens, temperature, api_key=api_key, model=model)
+
+
 def _make_settings(tmp_path: Path) -> Settings:
     return Settings(
         discord_token="token",
@@ -78,6 +92,55 @@ def test_complete_text_uses_cache(tmp_path: Path) -> None:
     assert first == "ok-1"
     assert second == "ok-1"
     assert ai.calls == 1
+
+
+def test_complete_text_uses_persistent_cache_across_instances(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = StubAIService(settings, store)
+
+    first = asyncio.run(ai.complete_text(system_prompt="sys", user_prompt="persist me", cache_ttl_sec=120))
+    second_ai = StubAIService(settings, store)
+    second = asyncio.run(second_ai.complete_text(system_prompt="sys", user_prompt="persist me", cache_ttl_sec=120))
+
+    assert first == "ok-1"
+    assert second == "ok-1"
+    assert second_ai.calls == 0
+    assert second_ai.telemetry_snapshot()["persistent_cache_rows"] >= 1
+
+
+def test_complete_text_coalesces_inflight_duplicate_calls(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = SlowStubAIService(settings, store)
+
+    async def run_pair() -> tuple[str | None, str | None]:
+        return await asyncio.gather(
+            ai.complete_text(system_prompt="sys", user_prompt="same", cache_ttl_sec=120),
+            ai.complete_text(system_prompt="sys", user_prompt="same", cache_ttl_sec=120),
+        )
+
+    first, second = asyncio.run(run_pair())
+
+    assert first == "ok-1"
+    assert second == "ok-1"
+    assert ai.calls == 1
+    assert ai.telemetry_snapshot()["inflight_joins"] == 1
+
+
+def test_api_budget_throttles_calls(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = StubAIService(settings, store)
+    ai.edit_self_config("max_ai_calls_per_minute", "1", source="test")
+
+    first = asyncio.run(ai.complete_text(system_prompt="s", user_prompt="u1", cache_ttl_sec=0))
+    second = asyncio.run(ai.complete_text(system_prompt="s", user_prompt="u2", cache_ttl_sec=0))
+
+    assert first == "ok-1"
+    assert second is None
+    assert ai.calls == 1
+    assert ai.telemetry_snapshot()["budget_throttles"] >= 1
 
 
 def test_api_cooldown_short_circuits_calls(tmp_path: Path) -> None:

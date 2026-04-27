@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -102,6 +103,9 @@ SELF_EDIT_LOG_MAX_ROWS = 240
 SUPER_USER_ID = 741470965359443970
 COMPLETION_CACHE_MAX_ROWS = 320
 COMPLETION_CACHE_DEFAULT_TTL_SEC = 80
+PERSISTENT_COMPLETION_CACHE_MAX_ROWS = 800
+API_CALL_WINDOW_SEC = 60
+API_CALL_WINDOW_DEFAULT_MAX = 18
 API_FAILURE_COOLDOWN_BASE_SEC = 20
 API_FAILURE_COOLDOWN_MAX_SEC = 5 * 60
 
@@ -295,6 +299,8 @@ class AIService:
         self._passwords_cache: dict[str, str] | None = None
         self._rng = random.Random()
         self._completion_cache: dict[str, dict[str, Any]] = {}
+        self._inflight_completions: dict[str, asyncio.Task[str | None]] = {}
+        self._api_call_timestamps: deque[float] = deque(maxlen=200)
         self._api_cooldown_until_ts: float = 0.0
         self._api_failure_streak: int = 0
         self._http_session: aiohttp.ClientSession | None = None
@@ -2399,7 +2405,15 @@ class AIService:
             value = int(raw)
         except (TypeError, ValueError):
             value = COMPLETION_CACHE_DEFAULT_TTL_SEC
-        return max(0, min(15 * 60, value))
+        return max(0, min(60 * 60, value))
+
+    def _max_api_calls_per_window(self) -> int:
+        raw = self.read_self_config("max_ai_calls_per_minute", API_CALL_WINDOW_DEFAULT_MAX)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = API_CALL_WINDOW_DEFAULT_MAX
+        return max(1, min(120, value))
 
     def _max_user_prompt_chars(self) -> int:
         raw = self.read_self_config("max_user_prompt_chars", 6000)
@@ -2436,6 +2450,10 @@ class AIService:
 
     def _get_cached_completion(self, key: str) -> str | None:
         row = self._completion_cache.get(key)
+        source = "memory"
+        if not isinstance(row, dict):
+            row = self._persistent_completion_cache().get(key)
+            source = "persistent"
         if not isinstance(row, dict):
             return None
         try:
@@ -2444,15 +2462,29 @@ class AIService:
             expires_ts = 0.0
         if expires_ts <= time.time():
             self._completion_cache.pop(key, None)
+            self._persistent_completion_cache().pop(key, None)
+            self.store.touch()
             return None
         value = str(row.get("text", "")).strip()
+        if value and source == "persistent":
+            self._completion_cache[key] = dict(row)
         return value or None
+
+    def _persistent_completion_cache(self) -> dict[str, Any]:
+        root = self._ai_root()
+        cache = root.setdefault("completion_cache", {})
+        if not isinstance(cache, dict):
+            root["completion_cache"] = {}
+            cache = root["completion_cache"]
+        return cache
 
     def telemetry_snapshot(self) -> dict[str, Any]:
         telemetry = self._telemetry_root()
         return {
             "calls": int(telemetry.get("calls", 0) or 0),
             "cache_hits": int(telemetry.get("cache_hits", 0) or 0),
+            "inflight_joins": int(telemetry.get("inflight_joins", 0) or 0),
+            "budget_throttles": int(telemetry.get("budget_throttles", 0) or 0),
             "successes": int(telemetry.get("successes", 0) or 0),
             "failures": int(telemetry.get("failures", 0) or 0),
             "fallbacks": int(telemetry.get("fallbacks", 0) or 0),
@@ -2461,6 +2493,7 @@ class AIService:
             "cooldown_remaining_sec": max(0, int(self._api_cooldown_until_ts - time.time())),
             "failure_streak": int(self._api_failure_streak),
             "models": dict(telemetry.get("models", {})) if isinstance(telemetry.get("models"), dict) else {},
+            "persistent_cache_rows": len(self._persistent_completion_cache()),
         }
 
     def _telemetry_root(self) -> dict[str, Any]:
@@ -2471,6 +2504,8 @@ class AIService:
             telemetry = root["telemetry"]
         telemetry.setdefault("calls", 0)
         telemetry.setdefault("cache_hits", 0)
+        telemetry.setdefault("inflight_joins", 0)
+        telemetry.setdefault("budget_throttles", 0)
         telemetry.setdefault("successes", 0)
         telemetry.setdefault("failures", 0)
         telemetry.setdefault("fallbacks", 0)
@@ -2494,6 +2529,10 @@ class AIService:
             telemetry["calls"] = int(telemetry.get("calls", 0) or 0) + 1
         elif event == "cache_hit":
             telemetry["cache_hits"] = int(telemetry.get("cache_hits", 0) or 0) + 1
+        elif event == "inflight_join":
+            telemetry["inflight_joins"] = int(telemetry.get("inflight_joins", 0) or 0) + 1
+        elif event == "budget_throttle":
+            telemetry["budget_throttles"] = int(telemetry.get("budget_throttles", 0) or 0) + 1
         elif event == "success":
             telemetry["successes"] = int(telemetry.get("successes", 0) or 0) + 1
         elif event == "failure":
@@ -2519,6 +2558,16 @@ class AIService:
             "ts": now,
             "expires_ts": now + ttl_sec,
         }
+        persistent = self._persistent_completion_cache()
+        persistent[key] = dict(self._completion_cache[key])
+        if len(persistent) > PERSISTENT_COMPLETION_CACHE_MAX_ROWS:
+            ranked_persistent = sorted(
+                persistent.items(),
+                key=lambda item: float(item[1].get("expires_ts", 0.0) or 0.0) if isinstance(item[1], dict) else 0.0,
+            )
+            for stale_key, _row in ranked_persistent[: len(persistent) - PERSISTENT_COMPLETION_CACHE_MAX_ROWS]:
+                persistent.pop(stale_key, None)
+        self.store.touch()
         if len(self._completion_cache) <= COMPLETION_CACHE_MAX_ROWS:
             return
         ranked = sorted(
@@ -2530,6 +2579,15 @@ class AIService:
 
     def _api_on_cooldown(self) -> bool:
         return self._api_cooldown_until_ts > time.time()
+
+    def _api_budget_available(self) -> bool:
+        now = time.time()
+        while self._api_call_timestamps and (now - self._api_call_timestamps[0]) > API_CALL_WINDOW_SEC:
+            self._api_call_timestamps.popleft()
+        return len(self._api_call_timestamps) < self._max_api_calls_per_window()
+
+    def _note_api_call_started(self) -> None:
+        self._api_call_timestamps.append(time.time())
 
     def _note_api_success(self) -> None:
         self._api_failure_streak = 0
@@ -2579,9 +2637,49 @@ class AIService:
             return cached
         if self._api_on_cooldown():
             return None
+        inflight = self._inflight_completions.get(cache_key)
+        if inflight is not None and not inflight.done():
+            self._note_ai_telemetry("inflight_join")
+            return await inflight
+        task = asyncio.create_task(
+            self._complete_text_uncached(
+                cache_key=cache_key,
+                safe_system=safe_system,
+                safe_user=safe_user,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                api_key=api_key,
+                ttl=ttl,
+            )
+        )
+        self._inflight_completions[cache_key] = task
+        try:
+            return await task
+        finally:
+            if self._inflight_completions.get(cache_key) is task:
+                self._inflight_completions.pop(cache_key, None)
+
+    async def _complete_text_uncached(
+        self,
+        *,
+        cache_key: str,
+        safe_system: str,
+        safe_user: str,
+        max_tokens: int,
+        temperature: float,
+        api_key: str,
+        ttl: int,
+    ) -> str | None:
+        if not self._api_budget_available():
+            self._note_ai_telemetry("budget_throttle")
+            return None
         candidates = self._model_candidates()
         for index, model in enumerate(candidates):
             try:
+                if not self._api_budget_available():
+                    self._note_ai_telemetry("budget_throttle")
+                    return None
+                self._note_api_call_started()
                 self._note_ai_telemetry("call", model=model, prompt_chars=len(safe_system) + len(safe_user), fallback=index > 0)
                 output = await self._chat_completion(
                     [
@@ -2622,6 +2720,9 @@ class AIService:
             return None
         if self._api_on_cooldown():
             return None
+        if not self._api_budget_available():
+            self._note_ai_telemetry("budget_throttle")
+            return None
         prompt_limit = self._max_user_prompt_chars()
         safe_system = self._clamp_prompt(system_prompt, limit=max(1200, int(prompt_limit * 0.65)))
         safe_user = self._clamp_prompt(user_prompt, limit=prompt_limit)
@@ -2635,6 +2736,10 @@ class AIService:
         candidates = self._vision_model_candidates()
         for index, model in enumerate(candidates):
             try:
+                if not self._api_budget_available():
+                    self._note_ai_telemetry("budget_throttle")
+                    return None
+                self._note_api_call_started()
                 self._note_ai_telemetry("call", model=model, prompt_chars=len(safe_system) + len(safe_user), fallback=index > 0)
                 output = await self._chat_completion(
                     messages,
@@ -3794,6 +3899,7 @@ class AIService:
         root.setdefault("capabilities", {})
         root.setdefault("privacy", {"paused_user_ids": [], "audit_log": []})
         root.setdefault("telemetry", {})
+        root.setdefault("completion_cache", {})
         root.setdefault(
             "prompt_injection",
             {
