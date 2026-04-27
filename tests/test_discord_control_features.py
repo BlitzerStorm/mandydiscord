@@ -113,3 +113,31 @@ def test_autonomy_approval_executes_payload(tmp_path: Path) -> None:
     assert "executed=`True`" in message
     assert control.payload["action"] == "rename_channel"
     assert bot.store.data["autonomy_policy"]["proposals"][0]["status"] == "executed"
+
+
+def test_autonomy_extra_allow_requires_approval_for_external_contact(tmp_path: Path) -> None:
+    bot = MandyBot(_settings(tmp_path))
+    asyncio.run(bot.store.load())
+
+    ok, note = bot._add_autonomy_extra_action("send_message")  # noqa: SLF001
+    assert ok is False
+    assert "approval" in note
+
+    bot._autonomy_policy_root()["require_approval"] = True  # noqa: SLF001
+    ok, note = bot._add_autonomy_extra_action("send_message")  # noqa: SLF001
+
+    assert ok is True
+    assert "send_message" in bot._autonomy_extra_allowed_actions()  # noqa: SLF001
+
+
+def test_autonomy_external_contact_blocked_without_approval_mode(tmp_path: Path) -> None:
+    bot = MandyBot(_settings(tmp_path))
+    asyncio.run(bot.store.load())
+    root = bot._autonomy_policy_root()  # noqa: SLF001
+    root["allowed_actions"] = ["send_message"]
+    root["require_approval"] = False
+
+    allowed, why = bot._is_autonomous_action_allowed(77, {"action": "send_message", "channel_id": 55})  # noqa: SLF001
+
+    assert allowed is False
+    assert why == "external_contact_requires_approval_mode"

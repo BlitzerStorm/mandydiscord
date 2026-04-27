@@ -116,6 +116,7 @@ AUTONOMY_GOD_ALLOWED_ACTIONS = AUTONOMY_ASSIST_ALLOWED_ACTIONS.union(
     }
 )
 AUTONOMY_DESTRUCTIVE_ACTIONS = {"delete_channel", "delete_role", "bulk_delete", "kick_member", "set_server_name"}
+AUTONOMY_RESTRICTED_EXTERNAL_ACTIONS = {"send_message", "invite_user", "send_shadow_message"}
 AUTONOMY_ACTION_MIN_GAP_SEC = 10 * 60
 AUTONOMY_ACTION_WINDOW_SEC = 60 * 60
 AUTONOMY_ACTION_MAX_PER_WINDOW = 2
@@ -423,9 +424,11 @@ class MandyBot(commands.Bot):
             want = mode.strip().casefold()
             if want in {"show", "status"}:
                 current = self._autonomy_mode()
+                approval = bool(self._autonomy_policy_root().get("require_approval", False))
                 await ctx.send(
                     f"Autonomy mode: `{current}` "
                     f"allowed_actions=`{len(self._autonomy_allowed_actions(current))}` "
+                    f"approval_required=`{approval}` "
                     f"window_max=`{AUTONOMY_ACTION_MAX_PER_WINDOW}`/{AUTONOMY_ACTION_WINDOW_SEC // 60}m"
                 )
                 return
@@ -437,6 +440,49 @@ class MandyBot(commands.Bot):
             self.store.touch()
             await ctx.send(f"Autonomy mode set to `{want}`.")
 
+        @self.command(name="autonomyapproval")
+        @self._tier_check(90)
+        async def autonomyapproval(ctx: commands.Context, mode: str = "show") -> None:
+            root = self._autonomy_policy_root()
+            want = mode.strip().casefold()
+            if want in {"show", "status"}:
+                await ctx.send(f"Autonomy approval required: `{bool(root.get('require_approval', False))}`")
+                return
+            if want not in {"on", "off", "true", "false", "yes", "no"}:
+                await ctx.send("Usage: `!autonomyapproval show|on|off`")
+                return
+            enabled = want in {"on", "true", "yes"}
+            root["require_approval"] = enabled
+            self.store.touch()
+            await ctx.send(f"Autonomy approval required set to `{enabled}`.")
+
+        @self.group(name="autonomyallow", invoke_without_command=True)
+        @self._tier_check(90)
+        async def autonomyallow_group(ctx: commands.Context) -> None:
+            allowed = sorted(self._autonomy_allowed_actions())
+            extra = self._autonomy_extra_allowed_actions()
+            lines = [
+                f"Mode=`{self._autonomy_mode()}` total_allowed=`{len(allowed)}` extra=`{len(extra)}`",
+                f"Base/active: {', '.join(allowed[:30])}",
+            ]
+            if extra:
+                lines.append(f"Extra: {', '.join(extra)}")
+            await ctx.send("\n".join(lines)[:1900])
+
+        @autonomyallow_group.command(name="add")
+        @self._tier_check(90)
+        async def autonomyallow_add(ctx: commands.Context, action: str) -> None:
+            normalized = action.strip()
+            ok, note = self._add_autonomy_extra_action(normalized)
+            await ctx.send(f"Add `{normalized}` ok=`{ok}` {note}")
+
+        @autonomyallow_group.command(name="remove")
+        @self._tier_check(90)
+        async def autonomyallow_remove(ctx: commands.Context, action: str) -> None:
+            normalized = action.strip()
+            removed = self._remove_autonomy_extra_action(normalized)
+            await ctx.send(f"Remove `{normalized}` removed=`{removed}`")
+
         @self.command(name="autonomydash")
         @self._tier_check(70)
         async def autonomydash(ctx: commands.Context) -> None:
@@ -445,7 +491,8 @@ class MandyBot(commands.Bot):
             action_log = root.setdefault("action_log", [])
             pending = [row for row in proposals if isinstance(row, dict) and str(row.get("status", "")) == "pending"]
             lines = [
-                f"Autonomy mode=`{self._autonomy_mode()}` pending=`{len(pending)}` recent_actions=`{len(action_log) if isinstance(action_log, list) else 0}`",
+                f"Autonomy mode=`{self._autonomy_mode()}` approval_required=`{bool(root.get('require_approval', False))}` "
+                f"pending=`{len(pending)}` recent_actions=`{len(action_log) if isinstance(action_log, list) else 0}`",
             ]
             for row in pending[-8:]:
                 lines.append(
@@ -4515,6 +4562,47 @@ class MandyBot(commands.Bot):
             allowed.update(str(item).strip() for item in extra if str(item).strip())
         return allowed
 
+    def _autonomy_extra_allowed_actions(self) -> list[str]:
+        extra = self._autonomy_policy_root().get("allowed_actions", [])
+        if not isinstance(extra, list):
+            return []
+        return sorted({str(item).strip() for item in extra if str(item).strip()})
+
+    def _add_autonomy_extra_action(self, action: str) -> tuple[bool, str]:
+        normalized = str(action or "").strip()
+        if not normalized:
+            return (False, "missing action")
+        all_known = AUTONOMY_GOD_ALLOWED_ACTIONS.union(AUTONOMY_RESTRICTED_EXTERNAL_ACTIONS)
+        if normalized not in all_known:
+            return (False, "unknown action")
+        if normalized in AUTONOMY_DESTRUCTIVE_ACTIONS:
+            return (False, "destructive actions require `god` mode, not extra allow")
+        if normalized in AUTONOMY_RESTRICTED_EXTERNAL_ACTIONS and not bool(self._autonomy_policy_root().get("require_approval", False)):
+            return (False, "external-contact actions require `!autonomyapproval on`")
+        root = self._autonomy_policy_root()
+        extra = root.setdefault("allowed_actions", [])
+        if not isinstance(extra, list):
+            root["allowed_actions"] = []
+            extra = root["allowed_actions"]
+        if normalized not in {str(item) for item in extra}:
+            extra.append(normalized)
+            self.store.touch()
+        return (True, "allowed")
+
+    def _remove_autonomy_extra_action(self, action: str) -> bool:
+        normalized = str(action or "").strip()
+        root = self._autonomy_policy_root()
+        extra = root.setdefault("allowed_actions", [])
+        if not isinstance(extra, list):
+            root["allowed_actions"] = []
+            return False
+        before = len(extra)
+        extra[:] = [item for item in extra if str(item).strip() != normalized]
+        changed = len(extra) != before
+        if changed:
+            self.store.touch()
+        return changed
+
     def _autonomy_action_rate_limited(self, guild_id: int) -> bool:
         now = time.time()
         root = self._autonomy_policy_root()
@@ -4709,6 +4797,8 @@ class MandyBot(commands.Bot):
             return (False, "rate_limited")
         if action in AUTONOMY_DESTRUCTIVE_ACTIONS and mode != "god":
             return (False, "destructive_requires_god_mode")
+        if action in AUTONOMY_RESTRICTED_EXTERNAL_ACTIONS and not bool(self._autonomy_policy_root().get("require_approval", False)):
+            return (False, "external_contact_requires_approval_mode")
         return (True, "ok")
 
     async def _execute_autonomous_server_action(self, message: discord.Message, payload: dict[str, Any]) -> None:
