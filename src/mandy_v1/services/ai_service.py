@@ -518,6 +518,7 @@ class AIService:
         reflection_block = self._context_block(self.reflection_prompt_block(guild_id, user_id), limit=700)
         fun_block = self._context_block(self.fun_mode_prompt_block(guild_id), limit=350)
         curiosity_block = self._context_block(self.curiosity_prompt_block(guild_id, user_id, topic), limit=350)
+        agency_block = self._context_block(self.agency_prompt_block(), limit=350)
         injection = self.get_prompt_injection(guild_id)
         guild_prompt = self._context_block(injection.get("guild_prompt", ""), limit=4000)
         global_prompt = self._context_block(injection.get("master_prompt", ""), limit=4000)
@@ -550,6 +551,7 @@ class AIService:
             reflection_block,
             fun_block,
             curiosity_block,
+            agency_block,
             memory_block,
             runtime_block,
             agent_block,
@@ -609,6 +611,64 @@ class AIService:
 
     def compute_attention_score(self, message: discord.Message, bot_user_id: int) -> float:
         return float(self.attention_context(message, bot_user_id).get("score", 0.0) or 0.0)
+
+    def agency_policy(self) -> dict[str, Any]:
+        root = self._ai_root()
+        policy = root.setdefault("agency", {})
+        if not isinstance(policy, dict):
+            root["agency"] = {}
+            policy = root["agency"]
+        policy.setdefault("enabled", True)
+        policy.setdefault("ambient_min_score", 0.55)
+        policy.setdefault("reply_min_score", 0.78)
+        policy.setdefault("decision_log", [])
+        return policy
+
+    def set_agency_policy(
+        self,
+        *,
+        enabled: bool | None = None,
+        ambient_min_score: float | None = None,
+        reply_min_score: float | None = None,
+    ) -> dict[str, Any]:
+        policy = self.agency_policy()
+        if enabled is not None:
+            policy["enabled"] = bool(enabled)
+        if ambient_min_score is not None:
+            policy["ambient_min_score"] = round(max(0.0, min(1.0, float(ambient_min_score))), 3)
+        if reply_min_score is not None:
+            policy["reply_min_score"] = round(max(0.0, min(1.0, float(reply_min_score))), 3)
+        self.store.touch()
+        return dict(policy)
+
+    def agency_status(self) -> dict[str, Any]:
+        policy = self.agency_policy()
+        log = policy.setdefault("decision_log", [])
+        return {
+            "enabled": bool(policy.get("enabled", True)),
+            "ambient_min_score": float(policy.get("ambient_min_score", 0.55)),
+            "reply_min_score": float(policy.get("reply_min_score", 0.78)),
+            "decisions": len(log) if isinstance(log, list) else 0,
+            "last": log[-1] if isinstance(log, list) and log else {},
+        }
+
+    def agency_prompt_block(self) -> str:
+        status = self.agency_status()
+        last = status.get("last", {})
+        last_line = ""
+        if isinstance(last, dict) and last:
+            last_line = (
+                f"\nLast choice: action={last.get('action')} reason={last.get('reason')} "
+                f"score={last.get('score')} addressed={last.get('addressed')}"
+            )
+        return (
+            "[AGENCY]\n"
+            f"Enabled: {status['enabled']}\n"
+            f"Ambient react threshold: {status['ambient_min_score']:.2f}\n"
+            f"Ambient reply threshold: {status['reply_min_score']:.2f}\n"
+            "Directive: choose to ignore, react, or reply based on relevance, social timing, permissions, and cooldowns."
+            f"{last_line}"
+        )
 
     def _context_block(self, text: str, *, limit: int) -> str:
         clean = str(text or "").strip()
@@ -2037,40 +2097,118 @@ class AIService:
             now=now,
         )
         if not addressed:
-            return ChatDirective(action="ignore", reason="not_addressed", still_talking=still_talking, attention_score=0.0)
+            directive = self._decide_ambient_agency_action(
+                message,
+                bot_user_id=bot_user_id,
+                still_talking=still_talking,
+                recent_bot_reply=recent_bot_reply,
+                channel_cooldown=channel_cooldown,
+            )
+            self._record_agency_decision(message, directive, addressed=False)
+            return directive
         attention = self.attention_context(message, bot_user_id)
         score = float(attention.get("score", 0.0) or 0.0)
 
         if has_image and user_reply_gap < USER_REPLY_MIN_GAP_SEC and burst_count <= 1 and score < 1.0:
-            return ChatDirective(action="ignore", reason="image_recently_replied", still_talking=still_talking, attention_score=score)
+            directive = ChatDirective(action="ignore", reason="image_recently_replied", still_talking=still_talking, attention_score=score)
+            self._record_agency_decision(message, directive, addressed=True)
+            return directive
 
         if channel_cooldown and score < 1.0:
             score = max(0.0, score - 0.18)
 
         if score < 0.2:
-            return ChatDirective(action="ignore", reason="attention_ignore", still_talking=still_talking, attention_score=score)
+            directive = ChatDirective(action="ignore", reason="attention_ignore", still_talking=still_talking, attention_score=score)
+            self._record_agency_decision(message, directive, addressed=True)
+            return directive
         if score <= 0.45:
-            return ChatDirective(
+            directive = ChatDirective(
                 action="react",
                 reason="attention_react",
                 emoji=self._pick_reaction_emoji(content),
                 still_talking=still_talking,
                 attention_score=score,
             )
+            self._record_agency_decision(message, directive, addressed=True)
+            return directive
         if score <= 0.65:
             if self._chance(0.5):
                 mode = "direct_reply" if (has_image or self._mentions_mandy(message, bot_user_id) or direct_request) else "reply"
-                return ChatDirective(action=mode, reason="attention_mixed_reply", still_talking=still_talking or recent_bot_reply, attention_score=score)
-            return ChatDirective(
+                directive = ChatDirective(action=mode, reason="attention_mixed_reply", still_talking=still_talking or recent_bot_reply, attention_score=score)
+                self._record_agency_decision(message, directive, addressed=True)
+                return directive
+            directive = ChatDirective(
                 action="react",
                 reason="attention_mixed_react",
                 emoji=self._pick_reaction_emoji(content),
                 still_talking=still_talking,
                 attention_score=score,
             )
+            self._record_agency_decision(message, directive, addressed=True)
+            return directive
 
         mode = "direct_reply" if (has_image or self._mentions_mandy(message, bot_user_id) or direct_request) else "reply"
-        return ChatDirective(action=mode, reason="attention_reply", still_talking=still_talking or recent_bot_reply, attention_score=score)
+        directive = ChatDirective(action=mode, reason="attention_reply", still_talking=still_talking or recent_bot_reply, attention_score=score)
+        self._record_agency_decision(message, directive, addressed=True)
+        return directive
+
+    def _decide_ambient_agency_action(
+        self,
+        message: discord.Message,
+        *,
+        bot_user_id: int,
+        still_talking: bool,
+        recent_bot_reply: bool,
+        channel_cooldown: bool,
+    ) -> ChatDirective:
+        policy = self.agency_policy()
+        if not bool(policy.get("enabled", True)):
+            return ChatDirective(action="ignore", reason="agency_off", still_talking=still_talking, attention_score=0.0)
+        permission_intel = getattr(self.runtime_coordinator, "permission_intelligence", None) if self.runtime_coordinator is not None else None
+        if permission_intel is not None:
+            try:
+                if not bool(permission_intel.voice_policy().get("ambient_chat", True)):
+                    return ChatDirective(action="ignore", reason="ambient_off", still_talking=still_talking, attention_score=0.0)
+            except Exception:  # noqa: BLE001
+                pass
+        score = self.compute_attention_score(message, bot_user_id)
+        if channel_cooldown:
+            score = max(0.0, score - 0.2)
+        ambient_min = float(policy.get("ambient_min_score", 0.55))
+        reply_min = float(policy.get("reply_min_score", 0.78))
+        if score < ambient_min:
+            return ChatDirective(action="ignore", reason="agency_attention_low", still_talking=still_talking, attention_score=score)
+        if score >= reply_min and self._chance(0.35):
+            return ChatDirective(action="reply", reason="agency_ambient_reply", still_talking=still_talking or recent_bot_reply, attention_score=score)
+        return ChatDirective(
+            action="react",
+            reason="agency_ambient_react",
+            emoji=self._pick_reaction_emoji(str(message.content or "")),
+            still_talking=still_talking,
+            attention_score=score,
+        )
+
+    def _record_agency_decision(self, message: discord.Message, directive: ChatDirective, *, addressed: bool) -> None:
+        policy = self.agency_policy()
+        log = policy.setdefault("decision_log", [])
+        if not isinstance(log, list):
+            policy["decision_log"] = []
+            log = policy["decision_log"]
+        log.append(
+            {
+                "ts": time.time(),
+                "guild_id": int(message.guild.id) if message.guild else 0,
+                "channel_id": int(getattr(message.channel, "id", 0) or 0),
+                "user_id": int(getattr(message.author, "id", 0) or 0),
+                "action": directive.action,
+                "reason": directive.reason,
+                "score": round(float(directive.attention_score), 3),
+                "addressed": bool(addressed),
+            }
+        )
+        if len(log) > 500:
+            del log[: len(log) - 500]
+        self.store.touch()
 
     def note_bot_action(self, channel_id: int, action: str, user_id: int | None = None) -> None:
         now = time.time()
@@ -3900,6 +4038,7 @@ class AIService:
         root.setdefault("privacy", {"paused_user_ids": [], "audit_log": []})
         root.setdefault("telemetry", {})
         root.setdefault("completion_cache", {})
+        root.setdefault("agency", {"enabled": True, "ambient_min_score": 0.55, "reply_min_score": 0.78, "decision_log": []})
         root.setdefault(
             "prompt_injection",
             {

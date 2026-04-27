@@ -141,6 +141,12 @@ DEFAULT_STORE: dict[str, Any] = {
             "last_call_ts": 0.0,
         },
         "completion_cache": {},
+        "agency": {
+            "enabled": True,
+            "ambient_min_score": 0.55,
+            "reply_min_score": 0.78,
+            "decision_log": [],
+        },
         "prompt_injection": {
             "master_prompt": "",
             "master_learning_mode": "full",

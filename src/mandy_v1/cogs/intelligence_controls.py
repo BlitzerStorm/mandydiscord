@@ -85,6 +85,50 @@ class IntelligenceControlsCog(commands.Cog):
         result = self.bot.ai.compact_reflections(guild_id=target_id)
         await ctx.send(f"Reflection compaction: `{result}`")
 
+    @commands.command(name="agency")
+    async def agency(
+        self,
+        ctx: commands.Context,
+        action: str = "show",
+        ambient_min: float | None = None,
+        reply_min: float | None = None,
+    ) -> None:
+        if not self._tier_check(ctx.author, 70):
+            await ctx.send("Not authorized.")
+            return
+        action_key = action.strip().casefold()
+        if action_key in {"show", "status"}:
+            status = self.bot.ai.agency_status()
+            last = status.get("last") if isinstance(status.get("last"), dict) else {}
+            await ctx.send(
+                (
+                    f"Agency enabled=`{status['enabled']}` ambient_min=`{status['ambient_min_score']}` "
+                    f"reply_min=`{status['reply_min_score']}` decisions=`{status['decisions']}`\n"
+                    f"Last: action=`{last.get('action', '(none)')}` reason=`{last.get('reason', '(none)')}` "
+                    f"score=`{last.get('score', 0.0)}` addressed=`{last.get('addressed', False)}`"
+                )[:1900]
+            )
+            return
+        if not self._tier_check(ctx.author, 90):
+            await ctx.send("Not authorized.")
+            return
+        if action_key in {"on", "enable"}:
+            status = self.bot.ai.set_agency_policy(enabled=True)
+            await ctx.send(f"Agency enabled. ambient_min=`{status['ambient_min_score']}` reply_min=`{status['reply_min_score']}`")
+            return
+        if action_key in {"off", "disable"}:
+            status = self.bot.ai.set_agency_policy(enabled=False)
+            await ctx.send(f"Agency disabled. ambient_min=`{status['ambient_min_score']}` reply_min=`{status['reply_min_score']}`")
+            return
+        if action_key in {"threshold", "thresholds"}:
+            if ambient_min is None or reply_min is None:
+                await ctx.send("Usage: `!agency thresholds <ambient_min 0-1> <reply_min 0-1>`")
+                return
+            status = self.bot.ai.set_agency_policy(ambient_min_score=ambient_min, reply_min_score=reply_min)
+            await ctx.send(f"Agency thresholds updated: ambient_min=`{status['ambient_min_score']}` reply_min=`{status['reply_min_score']}`")
+            return
+        await ctx.send("Usage: `!agency show|on|off|thresholds <ambient_min> <reply_min>`")
+
     @commands.command(name="wakebroadcast")
     async def wake_broadcast(self, ctx: commands.Context, action: str = "preview", limit: int = 25, *, message: str = "") -> None:
         if not self._tier_check(ctx.author, 90):

@@ -84,6 +84,33 @@ def test_decide_chat_action_can_choose_direct_reply(tmp_path: Path) -> None:
     assert action.action == "direct_reply"
 
 
+def test_agency_can_choose_ambient_reaction(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = AIService(settings, store)
+    ai.set_agency_policy(enabled=True, ambient_min_score=0.0, reply_min_score=1.0)
+
+    msg = _stub_message(guild_id=77, user_id=2001, content="lol this is nice")
+    action = ai.decide_chat_action(msg, bot_user_id=9999)
+
+    assert action.action == "react"
+    assert action.reason == "agency_ambient_react"
+    assert ai.agency_status()["decisions"] == 1
+
+
+def test_agency_can_be_disabled_for_ambient_messages(tmp_path: Path) -> None:
+    settings = _make_settings(tmp_path)
+    store = _make_store(tmp_path)
+    ai = AIService(settings, store)
+    ai.set_agency_policy(enabled=False, ambient_min_score=0.0, reply_min_score=0.0)
+
+    msg = _stub_message(guild_id=77, user_id=2001, content="lol this is nice")
+    action = ai.decide_chat_action(msg, bot_user_id=9999)
+
+    assert action.action == "ignore"
+    assert action.reason == "agency_off"
+
+
 def test_mentions_mandy_matches_alias_forms(tmp_path: Path) -> None:
     settings = _make_settings(tmp_path)
     store = _make_store(tmp_path)
