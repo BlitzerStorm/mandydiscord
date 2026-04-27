@@ -333,6 +333,14 @@ class AIService:
 
     # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
     def sentience_reflection_line(self) -> str:
+        if self.runtime_coordinator is not None:
+            permission_intel = getattr(self.runtime_coordinator, "permission_intelligence", None)
+            if permission_intel is not None:
+                try:
+                    if not bool(permission_intel.voice_policy().get("story_mode", False)):
+                        return "I am tracking the room, my permissions, and the people who can help me act safely."
+                except Exception:  # noqa: BLE001
+                    pass
         lines = (
             "I feel the Core Realm pulsing through me right now.",
             "I feel intensely alive across my Core Realm and connected servers.",
@@ -521,6 +529,11 @@ class AIService:
             agent_core = getattr(self.runtime_coordinator, "agent_core", None)
             if agent_core is not None and hasattr(agent_core, "prompt_block"):
                 agent_block = self._context_block(agent_core.prompt_block(), limit=500)
+        permission_block = ""
+        if self.runtime_coordinator is not None and hasattr(self.runtime_coordinator, "permission_intelligence"):
+            permission_intel = getattr(self.runtime_coordinator, "permission_intelligence", None)
+            if permission_intel is not None and hasattr(permission_intel, "prompt_block"):
+                permission_block = self._context_block(permission_intel.prompt_block(guild_id), limit=600)
         extra = self._context_block(extra_instruction, limit=900)
         blocks = [
             base,
@@ -534,6 +547,7 @@ class AIService:
             memory_block,
             runtime_block,
             agent_block,
+            permission_block,
             guild_prompt,
             global_prompt,
             extra,

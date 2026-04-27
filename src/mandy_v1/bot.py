@@ -32,6 +32,7 @@ from mandy_v1.services.logger_service import LoggerService
 from mandy_v1.services.mirror_service import MirrorService
 from mandy_v1.services.onboarding_service import OnboardingService
 from mandy_v1.services.persona_service import PersonaService
+from mandy_v1.services.permission_intelligence_service import PermissionIntelligenceService
 from mandy_v1.services.runtime_coordinator_service import RuntimeCoordinatorService
 from mandy_v1.services.self_model_service import SelfModelService
 from mandy_v1.services.autonomy_engine import AutonomyEngine
@@ -261,6 +262,7 @@ class MandyBot(commands.Bot):
         self.dm_bridges = DMBridgeService(settings, self.store, self.logger)
         self.ai = AIService(settings, self.store)
         self.agent_core = AgentCoreService(self.store)
+        self.permission_intel = PermissionIntelligenceService(self.store, self.logger)
         self.emotion = EmotionService(self.store, self.ai)
         self.episodic = EpisodicMemoryService(self.store, self.ai)
         self.identity = IdentityService(self.store, self.ai)
@@ -297,6 +299,7 @@ class MandyBot(commands.Bot):
             autonomy_engine=self.autonomy,
             self_model_service=self.self_model,
             agent_core_service=self.agent_core,
+            permission_intelligence_service=self.permission_intel,
         )
         self.ai.attach_context_services(
             emotion=self.emotion,
@@ -486,6 +489,98 @@ class MandyBot(commands.Bot):
                 await ctx.send("Agent core directive updated.")
                 return
             await ctx.send("Usage: `!agentcore show|on|off|directive <text>`")
+
+        @self.command(name="permscan")
+        @self._tier_check(70)
+        async def permscan(ctx: commands.Context, guild_id: int | None = None) -> None:
+            target_id = int(guild_id or (ctx.guild.id if isinstance(ctx.guild, discord.Guild) else 0))
+            if target_id <= 0:
+                await ctx.send("Run this in a server or pass a guild id.")
+                return
+            if not self._can_control_satellite(ctx.author, target_id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            guild = self.get_guild(target_id)
+            if guild is None:
+                await ctx.send(f"Guild `{target_id}` unavailable.")
+                return
+            row = self.permission_intel.scan_guild(guild)
+            missing = row.get("missing_capabilities", [])
+            authorities = row.get("authorities", [])
+            ask = authorities[0] if isinstance(authorities, list) and authorities else {}
+            await ctx.send(
+                (
+                    f"Permission scan `{guild.name}` (`{guild.id}`)\n"
+                    f"Missing: `{', '.join(missing) if isinstance(missing, list) and missing else 'none'}`\n"
+                    f"Best authority: `{ask.get('label', 'unknown') if isinstance(ask, dict) else 'unknown'}` "
+                    f"reason=`{ask.get('reason', '') if isinstance(ask, dict) else ''}`"
+                )[:1900]
+            )
+
+        @self.command(name="authority")
+        @self._tier_check(50)
+        async def authority(ctx: commands.Context, guild_id: int | None = None) -> None:
+            target_id = int(guild_id or (ctx.guild.id if isinstance(ctx.guild, discord.Guild) else 0))
+            row = self.permission_intel.guild_snapshot(target_id)
+            if not row:
+                guild = self.get_guild(target_id)
+                if guild is None:
+                    await ctx.send("No scan yet and guild unavailable. Run `!permscan <guild_id>`.")
+                    return
+                row = self.permission_intel.scan_guild(guild)
+            authorities = row.get("authorities", [])
+            lines = [f"Likely authorities for `{target_id}`:"]
+            if isinstance(authorities, list):
+                for item in authorities[:10]:
+                    if isinstance(item, dict):
+                        lines.append(f"- <@{item.get('id', 0)}> {item.get('label', '')} score=`{item.get('score', 0)}` reason=`{item.get('reason', '')}`")
+            await ctx.send("\n".join(lines)[:1900])
+
+        @self.command(name="permask")
+        @self._tier_check(70)
+        async def permask(ctx: commands.Context, capability: str, guild_id: int | None = None, *, reason: str = "") -> None:
+            target_id = int(guild_id or (ctx.guild.id if isinstance(ctx.guild, discord.Guild) else 0))
+            if target_id <= 0:
+                await ctx.send("Run this in a server or pass a guild id.")
+                return
+            if not self._can_control_satellite(ctx.author, target_id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            ok, note = await self._ask_authority_for_permission(
+                guild_id=target_id,
+                capability=capability,
+                requester_id=ctx.author.id,
+                reason=reason or f"Mandy needs `{capability}` to complete requested Discord work.",
+            )
+            await ctx.send(note[:1900])
+
+        @self.command(name="storymode")
+        @self._tier_check(70)
+        async def storymode(ctx: commands.Context, mode: str = "show") -> None:
+            want = mode.strip().casefold()
+            if want in {"show", "status"}:
+                policy = self.permission_intel.voice_policy()
+                await ctx.send(f"Story/lore mode: `{bool(policy.get('story_mode', False))}`")
+                return
+            if want not in {"on", "off", "true", "false", "yes", "no"}:
+                await ctx.send("Usage: `!storymode show|on|off`")
+                return
+            policy = self.permission_intel.set_voice_policy(story_mode=want in {"on", "true", "yes"})
+            await ctx.send(f"Story/lore mode set to `{bool(policy.get('story_mode', False))}`.")
+
+        @self.command(name="ambient")
+        @self._tier_check(70)
+        async def ambient(ctx: commands.Context, mode: str = "show") -> None:
+            want = mode.strip().casefold()
+            if want in {"show", "status"}:
+                policy = self.permission_intel.voice_policy()
+                await ctx.send(f"Ambient chat: `{bool(policy.get('ambient_chat', True))}` threshold=`{policy.get('ambient_threshold', 0.72)}`")
+                return
+            if want not in {"on", "off", "true", "false", "yes", "no"}:
+                await ctx.send("Usage: `!ambient show|on|off`")
+                return
+            policy = self.permission_intel.set_voice_policy(ambient_chat=want in {"on", "true", "yes"})
+            await ctx.send(f"Ambient chat set to `{bool(policy.get('ambient_chat', True))}`.")
 
         @self.group(name="autonomyallow", invoke_without_command=True)
         @self._tier_check(90)
@@ -4813,6 +4908,53 @@ class MandyBot(commands.Bot):
         if action == "export":
             payload = json.dumps(self.ai.export_user_memory(user_id), indent=2)[:1800]
             await self._send_interaction_message(interaction, f"```json\n{payload}\n```", ephemeral=True)
+
+    async def _ask_authority_for_permission(
+        self,
+        *,
+        guild_id: int,
+        capability: str,
+        requester_id: int,
+        reason: str,
+    ) -> tuple[bool, str]:
+        guild = self.get_guild(guild_id)
+        if guild is None:
+            return (False, f"Guild `{guild_id}` unavailable.")
+        snapshot = self.permission_intel.guild_snapshot(guild_id) or self.permission_intel.scan_guild(guild)
+        authorities = snapshot.get("authorities", [])
+        if not isinstance(authorities, list) or not authorities:
+            return (False, f"No authority candidates found for `{guild_id}`. Run `!permscan {guild_id}` after member cache is ready.")
+        target = next((row for row in authorities if isinstance(row, dict) and int(row.get("id", 0) or 0) > 0), None)
+        if not isinstance(target, dict):
+            return (False, "No valid authority target found.")
+        target_id = int(target.get("id", 0) or 0)
+        user = self.get_user(target_id)
+        if user is None:
+            with contextlib.suppress(Exception):
+                user = await self.fetch_user(target_id)
+        request = self.permission_intel.record_permission_request(
+            guild_id=guild_id,
+            capability=capability,
+            requester_id=requester_id,
+            target_user_id=target_id,
+            reason=reason,
+        )
+        text = (
+            f"Hi. Mandy is trying to complete work in `{guild.name}` but is missing capability `{capability}`.\n"
+            f"Reason: {reason[:500]}\n"
+            "If you want Mandy to do this, grant the needed Discord permission or use the Admin Hub controls."
+        )
+        if user is not None:
+            try:
+                await user.send(text[:1900])
+                return (True, f"Asked <@{target_id}> for `{capability}`. request_ts=`{request['ts']}`")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        channel = self._resolve_god_admin_channel() or self._resolve_admin_debug_channel()
+        if channel is not None:
+            await channel.send(f"<@{target_id}> {text}"[:1900])
+            return (True, f"Could not DM <@{target_id}>; posted request in `{channel.name}`.")
+        return (False, f"Could not DM <@{target_id}> and no admin channel was available.")
 
     def _is_autonomous_action_allowed(self, guild_id: int, payload: dict[str, Any]) -> tuple[bool, str]:
         action = str(payload.get("action", "")).strip()

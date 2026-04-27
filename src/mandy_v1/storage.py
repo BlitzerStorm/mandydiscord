@@ -88,6 +88,15 @@ DEFAULT_STORE: dict[str, Any] = {
             "blocked": 0,
         },
     },
+    "permission_intelligence": {
+        "guilds": {},
+        "requests": [],
+        "voice_policy": {
+            "story_mode": False,
+            "ambient_chat": True,
+            "ambient_threshold": 0.72,
+        },
+    },
     "autonomy_policy": {
         "mode": "assist",
         "allowed_actions": [],

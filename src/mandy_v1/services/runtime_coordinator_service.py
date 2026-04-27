@@ -26,6 +26,7 @@ class RuntimeCoordinatorService:
         autonomy_engine: Any | None = None,
         self_model_service: Any | None = None,
         agent_core_service: Any | None = None,
+        permission_intelligence_service: Any | None = None,
     ) -> None:
         self.storage = storage
         self.emotion = emotion_service
@@ -37,6 +38,7 @@ class RuntimeCoordinatorService:
         self.autonomy = autonomy_engine
         self.self_model = self_model_service
         self.agent_core = agent_core_service
+        self.permission_intelligence = permission_intelligence_service
         self._workspace_cache: dict[str, Any] = {"root": "", "ts": 0.0, "snapshot": {}}
 
     def workspace_snapshot(self, workspace_root: Path) -> dict[str, Any]:
@@ -172,6 +174,25 @@ class RuntimeCoordinatorService:
                 agent_lines = []
             if agent_lines:
                 lines.append("AgentCore: " + " | ".join(str(line) for line in agent_lines[:2])[:220])
+
+        if self.permission_intelligence is not None and hasattr(self.permission_intelligence, "guild_snapshot"):
+            try:
+                perm = self.permission_intelligence.guild_snapshot(guild_id)
+            except Exception:  # noqa: BLE001
+                perm = {}
+            if isinstance(perm, dict) and perm:
+                missing = perm.get("missing_capabilities", [])
+                authorities = perm.get("authorities", [])
+                authority = ""
+                if isinstance(authorities, list) and authorities:
+                    first = authorities[0]
+                    if isinstance(first, dict):
+                        authority = str(first.get("label", first.get("id", "")))[:60]
+                lines.append(
+                    "Perms: "
+                    f"missing={','.join(str(item) for item in missing[:4]) if isinstance(missing, list) else 'unknown'} "
+                    f"ask={authority or 'unknown'}"
+                )
 
         if self.self_model is not None and hasattr(self.self_model, "snapshot"):
             try:
