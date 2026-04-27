@@ -431,6 +431,32 @@ class MandyBot(commands.Bot):
             self.store.touch()
             await ctx.send(f"Autonomy mode set to `{want}`.")
 
+        @self.command(name="autonomydash")
+        @self._tier_check(70)
+        async def autonomydash(ctx: commands.Context) -> None:
+            root = self._autonomy_policy_root()
+            proposals = root.setdefault("proposals", [])
+            action_log = root.setdefault("action_log", [])
+            pending = [row for row in proposals if isinstance(row, dict) and str(row.get("status", "")) == "pending"]
+            lines = [
+                f"Autonomy mode=`{self._autonomy_mode()}` pending=`{len(pending)}` recent_actions=`{len(action_log) if isinstance(action_log, list) else 0}`",
+            ]
+            for row in pending[-8:]:
+                lines.append(
+                    f"- `#{row.get('id', 0)}` guild=`{row.get('guild_id', 0)}` action=`{row.get('action', '')}` "
+                    f"target=`{row.get('target', '')}` reason={str(row.get('reason', ''))[:90]}"
+                )
+            await ctx.send("\n".join(lines)[:1900])
+
+        @self.command(name="autonomyapprove")
+        @self._tier_check(90)
+        async def autonomyapprove(ctx: commands.Context, proposal_id: int) -> None:
+            row = self._mark_autonomy_proposal(proposal_id, status="approved", actor_id=ctx.author.id)
+            if not row:
+                await ctx.send(f"Proposal `#{proposal_id}` not found.")
+                return
+            await ctx.send(f"Proposal `#{proposal_id}` marked approved. Re-trigger the action context for live execution.")
+
         @self.command(name="selfcheck")
         @self._tier_check(70)
         async def selfcheck(ctx: commands.Context, mode: str = "local") -> None:
@@ -594,6 +620,111 @@ class MandyBot(commands.Bot):
             self.store.touch()
             self.logger.log("soc.role_tier_set", actor_id=ctx.author.id, role_name=role_name, tier=tier)
             await ctx.send(f"SOC role tier set: `{role_name}` -> `{tier}`")
+
+        @self.command(name="funmode")
+        async def funmode(ctx: commands.Context, scope: str = "this", mode: str = "show") -> None:
+            if scope.strip().casefold() in {"this", "here"}:
+                if not isinstance(ctx.guild, discord.Guild):
+                    await ctx.send("Run this in a server or pass a guild id.")
+                    return
+                guild_id = ctx.guild.id
+            elif scope.strip().isdigit():
+                guild_id = int(scope.strip())
+            else:
+                await ctx.send("Usage: `!funmode this|<guild_id> show|balanced|chaotic|cozy|serious|roast|lore|helper`")
+                return
+            if not self._can_control_satellite(ctx.author, guild_id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            want = mode.strip().casefold()
+            if want in {"show", "status"}:
+                await ctx.send(f"Fun mode for `{guild_id}`: {self.ai.fun_mode_summary(guild_id)}")
+                return
+            try:
+                row = self.ai.set_fun_mode(guild_id, want)
+            except ValueError as exc:
+                await ctx.send(str(exc))
+                return
+            self.logger.log("ai.fun_mode_set", actor_id=ctx.author.id, guild_id=guild_id, mode=row["mode"])
+            await ctx.send(f"Fun mode for `{guild_id}` set to `{row['mode']}`.")
+
+        @self.command(name="reflect")
+        async def reflect(ctx: commands.Context, guild_id: int | None = None) -> None:
+            target_id = int(guild_id or (ctx.guild.id if isinstance(ctx.guild, discord.Guild) else 0))
+            if target_id <= 0:
+                await ctx.send("Run this in a server or pass a guild id.")
+                return
+            if not self._can_control_satellite(ctx.author, target_id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            row = self.ai.reflection_summary(target_id)
+            lines = [
+                f"Reflection for `{target_id}` messages=`{row['message_count']}` updated=`{row['updated_ts'] or 'never'}`",
+                f"Traits: {', '.join(row['stable_traits']) or 'none'}",
+                f"Preferences: {', '.join(row['preferences'][:6]) or 'none'}",
+                f"Storylines: {', '.join(row['storylines'][:6]) or 'none'}",
+                f"Unresolved: {', '.join(row['unresolved_threads'][:6]) or 'none'}",
+            ]
+            await ctx.send("\n".join(lines)[:1900])
+
+        @self.command(name="skills")
+        @self._tier_check(50)
+        async def skills_cmd(ctx: commands.Context) -> None:
+            lines = ["Mandy capability modules:", *self.ai.capability_lines()[:12]]
+            await ctx.send("\n".join(lines)[:1900])
+
+        @self.group(name="memory", invoke_without_command=True)
+        async def memory_group(ctx: commands.Context, user_id: int | None = None) -> None:
+            if not isinstance(ctx.guild, discord.Guild):
+                await ctx.send("Run this in a server.")
+                return
+            if not self._can_control_satellite(ctx.author, ctx.guild.id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            if user_id is None:
+                await ctx.send("Usage: `!memory <user_id>`, `!memory pin|unpin|edit|forget <user_id> <index> ...`")
+                return
+            rows = self.ai.list_user_memory(ctx.guild.id, user_id, limit=15)
+            if not rows:
+                await ctx.send(f"No memory facts for `{user_id}`.")
+                return
+            lines = [f"Memory facts for `{user_id}`:"]
+            for row in rows:
+                pin = " pinned" if row["pinned"] else ""
+                lines.append(f"- `#{row['index']}`{pin} {row['fact']} kind={row['kind']} strength={row['strength']}")
+            await ctx.send("\n".join(lines)[:1900])
+
+        @memory_group.command(name="pin")
+        async def memory_pin(ctx: commands.Context, user_id: int, index: int) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or not self._can_control_satellite(ctx.author, ctx.guild.id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            ok = self.ai.pin_user_memory(ctx.guild.id, user_id, index, pinned=True)
+            await ctx.send(f"Memory `#{index}` pinned=`{ok}`.")
+
+        @memory_group.command(name="unpin")
+        async def memory_unpin(ctx: commands.Context, user_id: int, index: int) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or not self._can_control_satellite(ctx.author, ctx.guild.id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            ok = self.ai.pin_user_memory(ctx.guild.id, user_id, index, pinned=False)
+            await ctx.send(f"Memory `#{index}` unpinned=`{ok}`.")
+
+        @memory_group.command(name="edit")
+        async def memory_edit(ctx: commands.Context, user_id: int, index: int, *, fact_text: str) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or not self._can_control_satellite(ctx.author, ctx.guild.id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            ok = self.ai.edit_user_memory(ctx.guild.id, user_id, index, fact_text)
+            await ctx.send(f"Memory `#{index}` edited=`{ok}`.")
+
+        @memory_group.command(name="forget")
+        async def memory_forget(ctx: commands.Context, user_id: int, index: int) -> None:
+            if not isinstance(ctx.guild, discord.Guild) or not self._can_control_satellite(ctx.author, ctx.guild.id, min_tier=70):
+                await ctx.send("Not authorized.")
+                return
+            ok = self.ai.forget_user_memory(ctx.guild.id, user_id, index)
+            await ctx.send(f"Memory `#{index}` forgotten=`{ok}`.")
 
         @self.command(name="setprompt")
         async def setprompt(ctx: commands.Context, scope: str, learning_mode: str, *, prompt_text: str) -> None:
@@ -4343,6 +4474,9 @@ class MandyBot(commands.Bot):
         root.setdefault("mode", "assist")
         root.setdefault("allowed_actions", [])
         root.setdefault("action_log", [])
+        root.setdefault("proposals", [])
+        root.setdefault("next_proposal_id", 1)
+        root.setdefault("require_approval", False)
         return root
 
     def _autonomy_mode(self) -> str:
@@ -4401,6 +4535,56 @@ class MandyBot(commands.Bot):
             del log_rows[: len(log_rows) - 800]
         self.store.touch()
 
+    def _record_autonomy_proposal(
+        self,
+        guild_id: int,
+        payload: dict[str, Any],
+        *,
+        status: str,
+        reason: str,
+        block_reason: str = "",
+    ) -> dict[str, Any]:
+        root = self._autonomy_policy_root()
+        proposals = root.setdefault("proposals", [])
+        if not isinstance(proposals, list):
+            root["proposals"] = []
+            proposals = root["proposals"]
+        proposal_id = int(root.get("next_proposal_id", 1) or 1)
+        root["next_proposal_id"] = proposal_id + 1
+        row = {
+            "id": proposal_id,
+            "ts": time.time(),
+            "guild_id": int(guild_id),
+            "action": str(payload.get("action", ""))[:80],
+            "target": str(payload.get("target", payload.get("channel_id", payload.get("message_id", ""))))[:80],
+            "status": str(status)[:30],
+            "reason": str(reason)[:220],
+            "block_reason": str(block_reason)[:120],
+            "payload": dict(payload),
+        }
+        proposals.append(row)
+        if len(proposals) > 300:
+            del proposals[: len(proposals) - 300]
+        self.store.touch()
+        return row
+
+    def _mark_autonomy_proposal(self, proposal_id: int, *, status: str, actor_id: int) -> dict[str, Any] | None:
+        root = self._autonomy_policy_root()
+        proposals = root.setdefault("proposals", [])
+        if not isinstance(proposals, list):
+            return None
+        for row in proposals:
+            if not isinstance(row, dict):
+                continue
+            if int(row.get("id", 0) or 0) != int(proposal_id):
+                continue
+            row["status"] = str(status)[:30]
+            row["reviewed_by"] = int(actor_id)
+            row["reviewed_ts"] = time.time()
+            self.store.touch()
+            return row
+        return None
+
     def _is_autonomous_action_allowed(self, guild_id: int, payload: dict[str, Any]) -> tuple[bool, str]:
         action = str(payload.get("action", "")).strip()
         if not action:
@@ -4427,6 +4611,13 @@ class MandyBot(commands.Bot):
             reason = str(payload.get("reason", "")).strip() or "unspecified"
             allowed, why = self._is_autonomous_action_allowed(message.guild.id, payload)
             if not allowed:
+                self._record_autonomy_proposal(
+                    message.guild.id,
+                    payload,
+                    status="blocked",
+                    reason=reason,
+                    block_reason=why,
+                )
                 self.logger.log(
                     "ai.autonomous_action_blocked",
                     guild_id=message.guild.id,
@@ -4436,7 +4627,12 @@ class MandyBot(commands.Bot):
                     mode=self._autonomy_mode(),
                 )
                 return
+            if bool(self._autonomy_policy_root().get("require_approval", False)):
+                proposal = self._record_autonomy_proposal(message.guild.id, payload, status="pending", reason=reason)
+                await self._send_internal_note(f"[AUTONOMY PROPOSED] #{proposal['id']} {action} reason: {reason}")
+                return
             target = self._autonomous_target_label(message.guild, payload)
+            self._record_autonomy_proposal(message.guild.id, payload, status="executed", reason=reason)
             log_line = f"[AUTONOMOUS] {action} on {target} — reason: {reason}"
             await self._send_internal_note(log_line)
             thoughts = self._resolve_mandy_thoughts_channel()

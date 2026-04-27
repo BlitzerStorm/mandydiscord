@@ -75,6 +75,14 @@ DEFAULT_STORE: dict[str, Any] = {
             "permanent": {},
         },
     },
+    "autonomy_policy": {
+        "mode": "assist",
+        "allowed_actions": [],
+        "action_log": [],
+        "proposals": [],
+        "next_proposal_id": 1,
+        "require_approval": False,
+    },
     "ai": {
         "guild_modes": {},
         "long_term_memory": {},
@@ -85,6 +93,9 @@ DEFAULT_STORE: dict[str, Any] = {
         "memory_facts": {},
         "relationships": {},
         "guild_style": {},
+        "reflections": {},
+        "fun_modes": {},
+        "capabilities": {},
         "prompt_injection": {
             "master_prompt": "",
             "master_learning_mode": "full",

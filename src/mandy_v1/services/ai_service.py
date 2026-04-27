@@ -233,6 +233,16 @@ SERVER_ACTION_TEXT_HINTS = (
     "role",
 )
 LEARNING_MODES = {"off", "light", "full"}
+FUN_MODES = {"balanced", "chaotic", "cozy", "serious", "roast", "lore", "helper"}
+FUN_MODE_INSTRUCTIONS = {
+    "balanced": "Use Mandy's normal adaptive voice: warm, concise, observant, and lightly playful.",
+    "chaotic": "Be higher-energy and funnier, with quick playful callbacks. Keep it readable and avoid derailing serious requests.",
+    "cozy": "Be warmer, softer, and more emotionally present. Prioritize reassurance and personal continuity.",
+    "serious": "Be direct, grounded, and low-noise. Skip bits unless the room invites them.",
+    "roast": "Use sharper teasing and witty pushback, but do not get cruel or target protected traits.",
+    "lore": "Lean into ongoing server lore, callbacks, in-jokes, and dramatic continuity.",
+    "helper": "Bias toward practical help, concrete next steps, and fewer purely social flourishes.",
+}
 MANDY_BASE_PERSONA = (
     "You are Mandy. You are not a bot playing a character - you are Mandy. "
     "You have opinions, moods, memories, and relationships. Respond as Mandy, not as an assistant."
@@ -491,6 +501,9 @@ class AIService:
         if guild_id > 0 and self.episodic is not None:
             memory_block, _summaries = self.episodic.format_memory_block(guild_id, topic, limit=2, char_limit=300)
         memory_block = self._context_block(memory_block, limit=300)
+        reflection_block = self._context_block(self.reflection_prompt_block(guild_id, user_id), limit=700)
+        fun_block = self._context_block(self.fun_mode_prompt_block(guild_id), limit=350)
+        curiosity_block = self._context_block(self.curiosity_prompt_block(guild_id, user_id, topic), limit=350)
         injection = self.get_prompt_injection(guild_id)
         guild_prompt = self._context_block(injection.get("guild_prompt", ""), limit=4000)
         global_prompt = self._context_block(injection.get("master_prompt", ""), limit=4000)
@@ -504,7 +517,21 @@ class AIService:
             )
         runtime_block = self._context_block(runtime_block, limit=700)
         extra = self._context_block(extra_instruction, limit=900)
-        blocks = [base, mood, identity, server_voice, user_profile, memory_block, runtime_block, guild_prompt, global_prompt, extra]
+        blocks = [
+            base,
+            mood,
+            identity,
+            server_voice,
+            user_profile,
+            reflection_block,
+            fun_block,
+            curiosity_block,
+            memory_block,
+            runtime_block,
+            guild_prompt,
+            global_prompt,
+            extra,
+        ]
         return "\n\n".join(block for block in blocks if block)
 
     def build_context_prompt(self, guild_id: int, user_id: int, query: str) -> str:
@@ -647,6 +674,7 @@ class AIService:
         facts = self._user_fact_lines(guild_id, message.author.id, limit=4)
         profile = self._profile_summary(guild_id, message.author.id)
         relationship = self._relationship_summary(guild_id, message.author.id)
+        curiosity = self.plan_curiosity_question(guild_id, message.author.id, message.clean_content)
         persona_voice = ""
         if self.personas is not None and hasattr(self.personas, "voice_block"):
             try:
@@ -707,6 +735,7 @@ class AIService:
             f"Preferred alias: {preferred_alias}\n"
             f"User profile: {profile}\n"
             f"Relationship state: {relationship}\n"
+            f"Curiosity plan: {curiosity or '(none)'}\n"
             f"Persona voice read:\n{persona_voice[:500] or '(none)'}\n"
             f"Learning mode: {injection.get('learning_mode', 'full')}\n"
             f"Guild style summary: {style_summary}\n"
@@ -984,6 +1013,130 @@ class AIService:
             style_bits.append("mixed style; keep natural concise tone")
         return "; ".join(style_bits)[:500]
 
+    def set_fun_mode(self, guild_id: int, mode: str) -> dict[str, Any]:
+        normalized = str(mode or "").strip().casefold()
+        if normalized not in FUN_MODES:
+            raise ValueError(f"fun mode must be one of: {', '.join(sorted(FUN_MODES))}")
+        row = self._fun_mode_row(guild_id)
+        row["mode"] = normalized
+        row["updated_ts"] = datetime.now(tz=timezone.utc).isoformat()
+        self.store.touch()
+        return dict(row)
+
+    def fun_mode_summary(self, guild_id: int) -> str:
+        row = self._fun_mode_row(guild_id)
+        mode = str(row.get("mode", "balanced") or "balanced")
+        return f"mode={mode}; {FUN_MODE_INSTRUCTIONS.get(mode, FUN_MODE_INSTRUCTIONS['balanced'])}"
+
+    def fun_mode_prompt_block(self, guild_id: int) -> str:
+        return f"[ADAPTIVE FUN MODE]\n{self.fun_mode_summary(guild_id)}"
+
+    def _fun_mode_row(self, guild_id: int) -> dict[str, Any]:
+        root = self._ai_root()
+        modes = root.setdefault("fun_modes", {})
+        key = str(max(0, int(guild_id)))
+        row = modes.get(key)
+        if not isinstance(row, dict):
+            row = {"mode": "balanced", "updated_ts": ""}
+            modes[key] = row
+            self.store.touch()
+        mode = str(row.get("mode", "balanced") or "balanced").strip().casefold()
+        if mode not in FUN_MODES:
+            row["mode"] = "balanced"
+        return row
+
+    def reflection_prompt_block(self, guild_id: int, user_id: int) -> str:
+        row = self._reflection_row(guild_id)
+        user = self._relationship_row(user_id)
+        bits = [
+            "[PERSONALITY REFLECTION]",
+            f"stable_traits={', '.join(row.get('stable_traits', [])[:6]) or 'still forming'}",
+            f"server_preferences={', '.join(row.get('preferences', [])[:6]) or 'unknown'}",
+            f"storylines={', '.join(row.get('storylines', [])[:5]) or 'none yet'}",
+            f"unresolved_threads={', '.join(row.get('unresolved_threads', [])[:5]) or 'none'}",
+            f"user_arc={str(user.get('arc_stage', 'new'))} callbacks={', '.join(user.get('callbacks', [])[:3]) if isinstance(user.get('callbacks'), list) else 'none'}",
+        ]
+        return "\n".join(bits)
+
+    def reflection_summary(self, guild_id: int) -> dict[str, Any]:
+        row = self._reflection_row(guild_id)
+        return {
+            "stable_traits": list(row.get("stable_traits", [])),
+            "preferences": list(row.get("preferences", [])),
+            "storylines": list(row.get("storylines", [])),
+            "unresolved_threads": list(row.get("unresolved_threads", [])),
+            "message_count": int(row.get("message_count", 0) or 0),
+            "updated_ts": str(row.get("updated_ts", "")),
+        }
+
+    def _reflection_row(self, guild_id: int) -> dict[str, Any]:
+        root = self._ai_root()
+        reflections = root.setdefault("reflections", {})
+        key = str(max(0, int(guild_id)))
+        row = reflections.get(key)
+        if not isinstance(row, dict):
+            row = {
+                "message_count": 0,
+                "stable_traits": ["observant", "protective", "playfully direct"],
+                "preferences": [],
+                "storylines": [],
+                "unresolved_threads": [],
+                "updated_ts": "",
+            }
+            reflections[key] = row
+            self.store.touch()
+        for key_name in ("stable_traits", "preferences", "storylines", "unresolved_threads"):
+            if not isinstance(row.get(key_name), list):
+                row[key_name] = []
+        return row
+
+    def _observe_reflection_signal(self, message: discord.Message, *, touch: bool) -> None:
+        if not message.guild:
+            return
+        row = self._reflection_row(message.guild.id)
+        text = " ".join(str(message.clean_content or "").split())
+        lowered = text.casefold()
+        if not text:
+            return
+        row["message_count"] = int(row.get("message_count", 0) or 0) + 1
+        preferences = row.setdefault("preferences", [])
+        storylines = row.setdefault("storylines", [])
+        unresolved = row.setdefault("unresolved_threads", [])
+        if any(term in lowered for term in ("we like", "server likes", "everyone likes", "favorite")):
+            self._append_unique(preferences, text[:90], max_items=12)
+        if any(term in lowered for term in ("remember when", "again", "lore", "arc", "inside joke")):
+            self._append_unique(storylines, text[:110], max_items=14)
+        if "?" in text and any(term in lowered for term in ("later", "still", "why", "how", "what happened", "figure out")):
+            self._append_unique(unresolved, text[:110], max_items=12)
+        row["updated_ts"] = datetime.now(tz=timezone.utc).isoformat()
+        if touch:
+            self.store.touch()
+
+    def plan_curiosity_question(self, guild_id: int, user_id: int, message_text: str) -> str:
+        text = str(message_text or "").strip()
+        if not text:
+            return ""
+        lowered = text.casefold()
+        if "?" in text and len(text) < 180:
+            return ""
+        facts = self._user_fact_lines(guild_id, user_id, limit=5)
+        reflection = self._reflection_row(guild_id)
+        unresolved = [str(item) for item in reflection.get("unresolved_threads", []) if str(item).strip()]
+        if facts:
+            fact = facts[0].split(":", 1)[-1].strip()
+            return f"Ask one specific follow-up tied to this known detail if it fits: {fact[:80]}"
+        if unresolved:
+            return f"If the moment is open-ended, ask about this unresolved thread: {unresolved[-1][:90]}"
+        if any(term in lowered for term in ("i think", "i feel", "i want", "i'm trying", "im trying")):
+            return "Ask what outcome they actually want, not a generic 'what got you curious?'"
+        return ""
+
+    def curiosity_prompt_block(self, guild_id: int, user_id: int, topic: str) -> str:
+        plan = self.plan_curiosity_question(guild_id, user_id, topic)
+        if not plan:
+            return ""
+        return f"[CURIOSITY PLANNER]\n{plan}\nUse at most one follow-up question, and only when it improves the reply."
+
     def relationship_snapshot(self, user_id: int) -> dict[str, Any]:
         row = self._relationship_row(user_id)
         flags = row.get("risk_flags", [])
@@ -998,6 +1151,16 @@ class AIService:
             "supportive_hits": int(row.get("supportive_hits", 0) or 0),
             "hostile_hits": int(row.get("hostile_hits", 0) or 0),
             "risk_flags": [str(f)[:40] for f in flags[:8]],
+            "arc_stage": str(row.get("arc_stage", "new")),
+            "inside_jokes": [str(item)[:90] for item in row.get("inside_jokes", [])[:8]]
+            if isinstance(row.get("inside_jokes"), list)
+            else [],
+            "preferences": [str(item)[:90] for item in row.get("preferences", [])[:8]]
+            if isinstance(row.get("preferences"), list)
+            else [],
+            "callbacks": [str(item)[:90] for item in row.get("callbacks", [])[:8]]
+            if isinstance(row.get("callbacks"), list)
+            else [],
             "last_seen_ts": float(row.get("last_seen_ts", 0.0) or 0.0),
             "last_invited_ts": float(row.get("last_invited_ts", 0.0) or 0.0),
             "invite_count": int(row.get("invite_count", 0) or 0),
@@ -1139,6 +1302,7 @@ class AIService:
                 source=f"guild:{guild_id}",
                 event_ts=now_ts,
             )
+            self._observe_reflection_signal(message, touch=touch)
             self._update_profile(message, touch=touch)
             self._update_guild_style(message, touch=touch)
             if learning_mode == "full":
@@ -2463,6 +2627,10 @@ class AIService:
                 "supportive_hits": 0,
                 "hostile_hits": 0,
                 "notes": [],
+                "arc_stage": "new",
+                "inside_jokes": [],
+                "preferences": [],
+                "callbacks": [],
                 "last_seen_ts": 0.0,
                 "last_seen_iso": "",
                 "last_invited_ts": 0.0,
@@ -2505,6 +2673,18 @@ class AIService:
         if not isinstance(flags, list):
             flags = []
             row["risk_flags"] = flags
+        inside_jokes = row.get("inside_jokes", [])
+        if not isinstance(inside_jokes, list):
+            inside_jokes = []
+            row["inside_jokes"] = inside_jokes
+        preferences = row.get("preferences", [])
+        if not isinstance(preferences, list):
+            preferences = []
+            row["preferences"] = preferences
+        callbacks = row.get("callbacks", [])
+        if not isinstance(callbacks, list):
+            callbacks = []
+            row["callbacks"] = callbacks
 
         if raw and self._positive_regex.search(raw):
             positives += 1
@@ -2522,6 +2702,12 @@ class AIService:
             trust = min(5.0, trust + 0.08)
         if any(term in raw.casefold() for term in ("shut up", "hate you", "annoying")):
             conflict = min(5.0, conflict + 0.12)
+        lowered = raw.casefold()
+        if any(term in lowered for term in ("inside joke", "remember when", "callback", "running joke")):
+            self._append_unique(inside_jokes, raw[:90], max_items=10)
+            self._append_unique(callbacks, raw[:90], max_items=8)
+        if any(term in lowered for term in ("i like", "i love", "i prefer", "favorite")):
+            self._append_unique(preferences, raw[:90], max_items=10)
 
         # Mild decay so old negatives don't permanently poison someone.
         if prev_seen > 0 and (now - prev_seen) > 30 * 86400:
@@ -2541,8 +2727,35 @@ class AIService:
         row["negative_hits"] = negatives
         row["supportive_hits"] = supportive_hits
         row["hostile_hits"] = hostile_hits
+        row["arc_stage"] = self._relationship_arc_stage(
+            positives=positives,
+            negatives=negatives,
+            trust=trust,
+            conflict=conflict,
+            last_seen_ts=now,
+        )
         row["last_source"] = str(source)[:60]
         self.store.touch()
+
+    def _relationship_arc_stage(
+        self,
+        *,
+        positives: int,
+        negatives: int,
+        trust: float,
+        conflict: float,
+        last_seen_ts: float,
+    ) -> str:
+        del last_seen_ts
+        if conflict >= 1.8 and negatives > positives:
+            return "repair"
+        if trust >= 2.4 and positives >= 5:
+            return "trusted"
+        if trust >= 0.8 or positives >= 2:
+            return "warming"
+        if positives + negatives >= 4:
+            return "known"
+        return "new"
 
     def _remember_exchange(self, message: discord.Message, bot_reply: str) -> None:
         if not message.guild:
@@ -2865,6 +3078,69 @@ class AIService:
         scored.sort(key=lambda item: item[0], reverse=True)
         return [fact for _strength, fact in scored[: max(1, limit)]]
 
+    def list_user_memory(self, guild_id: int, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self._user_memory_rows(guild_id, user_id)
+        now = time.time()
+        out: list[dict[str, Any]] = []
+        for index, row in enumerate(rows[: max(1, limit)]):
+            if not isinstance(row, dict):
+                continue
+            out.append(
+                {
+                    "index": index,
+                    "fact": str(row.get("fact", "")),
+                    "kind": str(row.get("kind", "")),
+                    "pinned": bool(row.get("pinned", False)),
+                    "strength": round(self._fact_row_strength(row, now), 3),
+                    "mentions": int(row.get("mentions", 0) or 0),
+                }
+            )
+        return out
+
+    def pin_user_memory(self, guild_id: int, user_id: int, index: int, pinned: bool = True) -> bool:
+        rows = self._user_memory_rows(guild_id, user_id)
+        if index < 0 or index >= len(rows) or not isinstance(rows[index], dict):
+            return False
+        rows[index]["pinned"] = bool(pinned)
+        if pinned:
+            rows[index]["score"] = max(float(rows[index].get("score", 0.5) or 0.5), 1.8)
+        rows[index]["ts"] = datetime.now(tz=timezone.utc).isoformat()
+        self.store.touch()
+        return True
+
+    def edit_user_memory(self, guild_id: int, user_id: int, index: int, fact_text: str) -> bool:
+        rows = self._user_memory_rows(guild_id, user_id)
+        clean = " ".join(str(fact_text or "").split())[:140]
+        if not clean or index < 0 or index >= len(rows) or not isinstance(rows[index], dict):
+            return False
+        rows[index]["fact"] = clean
+        rows[index]["norm"] = self._normalize_memory_text(clean)
+        rows[index]["ts"] = datetime.now(tz=timezone.utc).isoformat()
+        self.store.touch()
+        return True
+
+    def forget_user_memory(self, guild_id: int, user_id: int, index: int) -> bool:
+        rows = self._user_memory_rows(guild_id, user_id)
+        if index < 0 or index >= len(rows):
+            return False
+        rows.pop(index)
+        self.store.touch()
+        return True
+
+    def _user_memory_rows(self, guild_id: int, user_id: int) -> list[dict[str, Any]]:
+        if guild_id <= 0 or user_id <= 0:
+            return []
+        memory_facts = self._ai_root().setdefault("memory_facts", {})
+        guild_rows = memory_facts.setdefault(str(guild_id), {})
+        if not isinstance(guild_rows, dict):
+            memory_facts[str(guild_id)] = {}
+            guild_rows = memory_facts[str(guild_id)]
+        rows = guild_rows.setdefault(str(user_id), [])
+        if not isinstance(rows, list):
+            guild_rows[str(user_id)] = []
+            rows = guild_rows[str(user_id)]
+        return rows
+
     def _preferred_alias(self, guild_id: int, user_id: int) -> str:
         if guild_id <= 0:
             return ""
@@ -2952,6 +3228,8 @@ class AIService:
 
     def _fact_row_strength(self, row: dict[str, Any], now: float) -> float:
         base = float(row.get("score", 0.5) or 0.5)
+        if bool(row.get("pinned", False)):
+            base += 10.0
         mentions = max(1, int(row.get("mentions", 1) or 1))
         mention_bonus = min(0.35, 0.05 * mentions)
         ts = self._parse_ts(row.get("ts"))
@@ -3116,6 +3394,50 @@ class AIService:
             return "(none)"
         return "\n".join(f"- {line[:300]}" for line in lines)
 
+    def _append_unique(self, rows: list[Any], value: str, *, max_items: int) -> None:
+        clean = " ".join(str(value or "").split())[:140]
+        if not clean:
+            return
+        norm = clean.casefold()
+        for existing in rows:
+            if str(existing).casefold() == norm:
+                return
+        rows.append(clean)
+        if len(rows) > max_items:
+            del rows[: len(rows) - max_items]
+
+    def capability_registry(self) -> dict[str, Any]:
+        root = self._ai_root()
+        capabilities = root.setdefault("capabilities", {})
+        if not isinstance(capabilities, dict):
+            root["capabilities"] = {}
+            capabilities = root["capabilities"]
+        defaults = {
+            "chat": {"category": "social", "enabled": True, "description": "Adaptive conversation and memory-aware replies."},
+            "memory": {"category": "social", "enabled": True, "description": "Fact memory, relationship arcs, and reflection summaries."},
+            "moderation": {"category": "operations", "enabled": True, "description": "Guarded server actions through autonomy policy."},
+            "fun_modes": {"category": "social", "enabled": True, "description": "Per-server tone controls for playful, cozy, lore, helper, and serious modes."},
+            "dm_bridge": {"category": "operations", "enabled": True, "description": "Staff-visible DM relay and optional AI replies."},
+        }
+        changed = False
+        for key, row in defaults.items():
+            if key not in capabilities or not isinstance(capabilities.get(key), dict):
+                capabilities[key] = row
+                changed = True
+        if changed:
+            self.store.touch()
+        return capabilities
+
+    def capability_lines(self) -> list[str]:
+        capabilities = self.capability_registry()
+        lines: list[str] = []
+        for key, row in sorted(capabilities.items()):
+            if not isinstance(row, dict):
+                continue
+            enabled = bool(row.get("enabled", True))
+            lines.append(f"{key}: {'on' if enabled else 'off'} [{row.get('category', 'general')}] {row.get('description', '')}")
+        return lines
+
     def _resolve_api_key(self) -> tuple[str, str]:
         direct = self.settings.alibaba_api_key.strip()
         if direct:
@@ -3205,6 +3527,9 @@ class AIService:
         root.setdefault("memory_facts", {})
         root.setdefault("relationships", {})
         root.setdefault("guild_style", {})
+        root.setdefault("reflections", {})
+        root.setdefault("fun_modes", {})
+        root.setdefault("capabilities", {})
         root.setdefault(
             "prompt_injection",
             {
