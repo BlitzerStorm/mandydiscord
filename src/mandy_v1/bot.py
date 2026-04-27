@@ -1196,6 +1196,53 @@ class MandyBot(commands.Bot):
                 f"pruned_stale=`{summary['pruned']}` access_synced=`{summary['access_synced']}`"
             )
 
+        @self.command(name="leaveserver")
+        @self._tier_check(90)
+        async def leaveserver(ctx: commands.Context, guild_id: int, confirm: str = "", *, message: str = "") -> None:
+            if str(confirm).strip().casefold() != "confirm":
+                await ctx.send("Usage: `!leaveserver <guild_id> confirm [public_message]`")
+                return
+            if int(guild_id) == int(self.settings.admin_guild_id):
+                await ctx.send("Refusing to leave the Admin Hub.")
+                return
+            guild = self.get_guild(int(guild_id))
+            if guild is None:
+                await ctx.send(f"Guild `{guild_id}` is not available.")
+                return
+            if not self._can_control_satellite(ctx.author, int(guild_id), min_tier=90):
+                await ctx.send("Not authorized for that satellite.")
+                return
+            announcement = message.strip()
+            sent_announcement = False
+            if announcement:
+                target = self._best_public_announcement_channel(guild)
+                if target is not None:
+                    try:
+                        await target.send(announcement[:1900])
+                        sent_announcement = True
+                    except (discord.Forbidden, discord.HTTPException) as exc:
+                        self.logger.log(
+                            "guild.leave_announcement_failed",
+                            actor_id=ctx.author.id,
+                            guild_id=guild.id,
+                            channel_id=target.id,
+                            error=str(exc)[:240],
+                        )
+            guild_name = guild.name
+            self.logger.log(
+                "guild.leave_requested",
+                actor_id=ctx.author.id,
+                guild_id=guild.id,
+                guild_name=guild_name,
+                announced=sent_announcement,
+            )
+            await ctx.send(f"Leaving `{guild_name}` (`{guild.id}`), announced=`{sent_announcement}`.")
+            try:
+                await guild.leave()
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                self.logger.log("guild.leave_failed", actor_id=ctx.author.id, guild_id=guild.id, error=str(exc)[:240])
+                await ctx.send(f"Leave failed for `{guild.id}`: `{str(exc)[:160]}`")
+
         @self.command(name="housekeep")
         @self._tier_check(70)
         async def housekeep(ctx: commands.Context) -> None:
@@ -4055,6 +4102,29 @@ class MandyBot(commands.Bot):
             if perms.view_channel and perms.send_messages:
                 return True
         return False
+
+    def _best_public_announcement_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        me = guild.me
+        if me is None:
+            return None
+        preferred_names = (
+            "announcements",
+            "announcement",
+            "general",
+            "chat",
+            "main",
+            "lobby",
+        )
+        candidates = [
+            channel
+            for channel in guild.text_channels
+            if channel.permissions_for(me).view_channel and channel.permissions_for(me).send_messages
+        ]
+        for name in preferred_names:
+            for channel in candidates:
+                if channel.name.casefold() == name:
+                    return channel
+        return candidates[0] if candidates else None
 
     async def _maybe_shadow_rant_for_blocked_guild(self, guild_id: int, *, context: str) -> None:
         now = time.time()

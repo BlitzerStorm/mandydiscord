@@ -186,6 +186,7 @@ Health/setup:
 - `!housekeep`
 - `!housekeephere [channel]`
 - `!satellitesync`
+- `!leaveserver <guild_id> confirm [public_message]`
 - `!syncaccess`
 
 Prompt and AI controls:
