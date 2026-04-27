@@ -20,6 +20,7 @@ from mandy_v1.config import Settings
 from mandy_v1.cogs.intelligence_controls import setup_intelligence_controls
 from mandy_v1.prompts import GOD_MODE_OVERRIDE_PROMPT_TEMPLATE
 from mandy_v1.services.admin_layout_service import AdminLayoutService
+from mandy_v1.services.agent_core_service import AgentCoreService
 from mandy_v1.services.ai_service import AIService
 from mandy_v1.services.culture_service import CultureService
 from mandy_v1.services.dm_bridge_service import DMBridgeService
@@ -259,6 +260,7 @@ class MandyBot(commands.Bot):
         self.onboarding = OnboardingService(settings, self.store, self.logger)
         self.dm_bridges = DMBridgeService(settings, self.store, self.logger)
         self.ai = AIService(settings, self.store)
+        self.agent_core = AgentCoreService(self.store)
         self.emotion = EmotionService(self.store, self.ai)
         self.episodic = EpisodicMemoryService(self.store, self.ai)
         self.identity = IdentityService(self.store, self.ai)
@@ -294,6 +296,7 @@ class MandyBot(commands.Bot):
             expansion_service=self.expansion,
             autonomy_engine=self.autonomy,
             self_model_service=self.self_model,
+            agent_core_service=self.agent_core,
         )
         self.ai.attach_context_services(
             emotion=self.emotion,
@@ -455,6 +458,34 @@ class MandyBot(commands.Bot):
             root["require_approval"] = enabled
             self.store.touch()
             await ctx.send(f"Autonomy approval required set to `{enabled}`.")
+
+        @self.command(name="agentcore")
+        @self._tier_check(70)
+        async def agentcore(ctx: commands.Context, mode: str = "show", *, value: str = "") -> None:
+            root = self.agent_core.root()
+            want = mode.strip().casefold()
+            if want in {"show", "status"}:
+                await ctx.send("\n".join(["Agent core:", *self.agent_core.status_lines()])[:1900])
+                return
+            if not self.soc.can_run(ctx.author, 90):
+                await ctx.send("Not authorized.")
+                return
+            if want in {"on", "enable"}:
+                root["enabled"] = True
+                self.store.touch()
+                await ctx.send("Agent core enabled.")
+                return
+            if want in {"off", "disable"}:
+                root["enabled"] = False
+                self.store.touch()
+                await ctx.send("Agent core disabled.")
+                return
+            if want == "directive":
+                root["directive"] = value.strip()[:500] or root.get("directive", "")
+                self.store.touch()
+                await ctx.send("Agent core directive updated.")
+                return
+            await ctx.send("Usage: `!agentcore show|on|off|directive <text>`")
 
         @self.group(name="autonomyallow", invoke_without_command=True)
         @self._tier_check(90)
@@ -4799,7 +4830,16 @@ class MandyBot(commands.Bot):
             return (False, "destructive_requires_god_mode")
         if action in AUTONOMY_RESTRICTED_EXTERNAL_ACTIONS and not bool(self._autonomy_policy_root().get("require_approval", False)):
             return (False, "external_contact_requires_approval_mode")
-        return (True, "ok")
+        verdict = self.agent_core.evaluate_action(
+            guild_id=guild_id,
+            payload=payload,
+            base_allowed=True,
+            base_reason="ok",
+            approval_required=bool(self._autonomy_policy_root().get("require_approval", False)),
+            destructive_actions=AUTONOMY_DESTRUCTIVE_ACTIONS,
+            external_actions=AUTONOMY_RESTRICTED_EXTERNAL_ACTIONS,
+        )
+        return (verdict.allowed, verdict.reason)
 
     async def _execute_autonomous_server_action(self, message: discord.Message, payload: dict[str, Any]) -> None:
         if not message.guild:

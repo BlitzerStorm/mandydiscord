@@ -25,6 +25,7 @@ class RuntimeCoordinatorService:
         expansion_service: Any | None = None,
         autonomy_engine: Any | None = None,
         self_model_service: Any | None = None,
+        agent_core_service: Any | None = None,
     ) -> None:
         self.storage = storage
         self.emotion = emotion_service
@@ -35,6 +36,7 @@ class RuntimeCoordinatorService:
         self.expansion = expansion_service
         self.autonomy = autonomy_engine
         self.self_model = self_model_service
+        self.agent_core = agent_core_service
         self._workspace_cache: dict[str, Any] = {"root": "", "ts": 0.0, "snapshot": {}}
 
     def workspace_snapshot(self, workspace_root: Path) -> dict[str, Any]:
@@ -162,6 +164,14 @@ class RuntimeCoordinatorService:
                     f"decisions={int(status.get('decision_count', 0) or 0)} "
                     f"success={float(status.get('recent_success_rate', 0.0) or 0.0):.2f}"
                 )
+
+        if self.agent_core is not None and hasattr(self.agent_core, "status_lines"):
+            try:
+                agent_lines = self.agent_core.status_lines()
+            except Exception:  # noqa: BLE001
+                agent_lines = []
+            if agent_lines:
+                lines.append("AgentCore: " + " | ".join(str(line) for line in agent_lines[:2])[:220])
 
         if self.self_model is not None and hasattr(self.self_model, "snapshot"):
             try:

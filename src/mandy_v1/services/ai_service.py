@@ -516,6 +516,11 @@ class AIService:
                 user_name=user_name,
             )
         runtime_block = self._context_block(runtime_block, limit=700)
+        agent_block = ""
+        if self.runtime_coordinator is not None and hasattr(self.runtime_coordinator, "agent_core"):
+            agent_core = getattr(self.runtime_coordinator, "agent_core", None)
+            if agent_core is not None and hasattr(agent_core, "prompt_block"):
+                agent_block = self._context_block(agent_core.prompt_block(), limit=500)
         extra = self._context_block(extra_instruction, limit=900)
         blocks = [
             base,
@@ -528,6 +533,7 @@ class AIService:
             curiosity_block,
             memory_block,
             runtime_block,
+            agent_block,
             guild_prompt,
             global_prompt,
             extra,

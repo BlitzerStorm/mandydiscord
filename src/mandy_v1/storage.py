@@ -75,6 +75,19 @@ DEFAULT_STORE: dict[str, Any] = {
             "permanent": {},
         },
     },
+    "agent_core": {
+        "enabled": True,
+        "default_posture": "guarded",
+        "directive": "Think with the model; act only through typed Discord tools and policy gates.",
+        "audit_log": [],
+        "last_verdict": {},
+        "risk_counts": {
+            "low": 0,
+            "medium": 0,
+            "high": 0,
+            "blocked": 0,
+        },
+    },
     "autonomy_policy": {
         "mode": "assist",
         "allowed_actions": [],
