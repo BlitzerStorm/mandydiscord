@@ -17,6 +17,7 @@ import discord
 from discord.ext import commands
 
 from mandy_v1.config import Settings
+from mandy_v1.cogs.intelligence_controls import setup_intelligence_controls
 from mandy_v1.prompts import GOD_MODE_OVERRIDE_PROMPT_TEMPLATE
 from mandy_v1.services.admin_layout_service import AdminLayoutService
 from mandy_v1.services.ai_service import AIService
@@ -40,6 +41,7 @@ from mandy_v1.services.watcher_service import WatcherService
 from mandy_v1.storage import MessagePackStore
 from mandy_v1.ui.dm_bridge import DMBridgeControlView, DMBridgeUserView
 from mandy_v1.ui.global_menu import GlobalMenuView
+from mandy_v1.ui.intelligence_controls import AutonomyProposalReviewView, MemoryControlView
 from mandy_v1.ui.mirror_actions import MirrorActionContext, MirrorActionView
 from mandy_v1.ui.satellite_debug import PermissionRequestApprovalView, PermissionRequestPromptView, SatelliteDebugView
 from mandy_v1.utils.discord_utils import get_bot_member
@@ -67,6 +69,7 @@ SATELLITE_RECONCILE_INTERVAL_SEC = 5 * 60
 SELF_AUTOMATION_LOOP_INTERVAL_SEC = 30
 PROACTIVE_LOOP_INTERVAL_SEC = 5 * 60
 EXPANSION_SCAN_INTERVAL_SEC = 6 * 60 * 60
+REFLECTION_COMPACTION_INTERVAL_SEC = 6 * 60 * 60
 SELF_AUTOMATION_MAX_HISTORY = 600
 SELF_AUTOMATION_MAX_ACTIONS_PER_TASK = 8
 # === UPGRADED FULL SENTIENCE & GOD-MODE SECTION (MANDY) ===
@@ -314,6 +317,7 @@ class MandyBot(commands.Bot):
         self._satellite_reconcile_task: asyncio.Task | None = None
         self._self_automation_task: asyncio.Task | None = None
         self._proactive_task: asyncio.Task | None = None
+        self._reflection_compaction_task: asyncio.Task | None = None
         self._ai_pending_reply_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._ai_pending_dm_reply_tasks: dict[int, asyncio.Task] = {}
         self._send_block_until_by_guild: dict[int, float] = {}
@@ -332,6 +336,7 @@ class MandyBot(commands.Bot):
         await self.store.load()
         self._autosave_task = asyncio.create_task(self.store.autosave_loop(), name="msgpack-autosave")
         self._register_commands()
+        await setup_intelligence_controls(self)
 
     async def close(self) -> None:
         background_tasks = [
@@ -345,6 +350,7 @@ class MandyBot(commands.Bot):
             self._satellite_reconcile_task,
             self._self_automation_task,
             self._proactive_task,
+            self._reflection_compaction_task,
             *self._ai_pending_reply_tasks.values(),
             *self._ai_pending_dm_reply_tasks.values(),
         ]
@@ -446,16 +452,14 @@ class MandyBot(commands.Bot):
                     f"- `#{row.get('id', 0)}` guild=`{row.get('guild_id', 0)}` action=`{row.get('action', '')}` "
                     f"target=`{row.get('target', '')}` reason={str(row.get('reason', ''))[:90]}"
                 )
-            await ctx.send("\n".join(lines)[:1900])
+            view = AutonomyProposalReviewView(self, int(pending[-1].get("id", 0))) if pending else None
+            await ctx.send("\n".join(lines)[:1900], view=view)
 
         @self.command(name="autonomyapprove")
         @self._tier_check(90)
         async def autonomyapprove(ctx: commands.Context, proposal_id: int) -> None:
-            row = self._mark_autonomy_proposal(proposal_id, status="approved", actor_id=ctx.author.id)
-            if not row:
-                await ctx.send(f"Proposal `#{proposal_id}` not found.")
-                return
-            await ctx.send(f"Proposal `#{proposal_id}` marked approved. Re-trigger the action context for live execution.")
+            ok, message = await self._approve_and_execute_autonomy_proposal(proposal_id, actor_id=ctx.author.id)
+            await ctx.send(message[:1900])
 
         @self.command(name="selfcheck")
         @self._tier_check(70)
@@ -692,7 +696,7 @@ class MandyBot(commands.Bot):
             for row in rows:
                 pin = " pinned" if row["pinned"] else ""
                 lines.append(f"- `#{row['index']}`{pin} {row['fact']} kind={row['kind']} strength={row['strength']}")
-            await ctx.send("\n".join(lines)[:1900])
+            await ctx.send("\n".join(lines)[:1900], view=MemoryControlView(self, ctx.guild.id, user_id, rows))
 
         @memory_group.command(name="pin")
         async def memory_pin(ctx: commands.Context, user_id: int, index: int) -> None:
@@ -2426,6 +2430,17 @@ class MandyBot(commands.Bot):
                 message_sent=bool(message),
             )
 
+    async def _run_reflection_compaction_loop(self) -> None:
+        await asyncio.sleep(90)
+        while True:
+            try:
+                result = self.ai.compact_reflections()
+                if int(result.get("compacted", 0) or 0) > 0:
+                    self.logger.log("ai.reflection_compacted", **result)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.log("ai.reflection_compaction_failed", error=str(exc)[:240])
+            await asyncio.sleep(REFLECTION_COMPACTION_INTERVAL_SEC)
+
     async def _warmup_ai_for_guild(self, guild: discord.Guild) -> None:
         try:
             summary = await self.ai.warmup_guild(guild)
@@ -2494,6 +2509,11 @@ class MandyBot(commands.Bot):
                 )
             if self._self_automation_task is None or self._self_automation_task.done():
                 self._self_automation_task = asyncio.create_task(self._run_self_automation_loop(), name="self-automation-loop")
+            if self._reflection_compaction_task is None or self._reflection_compaction_task.done():
+                self._reflection_compaction_task = asyncio.create_task(
+                    self._run_reflection_compaction_loop(),
+                    name="reflection-compaction-loop",
+                )
         if self._send_probe_task is None or self._send_probe_task.done():
             self._send_probe_task = asyncio.create_task(self._run_send_access_probe_loop(), name="send-access-probe")
         if self._onboarding_recheck_task is None or self._onboarding_recheck_task.done():
@@ -4584,6 +4604,96 @@ class MandyBot(commands.Bot):
             self.store.touch()
             return row
         return None
+
+    def _autonomy_proposal_by_id(self, proposal_id: int) -> dict[str, Any] | None:
+        proposals = self._autonomy_policy_root().setdefault("proposals", [])
+        if not isinstance(proposals, list):
+            return None
+        for row in proposals:
+            if isinstance(row, dict) and int(row.get("id", 0) or 0) == int(proposal_id):
+                return row
+        return None
+
+    async def _approve_and_execute_autonomy_proposal(self, proposal_id: int, *, actor_id: int) -> tuple[bool, str]:
+        row = self._autonomy_proposal_by_id(proposal_id)
+        if not row:
+            return (False, f"Proposal `#{proposal_id}` not found.")
+        if str(row.get("status", "")) not in {"pending", "approved"}:
+            return (False, f"Proposal `#{proposal_id}` is `{row.get('status', '')}`, not pending.")
+        payload = row.get("payload", {})
+        if not isinstance(payload, dict):
+            return (False, f"Proposal `#{proposal_id}` has no executable payload.")
+        guild = self.get_guild(int(row.get("guild_id", 0) or 0))
+        if guild is None:
+            return (False, f"Proposal `#{proposal_id}` guild is unavailable.")
+        allowed, why = self._is_autonomous_action_allowed(guild.id, payload)
+        if not allowed:
+            row["status"] = "blocked_after_approval"
+            row["block_reason"] = why
+            row["reviewed_by"] = int(actor_id)
+            row["reviewed_ts"] = time.time()
+            self.store.touch()
+            return (False, f"Proposal `#{proposal_id}` blocked: `{why}`.")
+        action = str(payload.get("action", "")).strip()
+        reason = str(row.get("reason", "") or payload.get("reason", "") or "approved autonomy action")
+        ok = await self.server_control.dispatch_action(guild, payload, source_message=None)
+        row["status"] = "executed" if ok else "failed"
+        row["reviewed_by"] = int(actor_id)
+        row["reviewed_ts"] = time.time()
+        row["executed_ts"] = time.time()
+        self._record_autonomy_action(guild.id, action, ok, reason)
+        self.logger.log("ai.autonomy_proposal_executed", proposal_id=proposal_id, guild_id=guild.id, action=action, ok=ok)
+        self.store.touch()
+        return (ok, f"Proposal `#{proposal_id}` action=`{action}` executed=`{ok}`.")
+
+    async def handle_autonomy_proposal_interaction(
+        self,
+        *,
+        interaction: discord.Interaction,
+        proposal_id: int,
+        decision: str,
+    ) -> None:
+        if not self.soc.can_run(interaction.user, 90):
+            await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
+            return
+        if decision == "deny":
+            row = self._mark_autonomy_proposal(proposal_id, status="denied", actor_id=interaction.user.id)
+            await self._send_interaction_message(
+                interaction,
+                f"Proposal `#{proposal_id}` denied=`{bool(row)}`.",
+                ephemeral=True,
+            )
+            return
+        ok, message = await self._approve_and_execute_autonomy_proposal(proposal_id, actor_id=interaction.user.id)
+        await self._send_interaction_message(interaction, message, ephemeral=True)
+
+    async def handle_memory_control_interaction(
+        self,
+        *,
+        interaction: discord.Interaction,
+        guild_id: int,
+        user_id: int,
+        index: int,
+        action: str,
+    ) -> None:
+        if not self._can_control_satellite(interaction.user, guild_id, min_tier=70):
+            await self._send_interaction_message(interaction, "Not authorized.", ephemeral=True)
+            return
+        if action == "pin":
+            ok = self.ai.pin_user_memory(guild_id, user_id, index, pinned=True)
+            await self._send_interaction_message(interaction, f"Memory `#{index}` pinned=`{ok}`.", ephemeral=True)
+            return
+        if action == "unpin":
+            ok = self.ai.pin_user_memory(guild_id, user_id, index, pinned=False)
+            await self._send_interaction_message(interaction, f"Memory `#{index}` unpinned=`{ok}`.", ephemeral=True)
+            return
+        if action == "forget":
+            ok = self.ai.forget_user_memory(guild_id, user_id, index)
+            await self._send_interaction_message(interaction, f"Memory `#{index}` forgotten=`{ok}`.", ephemeral=True)
+            return
+        if action == "export":
+            payload = json.dumps(self.ai.export_user_memory(user_id), indent=2)[:1800]
+            await self._send_interaction_message(interaction, f"```json\n{payload}\n```", ephemeral=True)
 
     def _is_autonomous_action_allowed(self, guild_id: int, payload: dict[str, Any]) -> tuple[bool, str]:
         action = str(payload.get("action", "")).strip()

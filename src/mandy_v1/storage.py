@@ -96,6 +96,21 @@ DEFAULT_STORE: dict[str, Any] = {
         "reflections": {},
         "fun_modes": {},
         "capabilities": {},
+        "privacy": {
+            "paused_user_ids": [],
+            "audit_log": [],
+        },
+        "telemetry": {
+            "calls": 0,
+            "cache_hits": 0,
+            "successes": 0,
+            "failures": 0,
+            "fallbacks": 0,
+            "models": {},
+            "estimated_tokens": 0,
+            "estimated_cost_usd": 0.0,
+            "last_call_ts": 0.0,
+        },
         "prompt_injection": {
             "master_prompt": "",
             "master_learning_mode": "full",

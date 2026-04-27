@@ -1090,6 +1090,45 @@ class AIService:
                 row[key_name] = []
         return row
 
+    def compact_reflections(self, *, guild_id: int | None = None) -> dict[str, Any]:
+        reflections = self._ai_root().setdefault("reflections", {})
+        if not isinstance(reflections, dict):
+            return {"compacted": 0, "guilds": 0}
+        wanted = {str(int(guild_id))} if guild_id is not None else set(reflections.keys())
+        compacted = 0
+        for key in list(wanted):
+            row = reflections.get(key)
+            if not isinstance(row, dict):
+                continue
+            for name, limit in (
+                ("stable_traits", 8),
+                ("preferences", 10),
+                ("storylines", 10),
+                ("unresolved_threads", 8),
+            ):
+                values = row.get(name, [])
+                if not isinstance(values, list):
+                    row[name] = []
+                    continue
+                seen: set[str] = set()
+                cleaned: list[str] = []
+                for value in values:
+                    text = " ".join(str(value or "").split())[:120]
+                    norm = self._normalize_memory_text(text)
+                    if not text or norm in seen:
+                        continue
+                    seen.add(norm)
+                    cleaned.append(text)
+                if len(cleaned) > limit:
+                    cleaned = cleaned[-limit:]
+                if cleaned != values:
+                    compacted += 1
+                row[name] = cleaned
+            row["compacted_ts"] = datetime.now(tz=timezone.utc).isoformat()
+        if compacted:
+            self.store.touch()
+        return {"compacted": compacted, "guilds": len(wanted)}
+
     def _observe_reflection_signal(self, message: discord.Message, *, touch: bool) -> None:
         if not message.guild:
             return
@@ -1294,6 +1333,8 @@ class AIService:
         )
         if update_turn:
             self._update_turn_state(message.channel.id, message.author.id, now)
+        if self.is_learning_paused(message.author.id):
+            return
         if learning_mode != "off":
             self._note_relationship_signal(
                 user_id=int(message.author.id),
@@ -2387,6 +2428,68 @@ class AIService:
         value = str(row.get("text", "")).strip()
         return value or None
 
+    def telemetry_snapshot(self) -> dict[str, Any]:
+        telemetry = self._telemetry_root()
+        return {
+            "calls": int(telemetry.get("calls", 0) or 0),
+            "cache_hits": int(telemetry.get("cache_hits", 0) or 0),
+            "successes": int(telemetry.get("successes", 0) or 0),
+            "failures": int(telemetry.get("failures", 0) or 0),
+            "fallbacks": int(telemetry.get("fallbacks", 0) or 0),
+            "estimated_tokens": int(telemetry.get("estimated_tokens", 0) or 0),
+            "estimated_cost_usd": round(float(telemetry.get("estimated_cost_usd", 0.0) or 0.0), 6),
+            "cooldown_remaining_sec": max(0, int(self._api_cooldown_until_ts - time.time())),
+            "failure_streak": int(self._api_failure_streak),
+            "models": dict(telemetry.get("models", {})) if isinstance(telemetry.get("models"), dict) else {},
+        }
+
+    def _telemetry_root(self) -> dict[str, Any]:
+        root = self._ai_root()
+        telemetry = root.setdefault("telemetry", {})
+        if not isinstance(telemetry, dict):
+            root["telemetry"] = {}
+            telemetry = root["telemetry"]
+        telemetry.setdefault("calls", 0)
+        telemetry.setdefault("cache_hits", 0)
+        telemetry.setdefault("successes", 0)
+        telemetry.setdefault("failures", 0)
+        telemetry.setdefault("fallbacks", 0)
+        telemetry.setdefault("models", {})
+        telemetry.setdefault("estimated_tokens", 0)
+        telemetry.setdefault("estimated_cost_usd", 0.0)
+        telemetry.setdefault("last_call_ts", 0.0)
+        return telemetry
+
+    def _note_ai_telemetry(
+        self,
+        event: str,
+        *,
+        model: str = "",
+        prompt_chars: int = 0,
+        output_chars: int = 0,
+        fallback: bool = False,
+    ) -> None:
+        telemetry = self._telemetry_root()
+        if event == "call":
+            telemetry["calls"] = int(telemetry.get("calls", 0) or 0) + 1
+        elif event == "cache_hit":
+            telemetry["cache_hits"] = int(telemetry.get("cache_hits", 0) or 0) + 1
+        elif event == "success":
+            telemetry["successes"] = int(telemetry.get("successes", 0) or 0) + 1
+        elif event == "failure":
+            telemetry["failures"] = int(telemetry.get("failures", 0) or 0) + 1
+        if fallback:
+            telemetry["fallbacks"] = int(telemetry.get("fallbacks", 0) or 0) + 1
+        if model:
+            models = telemetry.setdefault("models", {})
+            if isinstance(models, dict):
+                models[model] = int(models.get(model, 0) or 0) + 1
+        estimated_tokens = max(1, int((prompt_chars + output_chars) / 4)) if (prompt_chars + output_chars) > 0 else 0
+        telemetry["estimated_tokens"] = int(telemetry.get("estimated_tokens", 0) or 0) + estimated_tokens
+        telemetry["estimated_cost_usd"] = round(float(telemetry.get("estimated_cost_usd", 0.0) or 0.0) + (estimated_tokens / 1000 * 0.001), 6)
+        telemetry["last_call_ts"] = time.time()
+        self.store.touch()
+
     def _put_cached_completion(self, key: str, text: str, *, ttl_sec: int) -> None:
         if ttl_sec <= 0:
             return
@@ -2452,11 +2555,14 @@ class AIService:
         )
         cached = self._get_cached_completion(cache_key)
         if cached is not None:
+            self._note_ai_telemetry("cache_hit")
             return cached
         if self._api_on_cooldown():
             return None
-        for model in self._model_candidates():
+        candidates = self._model_candidates()
+        for index, model in enumerate(candidates):
             try:
+                self._note_ai_telemetry("call", model=model, prompt_chars=len(safe_system) + len(safe_user), fallback=index > 0)
                 output = await self._chat_completion(
                     [
                         {"role": "system", "content": safe_system},
@@ -2473,9 +2579,11 @@ class AIService:
                     root["auto_model"] = model
                     self.store.touch()
                 self._put_cached_completion(cache_key, output, ttl_sec=ttl)
+                self._note_ai_telemetry("success", model=model, output_chars=len(output))
                 return output
             except Exception:  # noqa: BLE001
                 self._note_api_failure()
+                self._note_ai_telemetry("failure", model=model, fallback=index > 0)
                 continue
         return None
 
@@ -2504,8 +2612,10 @@ class AIService:
             {"role": "system", "content": safe_system},
             {"role": "user", "content": user_content},
         ]
-        for model in self._vision_model_candidates():
+        candidates = self._vision_model_candidates()
+        for index, model in enumerate(candidates):
             try:
+                self._note_ai_telemetry("call", model=model, prompt_chars=len(safe_system) + len(safe_user), fallback=index > 0)
                 output = await self._chat_completion(
                     messages,
                     max_tokens=max_tokens,
@@ -2518,9 +2628,11 @@ class AIService:
                 if root.get("auto_vision_model") != model:
                     root["auto_vision_model"] = model
                     self.store.touch()
+                self._note_ai_telemetry("success", model=model, output_chars=len(output))
                 return output
             except Exception:  # noqa: BLE001
                 self._note_api_failure()
+                self._note_ai_telemetry("failure", model=model, fallback=index > 0)
                 continue
         return None
 
@@ -2980,6 +3092,136 @@ class AIService:
         self._prune_user_fact_rows(rows)
         if touch:
             self.store.touch()
+
+    def is_learning_paused(self, user_id: int) -> bool:
+        paused = self._privacy_root().setdefault("paused_user_ids", [])
+        return str(int(user_id)) in {str(item) for item in paused}
+
+    def set_learning_paused(self, user_id: int, paused: bool, *, actor_id: int = 0, reason: str = "") -> bool:
+        root = self._privacy_root()
+        rows = root.setdefault("paused_user_ids", [])
+        if not isinstance(rows, list):
+            rows = []
+            root["paused_user_ids"] = rows
+        key = str(int(user_id))
+        changed = False
+        if paused and key not in {str(item) for item in rows}:
+            rows.append(key)
+            changed = True
+        if not paused:
+            before = len(rows)
+            rows[:] = [item for item in rows if str(item) != key]
+            changed = len(rows) != before
+        self._privacy_audit(
+            "learning_paused" if paused else "learning_resumed",
+            actor_id=actor_id,
+            user_id=user_id,
+            reason=reason,
+        )
+        if changed:
+            self.store.touch()
+        return changed
+
+    def export_user_memory(self, user_id: int) -> dict[str, Any]:
+        root = self._ai_root()
+        uid = str(int(user_id))
+        facts: dict[str, Any] = {}
+        for guild_id, guild_rows in root.setdefault("memory_facts", {}).items():
+            if isinstance(guild_rows, dict) and uid in guild_rows:
+                facts[str(guild_id)] = guild_rows.get(uid, [])
+        profiles: dict[str, Any] = {}
+        for guild_id, guild_rows in root.setdefault("profiles", {}).items():
+            if isinstance(guild_rows, dict) and uid in guild_rows:
+                profiles[str(guild_id)] = guild_rows.get(uid, {})
+        long_term: dict[str, list[dict[str, Any]]] = {}
+        for guild_id, rows in root.setdefault("long_term_memory", {}).items():
+            if not isinstance(rows, list):
+                continue
+            mine = [row for row in rows if isinstance(row, dict) and int(row.get("user_id", 0) or 0) == int(user_id)]
+            if mine:
+                long_term[str(guild_id)] = mine
+        return {
+            "user_id": int(user_id),
+            "learning_paused": self.is_learning_paused(user_id),
+            "relationship": root.setdefault("relationships", {}).get(uid, {}),
+            "facts": facts,
+            "profiles": profiles,
+            "long_term_memory": long_term,
+        }
+
+    def forget_user_everywhere(self, user_id: int, *, actor_id: int = 0, reason: str = "") -> dict[str, int]:
+        root = self._ai_root()
+        uid = str(int(user_id))
+        removed = {"facts": 0, "profiles": 0, "relationships": 0, "long_term": 0}
+        for guild_rows in root.setdefault("memory_facts", {}).values():
+            if isinstance(guild_rows, dict) and uid in guild_rows:
+                removed["facts"] += len(guild_rows.get(uid, []) or [])
+                guild_rows.pop(uid, None)
+        for guild_rows in root.setdefault("profiles", {}).values():
+            if isinstance(guild_rows, dict) and uid in guild_rows:
+                removed["profiles"] += 1
+                guild_rows.pop(uid, None)
+        relationships = root.setdefault("relationships", {})
+        if isinstance(relationships, dict) and uid in relationships:
+            relationships.pop(uid, None)
+            removed["relationships"] = 1
+        for rows in root.setdefault("long_term_memory", {}).values():
+            if not isinstance(rows, list):
+                continue
+            before = len(rows)
+            rows[:] = [row for row in rows if not (isinstance(row, dict) and int(row.get("user_id", 0) or 0) == int(user_id))]
+            removed["long_term"] += before - len(rows)
+        self._privacy_audit("forget_user", actor_id=actor_id, user_id=user_id, reason=reason, details=removed)
+        self.store.touch()
+        return removed
+
+    def privacy_audit_lines(self, limit: int = 10) -> list[str]:
+        audit = self._privacy_root().setdefault("audit_log", [])
+        if not isinstance(audit, list):
+            return []
+        lines: list[str] = []
+        for row in audit[-max(1, limit) :]:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"{row.get('ts', '')} action={row.get('action', '')} user={row.get('user_id', 0)} actor={row.get('actor_id', 0)}"
+            )
+        return lines
+
+    def _privacy_root(self) -> dict[str, Any]:
+        root = self._ai_root()
+        privacy = root.setdefault("privacy", {"paused_user_ids": [], "audit_log": []})
+        if not isinstance(privacy, dict):
+            root["privacy"] = {"paused_user_ids": [], "audit_log": []}
+            privacy = root["privacy"]
+        privacy.setdefault("paused_user_ids", [])
+        privacy.setdefault("audit_log", [])
+        return privacy
+
+    def _privacy_audit(
+        self,
+        action: str,
+        *,
+        actor_id: int,
+        user_id: int,
+        reason: str = "",
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        audit = self._privacy_root().setdefault("audit_log", [])
+        if not isinstance(audit, list):
+            return
+        audit.append(
+            {
+                "ts": datetime.now(tz=timezone.utc).isoformat(),
+                "action": str(action)[:80],
+                "actor_id": int(actor_id),
+                "user_id": int(user_id),
+                "reason": str(reason)[:180],
+                "details": details or {},
+            }
+        )
+        if len(audit) > 500:
+            del audit[: len(audit) - 500]
 
     def _extract_fact_candidates(self, text: str) -> list[tuple[str, float, str]]:
         clean = " ".join(text.split())
@@ -3530,6 +3772,8 @@ class AIService:
         root.setdefault("reflections", {})
         root.setdefault("fun_modes", {})
         root.setdefault("capabilities", {})
+        root.setdefault("privacy", {"paused_user_ids": [], "audit_log": []})
+        root.setdefault("telemetry", {})
         root.setdefault(
             "prompt_injection",
             {
