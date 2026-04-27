@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import json
 from typing import Any
 
@@ -83,6 +84,101 @@ class IntelligenceControlsCog(commands.Cog):
             return
         result = self.bot.ai.compact_reflections(guild_id=target_id)
         await ctx.send(f"Reflection compaction: `{result}`")
+
+    @commands.command(name="wakebroadcast")
+    async def wake_broadcast(self, ctx: commands.Context, action: str = "preview", limit: int = 25, *, message: str = "") -> None:
+        if not self._tier_check(ctx.author, 90):
+            await ctx.send("Not authorized.")
+            return
+        root = self._wake_root()
+        contacts = self._wake_contact_ids()
+        safe_limit = max(1, min(100, int(limit or 25)))
+        selected = contacts[:safe_limit]
+        action_key = action.strip().casefold()
+        if action_key in {"preview", "show", "status"}:
+            await ctx.send(
+                (
+                    f"Wake broadcast contacts=`{len(contacts)}` selected=`{len(selected)}` "
+                    f"last_sent_ts=`{root.get('last_sent_ts', 0.0)}`\n"
+                    f"Default message: {root.get('default_message', '')}\n"
+                    f"First targets: {', '.join(str(uid) for uid in selected[:20]) or '(none)'}\n"
+                    "Run `!wakebroadcast send <limit> <message>` to send intentionally."
+                )[:1900]
+            )
+            return
+        if action_key != "send":
+            await ctx.send("Usage: `!wakebroadcast preview [limit]` or `!wakebroadcast send <limit> [message]`")
+            return
+        if not selected:
+            await ctx.send("No known DM contacts to message.")
+            return
+        now = time.time()
+        last_sent = float(root.get("last_sent_ts", 0.0) or 0.0)
+        if (now - last_sent) < 6 * 60 * 60:
+            await ctx.send("Wake broadcast is on cooldown. Try again later or send manually through DM bridges.")
+            return
+        body = (message.strip() or str(root.get("default_message", ""))).strip()
+        if not body:
+            await ctx.send("Wake broadcast message is empty.")
+            return
+        sent = 0
+        failed = 0
+        for user_id in selected:
+            user = await self.bot.dm_bridges.resolve_user(self.bot, user_id)
+            if user is None:
+                failed += 1
+                continue
+            try:
+                await user.send(body[:1900])
+                sent += 1
+                self.bot.ai.capture_dm_outbound(user_id=user_id, user_name=str(user), text=body, touch=False)
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+        root["last_sent_ts"] = now
+        log = root.setdefault("sent_log", [])
+        if isinstance(log, list):
+            log.append(
+                {
+                    "ts": now,
+                    "actor_id": int(ctx.author.id),
+                    "selected": len(selected),
+                    "sent": sent,
+                    "failed": failed,
+                    "message_preview": body[:120],
+                }
+            )
+            if len(log) > 100:
+                del log[: len(log) - 100]
+        self.bot.store.touch()
+        await ctx.send(f"Wake broadcast complete: sent=`{sent}` failed=`{failed}` selected=`{len(selected)}`.")
+
+    def _wake_root(self) -> dict[str, Any]:
+        root = self.bot.store.data.setdefault("wake_broadcast", {})
+        if not isinstance(root, dict):
+            self.bot.store.data["wake_broadcast"] = {}
+            root = self.bot.store.data["wake_broadcast"]
+        root.setdefault("sent_log", [])
+        root.setdefault("last_sent_ts", 0.0)
+        root.setdefault("default_message", "Hi i just woke up sorry i been gone lets go")
+        return root
+
+    def _wake_contact_ids(self) -> list[int]:
+        ids: set[int] = set()
+        for user_id in self.bot.dm_bridges.list_user_ids():
+            if int(user_id) > 0:
+                ids.add(int(user_id))
+        events = self.bot.store.data.setdefault("ai", {}).setdefault("dm_brain", {}).setdefault("events", [])
+        if isinstance(events, list):
+            for row in events:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    uid = int(row.get("user_id", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if uid > 0:
+                    ids.add(uid)
+        return sorted(ids)
 
 
 async def setup_intelligence_controls(bot: Any) -> None:

@@ -97,6 +97,11 @@ DEFAULT_STORE: dict[str, Any] = {
             "ambient_threshold": 0.72,
         },
     },
+    "wake_broadcast": {
+        "sent_log": [],
+        "last_sent_ts": 0.0,
+        "default_message": "Hi i just woke up sorry i been gone lets go",
+    },
     "autonomy_policy": {
         "mode": "assist",
         "allowed_actions": [],

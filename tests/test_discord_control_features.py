@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from mandy_v1.bot import MandyBot
+from mandy_v1.cogs.intelligence_controls import IntelligenceControlsCog
 from mandy_v1.config import Settings
 from mandy_v1.services.ai_service import AIService
 from mandy_v1.storage import MessagePackStore
@@ -141,3 +142,17 @@ def test_autonomy_external_contact_blocked_without_approval_mode(tmp_path: Path)
 
     assert allowed is False
     assert why == "external_contact_requires_approval_mode"
+
+
+def test_wake_broadcast_collects_known_dm_contacts(tmp_path: Path) -> None:
+    bot = MandyBot(_settings(tmp_path))
+    asyncio.run(bot.store.load())
+    bot.store.data["dm_bridges"]["42"] = {"active": True}
+    bot.store.data["ai"]["dm_brain"]["events"] = [
+        {"user_id": 42, "text": "hi"},
+        {"user_id": 99, "text": "hello"},
+    ]
+    cog = IntelligenceControlsCog(bot)
+
+    assert cog._wake_contact_ids() == [42, 99]  # noqa: SLF001
+    assert cog._wake_root()["default_message"].startswith("Hi i just woke up")  # noqa: SLF001

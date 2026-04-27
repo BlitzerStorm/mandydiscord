@@ -91,7 +91,7 @@ AUTOMATION_BLOCKED_COMMAND_PATTERN = re.compile(
     r"(^|\s)(del|rm|rmdir|format|shutdown|reboot|restart-computer|stop-computer|Remove-Item)(\s|$)",
     re.IGNORECASE,
 )
-CORE_MODE_DEFAULT = True
+CORE_MODE_DEFAULT = False
 AUTONOMY_MODE_VALUES = {"off", "assist", "god"}
 AUTONOMY_ASSIST_ALLOWED_ACTIONS = {
     "nickname_member",
