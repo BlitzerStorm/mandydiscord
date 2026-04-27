@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import random
@@ -333,6 +334,29 @@ class MandyBot(commands.Bot):
         self._register_commands()
 
     async def close(self) -> None:
+        background_tasks = [
+            self._autosave_task,
+            self._ai_warmup_task,
+            self._housekeeping_task,
+            self._shadow_task,
+            self._send_probe_task,
+            self._onboarding_recheck_task,
+            self._hive_sync_task,
+            self._satellite_reconcile_task,
+            self._self_automation_task,
+            self._proactive_task,
+            *self._ai_pending_reply_tasks.values(),
+            *self._ai_pending_dm_reply_tasks.values(),
+        ]
+        for task in background_tasks:
+            if task and not task.done():
+                task.cancel()
+        for task in background_tasks:
+            if task:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+        if self.store.data:
+            await self.store.save()
         await self.ai.close()
         await super().close()
 

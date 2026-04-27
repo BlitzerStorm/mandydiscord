@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import time
 from typing import Any
 
 import msgpack
@@ -139,7 +140,19 @@ class MessagePackStore:
                 await self._save_unlocked()
                 return
             raw = self.path.read_bytes()
-            self.data = msgpack.unpackb(raw, raw=False)
+            try:
+                loaded = msgpack.unpackb(raw, raw=False)
+            except (msgpack.UnpackException, ValueError) as exc:
+                backup = self._backup_corrupt_store(raw)
+                self.data = _clone_defaults()
+                await self._save_unlocked()
+                raise RuntimeError(f"Store file was unreadable and was reset. Corrupt copy: {backup}") from exc
+            if not isinstance(loaded, dict):
+                backup = self._backup_corrupt_store(raw)
+                self.data = _clone_defaults()
+                await self._save_unlocked()
+                raise RuntimeError(f"Store root was not a mapping and was reset. Corrupt copy: {backup}")
+            self.data = loaded
             self._ensure_schema()
 
     async def autosave_loop(self) -> None:
@@ -164,11 +177,40 @@ class MessagePackStore:
 
     def _ensure_schema(self) -> None:
         defaults = _clone_defaults()
-        for key, value in defaults.items():
-            if key not in self.data:
-                self.data[key] = value
-        self._dirty = True
+        changed = _merge_defaults(self.data, defaults)
+        if changed:
+            self._dirty = True
+
+    def _backup_corrupt_store(self, raw: bytes) -> Path:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
+        suffix = 1
+        while backup.exists():
+            suffix += 1
+            backup = self.path.with_name(f"{self.path.name}.corrupt-{stamp}-{suffix}")
+        backup.write_bytes(raw)
+        return backup
 
 
 def _clone_defaults() -> dict[str, Any]:
     return msgpack.unpackb(msgpack.packb(DEFAULT_STORE, use_bin_type=True), raw=False)
+
+
+def _merge_defaults(target: dict[str, Any], defaults: dict[str, Any]) -> bool:
+    changed = False
+    for key, default_value in defaults.items():
+        if key not in target:
+            target[key] = default_value
+            changed = True
+            continue
+        current = target[key]
+        if isinstance(default_value, dict):
+            if not isinstance(current, dict):
+                target[key] = default_value
+                changed = True
+                continue
+            changed = _merge_defaults(current, default_value) or changed
+        elif isinstance(default_value, list) and not isinstance(current, list):
+            target[key] = default_value
+            changed = True
+    return changed
